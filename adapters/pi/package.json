@@ -1,0 +1,20 @@
+{
+  "name": "@super-mem/pi",
+  "version": "0.1.0",
+  "description": "Native Super Mem extension for Pi",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Limme-swe/super-mem.git",
+    "directory": "adapters/pi"
+  },
+  "type": "module",
+  "files": ["extensions"],
+  "keywords": ["pi-package", "memory", "coding-agent"],
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": ["./extensions/super-mem.ts"]
+  }
+}

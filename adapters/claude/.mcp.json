@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "super_mem": {
+      "type": "stdio",
+      "command": "supermem",
+      "args": ["mcp", "--root", ".", "--namespace", "default"],
+      "env": {}
+    }
+  }
+}

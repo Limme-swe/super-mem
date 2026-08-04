@@ -1,0 +1,28 @@
+{
+  "name": "super-mem",
+  "version": "0.1.0",
+  "description": "Evidence-first, Git-aware local memory for Codex",
+  "author": {
+    "name": "Liam",
+    "url": "https://github.com/Limme-swe"
+  },
+  "homepage": "https://github.com/Limme-swe/super-mem",
+  "repository": "https://github.com/Limme-swe/super-mem",
+  "license": "MIT",
+  "keywords": ["memory", "coding-agents", "mcp", "git"],
+  "mcpServers": {
+    "super_mem": {
+      "command": "supermem",
+      "args": ["mcp", "--root", ".", "--namespace", "default"]
+    }
+  },
+  "interface": {
+    "displayName": "Super Mem",
+    "shortDescription": "Repository-aware memory for coding agents.",
+    "longDescription": "Recall evidence-backed decisions, outcomes, and procedures that still fit the current Git state.",
+    "developerName": "Liam",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "defaultPrompt": "Recall relevant repository decisions and failed attempts before I start."
+  }
+}

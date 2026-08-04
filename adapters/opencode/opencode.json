@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@super-mem/opencode"],
+  "mcp": {
+    "super_mem": {
+      "type": "local",
+      "command": ["supermem", "mcp", "--root", ".", "--namespace", "default"],
+      "enabled": true
+    }
+  }
+}
