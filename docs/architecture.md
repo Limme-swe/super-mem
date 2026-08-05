@@ -146,7 +146,7 @@ The default database is outside the worktree. On Unix, scope-sensitive commands,
 
 ## MCP server
 
-The server uses the [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). Trusted stdio launch pins root, namespace, optional workspace, and the launch repository identity. Every call rediscovers Git state and fails closed if the repository appears, disappears, changes ID, or changes common directory. MCP revision 2026-07-28 is stateless, so a model session ID is provenance, not a security boundary.
+The server uses the [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). Trusted stdio launch pins root, namespace, optional workspace, and the launch repository identity. Every call rediscovers Git state and fails closed if the repository appears, disappears, changes ID, or changes common directory. File-backed servers open one primary connection for writes and a bounded pool of two to four reader connections for concurrent recalls; literal in-memory databases retain one connection so their state stays shared. MCP revision 2026-07-28 is stateless, so a model session ID is provenance, not a security boundary.
 
 The model-facing tools are:
 

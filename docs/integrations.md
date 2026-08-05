@@ -21,7 +21,7 @@ All reference adapters are fail-open. If memory is unavailable, the coding sessi
 Start the stdio server with a trusted repository root:
 
 ~~~sh
-supermem mcp --root /absolute/path/to/repo --namespace default
+supermem mcp --root /absolute/path/to/repo
 ~~~
 
 Generic client configuration:
@@ -31,7 +31,7 @@ Generic client configuration:
   "mcpServers": {
     "super-mem": {
       "command": "supermem",
-      "args": ["mcp", "--root", "/absolute/path/to/repo", "--namespace", "default"]
+      "args": ["mcp", "--root", "/absolute/path/to/repo"]
     }
   }
 }
@@ -39,7 +39,7 @@ Generic client configuration:
 
 The launch command pins the canonical root, namespace, and optional workspace for the lifetime of the server. Each call rediscovers the repository and current Git state from that root and fails closed if the repository appears, disappears, changes identity, or changes Git common directory. Model-facing tool schemas expose only an optional session ID; they cannot select another root, namespace, repository, or workspace.
 
-`--namespace` and `--workspace` also read `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE`. Scoped CLI commands and command hooks use the same variables. Configure the adapter and MCP launch environment with identical values.
+`--db`, `--namespace`, and `--workspace` also read `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE`. Scoped CLI commands and command hooks use the same variables. Configure the adapter and MCP launch environment with identical values.
 
 `memory_context` accepts repository-relative `files` and an explicit `include_divergent` option. `memory_record` accepts files for records and checkpoints; checkpoint mode attempts a complete changed-file capture by default unless `auto_artifacts` is false, and attaches it only when capture is complete. `memory_manage` supports `inspect`, `history`, and `retract`. History returns the current head, immutable revisions, cited source and lifecycle events, revision-scoped links, feedback, and a per-revision metadata-completeness flag.
 
@@ -52,7 +52,8 @@ The included Codex plugin combines MCP with command hooks.
 ~~~toml
 [mcp_servers.super_mem]
 command = "supermem"
-args = ["mcp", "--root", ".", "--namespace", "default"]
+args = ["mcp", "--root", "."]
+env_vars = ["SUPER_MEM_DB", "SUPER_MEM_NAMESPACE", "SUPER_MEM_WORKSPACE"]
 ~~~
 
 | Event | Behavior |
@@ -72,7 +73,7 @@ The checkout includes a repository marketplace at [.agents/plugins/marketplace.j
 Register the MCP server:
 
 ~~~sh
-claude mcp add --scope project --transport stdio super_mem --   supermem mcp --root . --namespace default
+claude mcp add --scope project --transport stdio super_mem -- supermem mcp --root .
 ~~~
 
 | Event | Behavior |
@@ -96,7 +97,7 @@ OpenCode launches MCP as a local command:
   "mcp": {
     "super-mem": {
       "type": "local",
-      "command": ["supermem", "mcp", "--root", ".", "--namespace", "default"],
+      "command": ["supermem", "mcp", "--root", "."],
       "enabled": true
     }
   }

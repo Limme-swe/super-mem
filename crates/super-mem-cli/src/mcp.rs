@@ -2,7 +2,10 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context, bail};
@@ -36,17 +39,45 @@ pub const TOOL_NAMES: [&str; 4] = [
     "memory_record",
 ];
 
+const MAX_READ_ENGINES: usize = 4;
+const MIN_READ_ENGINES: usize = 2;
+
 #[derive(Clone)]
 pub struct MemoryServer {
     engine: Arc<MemoryEngine>,
+    read_engines: Arc<[Arc<MemoryEngine>]>,
+    next_read_engine: Arc<AtomicUsize>,
     policy: Arc<McpPolicy>,
     tool_router: ToolRouter<Self>,
 }
 
 impl MemoryServer {
     fn new(engine: MemoryEngine, policy: McpPolicy) -> Self {
+        let engine = Arc::new(engine);
+        let read_engines: Arc<[Arc<MemoryEngine>]> = vec![Arc::clone(&engine)].into();
+        Self {
+            engine,
+            read_engines,
+            next_read_engine: Arc::new(AtomicUsize::new(0)),
+            policy: Arc::new(policy),
+            tool_router: Self::tool_router(),
+        }
+    }
+
+    fn with_read_pool(
+        engine: MemoryEngine,
+        read_engines: Vec<MemoryEngine>,
+        policy: McpPolicy,
+    ) -> Self {
+        assert!(!read_engines.is_empty(), "MCP read pool must not be empty");
         Self {
             engine: Arc::new(engine),
+            read_engines: read_engines
+                .into_iter()
+                .map(Arc::new)
+                .collect::<Vec<_>>()
+                .into(),
+            next_read_engine: Arc::new(AtomicUsize::new(0)),
             policy: Arc::new(policy),
             tool_router: Self::tool_router(),
         }
@@ -70,6 +101,22 @@ impl MemoryServer {
             .await
             .map_err(|error| format!("memory worker failed: {error}"))?
     }
+
+    async fn run_read_blocking<T>(
+        &self,
+        operation: impl FnOnce(Arc<MemoryEngine>, Arc<McpPolicy>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+    {
+        let index = self.next_read_engine.fetch_add(1, Ordering::Relaxed)
+            % self.read_engines.len();
+        let engine = Arc::clone(&self.read_engines[index]);
+        let policy = self.policy.clone();
+        tokio::task::spawn_blocking(move || operation(engine, policy))
+            .await
+            .map_err(|error| format!("memory read worker failed: {error}"))?
+    }
 }
 
 #[tool_router]
@@ -92,7 +139,7 @@ impl MemoryServer {
             return tool_error("query must not be empty");
         }
         let result = self
-            .run_blocking(move |engine, policy| {
+            .run_read_blocking(move |engine, policy| {
                 let scope = policy.current_scope(arguments.session_id.clone())?;
                 let files = arguments
                     .files
@@ -366,9 +413,29 @@ pub async fn serve(
     let policy = McpPolicy::new(root, namespace, workspace_id)?;
     validate_database_for_scope(database, &policy.root)?;
     let engine = crate::app::open_engine(database)?;
-    let service = MemoryServer::new(engine, policy).serve(stdio()).await?;
+    let server = if is_private_in_memory_database(database) {
+        MemoryServer::new(engine, policy)
+    } else {
+        let read_engines = (0..production_read_pool_size())
+            .map(|_| crate::app::open_engine(database))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        MemoryServer::with_read_pool(engine, read_engines, policy)
+    };
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+fn is_private_in_memory_database(database: &Path) -> bool {
+    database == Path::new(":memory:")
+}
+
+fn production_read_pool_size() -> usize {
+    std::thread::available_parallelism().map_or(MIN_READ_ENGINES, |parallelism| {
+        parallelism
+            .get()
+            .clamp(MIN_READ_ENGINES, MAX_READ_ENGINES)
+    })
 }
 
 fn tool_text(value: impl Into<String>) -> CallToolResult {
@@ -785,7 +852,7 @@ enum ManageAction {
 struct MemoryManageArgs {
     /// `inspect`, `history`, or `retract`. Database status and purge are CLI-only.
     action: ManageAction,
-    /// Required for inspect/retract.
+    /// Required for inspect/history/retract.
     #[serde(default)]
     memory_id: Option<String>,
     /// Required for retract.
@@ -1166,6 +1233,100 @@ mod tests {
             "blocking memory work stalled the MCP transport runtime"
         );
         worker.await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pooled_blocking_reads_overlap_without_stalling_transport() {
+        use std::sync::{
+            Barrier,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("memory.sqlite3");
+        let primary = MemoryEngine::open(&database, EngineOptions::default()).unwrap();
+        let readers = vec![
+            MemoryEngine::open(&database, EngineOptions::default()).unwrap(),
+            MemoryEngine::open(&database, EngineOptions::default()).unwrap(),
+        ];
+        let policy = McpPolicy::new(directory.path(), "default".into(), None).unwrap();
+        let server = MemoryServer::with_read_pool(primary, readers, policy);
+        let rendezvous = Arc::new(Barrier::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let first = {
+            let server = server.clone();
+            let rendezvous = Arc::clone(&rendezvous);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tokio::spawn(async move {
+                server
+                    .run_read_blocking(move |engine, _| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        rendezvous.wait();
+                        engine.status().map_err(|error| error.to_string())?;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Arc::as_ptr(&engine) as usize)
+                    })
+                    .await
+            })
+        };
+        let second = {
+            let server = server.clone();
+            let rendezvous = Arc::clone(&rendezvous);
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tokio::spawn(async move {
+                server
+                    .run_read_blocking(move |engine, _| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(current, Ordering::SeqCst);
+                        rendezvous.wait();
+                        engine.status().map_err(|error| error.to_string())?;
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(Arc::as_ptr(&engine) as usize)
+                    })
+                    .await
+            })
+        };
+
+        let quick_task_ran = Arc::new(AtomicBool::new(false));
+        let quick_task_result = Arc::clone(&quick_task_ran);
+        tokio::spawn(async move {
+            quick_task_result.store(true, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            quick_task_ran.load(Ordering::SeqCst),
+            "pooled reads stalled the MCP transport runtime"
+        );
+
+        let first_engine = first.await.unwrap().unwrap();
+        let second_engine = second.await.unwrap().unwrap();
+        assert_ne!(
+            first_engine, second_engine,
+            "consecutive reads did not use independent pooled engines"
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "blocking read workers did not overlap"
+        );
+    }
+
+    #[test]
+    fn production_read_pool_is_small_and_bounded() {
+        assert!((MIN_READ_ENGINES..=MAX_READ_ENGINES).contains(&production_read_pool_size()));
+    }
+
+    #[test]
+    fn private_in_memory_database_does_not_use_independent_readers() {
+        assert!(is_private_in_memory_database(Path::new(":memory:")));
+        assert!(!is_private_in_memory_database(Path::new("memory.sqlite3")));
     }
 
     fn schema_has_enum_value(value: &serde_json::Value, expected: &str) -> bool {

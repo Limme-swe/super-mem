@@ -19,6 +19,7 @@ super-mem records prompts, decisions, tool results, tests, and failed attempts i
 - Tracks revisions, source events, historical links, corrections, retractions, and conflicting evidence without erasing history.
 - Classifies repository memories as exact, compatible, stale, divergent, or unversioned.
 - Builds a small, deterministic context packet under a fixed token budget.
+- Serves concurrent MCP recalls through a bounded SQLite reader pool while serializing writes on one primary connection.
 - Runs locally without an embedding model, hosted database, or telemetry service.
 
 The Rust core owns storage, scoping, retrieval, and context assembly. Harness adapters only translate lifecycle events and inject the resulting context.
@@ -66,7 +67,7 @@ supermem recall \
 Run the MCP server:
 
 ~~~sh
-supermem mcp --root /absolute/path/to/repo --namespace default
+supermem mcp --root /absolute/path/to/repo
 ~~~
 
 A generic stdio configuration looks like this:
@@ -76,13 +77,13 @@ A generic stdio configuration looks like this:
   "mcpServers": {
     "super-mem": {
       "command": "supermem",
-      "args": ["mcp", "--root", "/absolute/path/to/repo", "--namespace", "default"]
+      "args": ["mcp", "--root", "/absolute/path/to/repo"]
     }
   }
 }
 ~~~
 
-The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries. `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE` can provide the same scope to scoped CLI commands, hooks, and MCP; keep both processes configured alike.
+The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries. `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` can provide the same store and scope to scoped CLI commands, hooks, and MCP; keep both processes configured alike.
 
 ## Integrations
 

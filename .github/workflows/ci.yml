@@ -22,7 +22,7 @@ jobs:
     name: Format, lint, and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
@@ -31,12 +31,16 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets --all-features
+      - name: Validate crate packages
+        run: |
+          cargo package -p super-mem-core --locked --no-verify
+          cargo package -p super-mem --locked --no-verify
 
   msrv:
     name: Rust 1.88 compatibility
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
@@ -49,7 +53,7 @@ jobs:
     name: Dependency policy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
@@ -61,13 +65,14 @@ jobs:
     name: Adapter contracts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 24
+          package-manager-cache: false
       - name: Validate evaluation fixture contract
         run: node scripts/validate-eval-fixture.mjs
-      - name: Validate adapter manifests
+      - name: Validate adapter contracts
         run: |
           python -m json.tool adapters/codex/.codex-plugin/plugin.json >/dev/null
           python -m json.tool adapters/codex/.mcp.json >/dev/null
@@ -80,18 +85,108 @@ jobs:
           python -m json.tool adapters/pi/package.json >/dev/null
           python - <<'PY'
           import json
+          import re
+          import tomllib
           from pathlib import Path
+
           manifest = json.loads(Path("adapters/codex/.codex-plugin/plugin.json").read_text())
           assert manifest["name"] == "super-mem"
           assert manifest["mcpServers"] == "./.mcp.json"
           assert manifest["hooks"] == "./hooks/hooks.json"
           assert isinstance(manifest["interface"]["defaultPrompt"], list)
+
           mcp_servers = json.loads(Path("adapters/codex/.mcp.json").read_text())
-          assert mcp_servers["super_mem"]["command"] == "supermem"
+          codex_server = mcp_servers["super_mem"]
+          assert codex_server["command"] == "supermem"
+          forwarded_scope = {
+              "SUPER_MEM_DB",
+              "SUPER_MEM_NAMESPACE",
+              "SUPER_MEM_WORKSPACE",
+          }
+          assert forwarded_scope <= set(codex_server["env_vars"])
+
           marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text())
           entry = marketplace["plugins"][0]
           assert entry["name"] == "super-mem"
           assert entry["source"] == {"source": "local", "path": "./adapters/codex"}
+
+          codex_config = tomllib.loads(Path("adapters/codex/config.toml").read_text())
+          codex_manual = codex_config["mcp_servers"]["super_mem"]
+          assert forwarded_scope <= set(codex_manual["env_vars"])
+
+          claude_server = json.loads(
+              Path("adapters/claude/.mcp.json").read_text()
+          )["mcpServers"]["super_mem"]
+          opencode_server = json.loads(
+              Path("adapters/opencode/opencode.json").read_text()
+          )["mcp"]["super_mem"]
+          shipped_commands = {
+              "Codex plugin": codex_server["args"],
+              "Codex manual config": codex_manual["args"],
+              "Claude Code": claude_server["args"],
+              "OpenCode": opencode_server["command"][1:],
+          }
+          environment_backed_flags = {"--db", "--namespace", "--workspace"}
+          for adapter, arguments in shipped_commands.items():
+              masked = environment_backed_flags.intersection(arguments)
+              assert not masked, f"{adapter} masks environment-backed options: {sorted(masked)}"
+          shipped_environments = {
+              "Codex plugin": codex_server.get("env", {}),
+              "Codex manual config": codex_manual.get("env", {}),
+              "Claude Code": claude_server.get("env", {}),
+              "OpenCode": {
+                  **opencode_server.get("env", {}),
+                  **opencode_server.get("environment", {}),
+              },
+          }
+          for adapter, environment in shipped_environments.items():
+              masked = forwarded_scope.intersection(environment)
+              assert not masked, f"{adapter} fixes environment-backed options: {sorted(masked)}"
+
+          types_source = Path("crates/super-mem-core/src/types.rs").read_text()
+          busy_match = re.search(r"busy_timeout_ms:\s*([0-9][0-9_]*)", types_source)
+          assert busy_match, "default SQLite busy timeout not found"
+          busy_timeout_ms = int(busy_match.group(1).replace("_", ""))
+          for field in ("startup_timeout_sec", "tool_timeout_sec"):
+              deadline_ms = codex_manual[field] * 1000
+              assert deadline_ms > busy_timeout_ms, (
+                  f"Codex {field} must exceed SQLite's {busy_timeout_ms} ms busy timeout"
+              )
+
+          database_hook_events = {
+              "SessionStart",
+              "UserPromptSubmit",
+              "SubagentStart",
+              "PostToolUse",
+              "PostToolUseFailure",
+              "Stop",
+              "SubagentStop",
+              "PostCompact",
+          }
+          for path in (
+              Path("adapters/codex/hooks/hooks.json"),
+              Path("adapters/claude/.claude/settings.json"),
+          ):
+              hooks = json.loads(path.read_text())["hooks"]
+              for event in database_hook_events.intersection(hooks):
+                  for group in hooks[event]:
+                      for handler in group["hooks"]:
+                          deadline_ms = handler["timeout"] * 1000
+                          assert deadline_ms > busy_timeout_ms, (
+                              f"{path}:{event} timeout must exceed SQLite's "
+                              f"{busy_timeout_ms} ms busy timeout"
+                          )
+
+          for path in (
+              Path("adapters/opencode/src/index.ts"),
+              Path("adapters/pi/extensions/super-mem.ts"),
+          ):
+              timeout_match = re.search(r"const TIMEOUT_MS = ([0-9_]+)", path.read_text())
+              assert timeout_match, f"{path}: TIMEOUT_MS not found"
+              deadline_ms = int(timeout_match.group(1).replace("_", ""))
+              assert deadline_ms > busy_timeout_ms, (
+                  f"{path}: timeout must exceed SQLite's {busy_timeout_ms} ms busy timeout"
+              )
           PY
       - name: Type-check current host adapters
         run: |
@@ -110,7 +205,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1

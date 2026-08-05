@@ -26,7 +26,7 @@ Notable changes are recorded here. Semantic Versioning begins with the first sta
 
 ### Performance
 
-- Lower CLI and hook startup cost, blocking MCP work moved off the transport thread, and bounded-memory Unicode handling in the OpenCode and Pi adapters.
+- Lower CLI and hook startup cost, blocking MCP work moved off the transport thread, a bounded 2–4 connection MCP recall pool for concurrent agents, and bounded-memory Unicode handling in the OpenCode and Pi adapters.
 
 ### Security
 

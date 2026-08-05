@@ -9,9 +9,9 @@
 
 For a manual project install, copy hooks/hooks.json to .codex/hooks.json and merge config.toml into the active Codex configuration.
 
-The included MCP command uses --root . --namespace default. Use an absolute trusted root if Codex may start elsewhere, and add --workspace when separate workspaces share a repository.
+The included MCP command uses --root . and otherwise reads the standard `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` environment variables. Use an absolute trusted root if Codex may start elsewhere.
 
-Hooks and MCP are separate processes. If you change the MCP `--namespace` or `--workspace`, set `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE` to the same values in the environment that launches Codex. Hooks otherwise use namespace `default` with no workspace.
+Hooks and MCP are separate processes. Set `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` in the environment that launches Codex when selecting a custom store or scope. The bundled MCP configuration forwards those variables so both processes resolve the same values; the defaults remain namespace `default` with no workspace.
 
 ## Captured events
 

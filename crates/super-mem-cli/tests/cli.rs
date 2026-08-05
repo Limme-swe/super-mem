@@ -1,6 +1,13 @@
 //! End-to-end tests for the CLI, hooks, and MCP stdio surface.
 
-use std::{fs, path::Path, process::Command as ProcessCommand};
+use std::{
+    fs,
+    path::Path,
+    process::Command as ProcessCommand,
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -1055,6 +1062,105 @@ fn automatic_stop_checkpoint_is_recalled_in_a_new_session() {
     let output = String::from_utf8(output).unwrap();
     assert!(output.contains("pnpm"));
     assert_eq!(output.matches("<super-mem-context>").count(), 1);
+}
+
+#[test]
+fn hooks_and_mcp_share_database_namespace_and_workspace_environment() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("scoped-memory.sqlite3");
+    let scope_environment = [
+        ("SUPER_MEM_DB", database.as_os_str()),
+        ("SUPER_MEM_NAMESPACE", std::ffi::OsStr::new("team-memory")),
+        ("SUPER_MEM_WORKSPACE", std::ffi::OsStr::new("workspace-blue")),
+    ];
+    let stop = serde_json::json!({
+        "hook_event_name": "Stop",
+        "session_id": "host-session",
+        "turn_id": "turn-9",
+        "cwd": temp.path(),
+        "last_assistant_message": "The cross-surface scope sentinel is amber-kingfisher."
+    });
+    Command::cargo_bin("supermem")
+        .unwrap()
+        .envs(scope_environment)
+        .args(["hook", "codex"])
+        .write_stdin(stop.to_string())
+        .assert()
+        .success()
+        .stdout("{}\n");
+
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+        "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"memory_context\",\"arguments\":{\"query\":\"cross-surface scope sentinel\"}}}\n",
+    );
+    let output = Command::cargo_bin("supermem")
+        .unwrap()
+        .envs(scope_environment)
+        .args(["mcp", "--root"])
+        .arg(temp.path())
+        .write_stdin(input)
+        .timeout(Duration::from_secs(7))
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    let response = String::from_utf8(output).unwrap();
+    let call: Value = response
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .find(|value: &Value| value["id"] == 2)
+        .expect("tools/call response");
+    let text = call["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text tool result");
+    assert!(text.contains("amber-kingfisher"));
+}
+
+#[test]
+fn mcp_startup_survives_short_sqlite_writer_contention() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database)
+        .args(["status", "--quiet"])
+        .assert()
+        .success();
+
+    let lock_database = database.clone();
+    let (locked_sender, locked_receiver) = mpsc::channel();
+    let holder = thread::spawn(move || {
+        let connection = rusqlite::Connection::open(lock_database).unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked_sender.send(()).unwrap();
+        thread::sleep(Duration::from_millis(750));
+        connection.execute_batch("ROLLBACK").unwrap();
+    });
+    locked_receiver.recv().unwrap();
+
+    let input = concat!(
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{},\"clientInfo\":{\"name\":\"test\",\"version\":\"0\"}}}\n",
+        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n",
+    );
+    let started = Instant::now();
+    let output = command(&database)
+        .args(["mcp", "--root"])
+        .arg(temp.path())
+        .write_stdin(input)
+        .timeout(Duration::from_secs(7))
+        .assert()
+        .success()
+        .stderr(predicate::str::is_empty())
+        .get_output()
+        .stdout
+        .clone();
+    holder.join().unwrap();
+    assert!(started.elapsed() >= Duration::from_millis(600));
+    let response = String::from_utf8(output).unwrap();
+    assert!(response.lines().any(|line| {
+        serde_json::from_str::<Value>(line).is_ok_and(|value| value["id"] == 1)
+    }));
 }
 
 #[test]

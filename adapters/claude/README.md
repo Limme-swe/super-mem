@@ -7,14 +7,14 @@ Install supermem on PATH, then copy .mcp.json and .claude/settings.json into the
 The MCP server can also be registered with:
 
 ~~~sh
-claude mcp add --scope project --transport stdio super_mem --   supermem mcp --root . --namespace default
+claude mcp add --scope project --transport stdio super_mem -- supermem mcp --root .
 ~~~
 
 Verify the connection with claude mcp list and /mcp.
 
-The included command pins --root to `${CLAUDE_PROJECT_DIR:-.}` and uses namespace `default`. Use an absolute trusted root for user-level configuration and add `--workspace` when needed.
+The included command pins --root to `${CLAUDE_PROJECT_DIR:-.}`. Database, namespace, and workspace use the standard environment variables, with namespace `default` and no workspace when they are unset. Use an absolute trusted root for user-level configuration.
 
-Hooks and MCP are separate processes. If you change the MCP `--namespace` or `--workspace`, set `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE` to the same values in the environment that launches Claude Code. Hooks otherwise use namespace `default` with no workspace.
+Hooks and MCP are separate processes. Set `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` in the environment that launches Claude Code when selecting a custom store or scope so both processes resolve the same values.
 
 ## Captured events
 

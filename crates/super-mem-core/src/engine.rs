@@ -1328,7 +1328,11 @@ impl MemoryEngine {
         if !saw_footer {
             return Err(Error::InvalidInput("import footer is missing".into()));
         }
-        let snapshot_version = snapshot_version.expect("header is present");
+        let Some(snapshot_version) = snapshot_version else {
+            return Err(Error::InvalidInput(
+                "snapshot header version is missing".into(),
+            ));
+        };
         for (table, _) in snapshot_tables(snapshot_version) {
             actual_counts.entry(table.to_owned()).or_default();
         }
