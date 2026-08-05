@@ -90,6 +90,7 @@ jobs:
       - name: Validate release tooling and metadata
         run: |
           python -m py_compile scripts/*.py
+          python -m unittest discover -s scripts/tests -p "test_*.py"
           python scripts/release_metadata.py
       - name: Validate adapter contracts
         run: |

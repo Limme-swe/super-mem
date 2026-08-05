@@ -46,7 +46,7 @@ jobs:
           python-version: "3.12"
       - name: Install pinned Rust toolchain
         run: |
-          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          rustup toolchain install 1.97.1 --profile minimal --component rust-docs --no-self-update
           rustup default 1.97.1
       - name: Generate dependency license report
         run: |
