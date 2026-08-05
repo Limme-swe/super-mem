@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 import tempfile
 import unittest
@@ -23,8 +24,10 @@ class AppendNativeNoticesTests(unittest.TestCase):
         self.rust_licenses.mkdir(parents=True)
         self.apache = b"apache notice exact bytes\x00\xff"
         self.mit = b"mit notice exact bytes\x00\xfe"
+        self.unicode = b"unicode notice exact bytes\x00\xfb"
         (self.rust_licenses / "Apache-2.0.txt").write_bytes(self.apache)
         (self.rust_licenses / "MIT.txt").write_bytes(self.mit)
+        (self.rust_licenses / "Unicode-3.0.txt").write_bytes(self.unicode)
 
     def test_prefers_library_notice_and_preserves_exact_bytes(self) -> None:
         library = b"library notice exact bytes\x00\xfd"
@@ -39,6 +42,7 @@ class AppendNativeNoticesTests(unittest.TestCase):
         self.assertNotIn(full, output)
         self.assertIn(self.apache, output)
         self.assertIn(self.mit, output)
+        self.assertIn(self.unicode, output)
         self.assertIn(b"COPYRIGHT-library.html", output)
 
     def test_falls_back_to_full_toolchain_notice(self) -> None:
@@ -63,10 +67,24 @@ class AppendNativeNoticesTests(unittest.TestCase):
                 content = path.read_bytes()
                 path.unlink()
                 try:
-                    with self.assertRaisesRegex(SystemExit, str(path)):
+                    with self.assertRaisesRegex(SystemExit, re.escape(missing)):
                         notices.append_rust_notices(self.report, self.sysroot)
                 finally:
                     path.write_bytes(content)
+
+    def test_supports_legacy_toolchain_license_layout(self) -> None:
+        (self.rust_docs / "COPYRIGHT-library.html").write_bytes(b"library notice")
+        for path in self.rust_licenses.iterdir():
+            path.unlink()
+        self.rust_licenses.rmdir()
+        (self.rust_docs / "LICENSE-APACHE").write_bytes(self.apache)
+        (self.rust_docs / "LICENSE-MIT").write_bytes(self.mit)
+
+        notices.append_rust_notices(self.report, self.sysroot)
+
+        output = self.report.read_bytes()
+        self.assertIn(self.apache, output)
+        self.assertIn(self.mit, output)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,29 @@ def first_notice(candidates: tuple[Path, ...]) -> Path:
     raise SystemExit(f"required native license notice is missing; checked:\n  {rendered}")
 
 
+def rust_license_notices(rust_docs: Path) -> tuple[Path, ...]:
+    license_directory = rust_docs / "licenses"
+    if license_directory.is_dir():
+        notices = tuple(sorted(license_directory.glob("*.txt"), key=lambda path: path.name))
+        if not notices:
+            raise SystemExit(f"Rust license directory contains no notices: {license_directory}")
+        for notice in notices:
+            if not notice.is_file() or notice.stat().st_size == 0:
+                raise SystemExit(f"required native license notice is missing: {notice}")
+        names = {notice.name for notice in notices}
+        required = {"Apache-2.0.txt", "MIT.txt"}
+        missing = sorted(required - names)
+        if missing:
+            raise SystemExit(
+                f"Rust license directory is missing required notices: {', '.join(missing)}"
+            )
+        return notices
+    return (
+        first_notice((rust_docs / "LICENSE-APACHE",)),
+        first_notice((rust_docs / "LICENSE-MIT",)),
+    )
+
+
 def append_rust_notices(report: Path, rust_sysroot: Path) -> None:
     rust_docs = rust_sysroot / "share" / "doc" / "rust"
     copyright_notice = first_notice(
@@ -41,30 +64,10 @@ def append_rust_notices(report: Path, rust_sysroot: Path) -> None:
         f"Rust standard library and runtime — {copyright_notice.name}",
         copyright_notice,
     )
-    license_notices = (
-        (
-            "Apache-2.0",
-            first_notice(
-                (
-                    rust_docs / "licenses" / "Apache-2.0.txt",
-                    rust_docs / "LICENSE-APACHE",
-                )
-            ),
-        ),
-        (
-            "MIT",
-            first_notice(
-                (
-                    rust_docs / "licenses" / "MIT.txt",
-                    rust_docs / "LICENSE-MIT",
-                )
-            ),
-        ),
-    )
-    for license_name, source in license_notices:
+    for source in rust_license_notices(rust_docs):
         append_section(
             report,
-            f"Rust toolchain used for this release — {license_name} ({source.name})",
+            f"Rust toolchain used for this release — {source.name}",
             source,
         )
 
