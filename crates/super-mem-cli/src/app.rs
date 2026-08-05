@@ -557,6 +557,16 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
 }
 
 fn lexical_repository_alias(cwd: &Path, canonical_root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    // `..` is valid in a caller's cwd but intentionally forbidden in database
+    // paths. Alias recovery is only an extra lexical spelling, so fall back to
+    // Git's discovered/canonical roots when preserving that spelling would be
+    // ambiguous around symbolic links.
+    if cwd
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Ok(None);
+    }
     let mut cursor = absolute_lexical_path(cwd)?;
     loop {
         if cursor
@@ -1277,6 +1287,17 @@ mod tests {
         assert!(bounded.starts_with("sm1:"));
         assert_eq!(bounded.len(), 68);
         assert!(bounded.len() <= 256);
+    }
+
+    #[test]
+    fn lexical_repository_alias_is_best_effort_for_parent_components() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let canonical = repository.canonicalize().unwrap();
+        let aliased = repository.join("child").join("..");
+
+        assert_eq!(lexical_repository_alias(&aliased, &canonical).unwrap(), None);
     }
 
     #[test]
