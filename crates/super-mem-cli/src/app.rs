@@ -472,14 +472,12 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
     // The lexical spelling is required to inspect junction components before
     // they are resolved; the canonical spelling covers ordinary aliases.
     let repository_lexical = absolute_lexical_path(&discovered_repository_root)?;
-    let repository_root = discovered_repository_root
-        .canonicalize()
-        .with_context(|| {
-            format!(
-                "resolve Git worktree {}",
-                discovered_repository_root.display()
-            )
-        })?;
+    let repository_root = discovered_repository_root.canonicalize().with_context(|| {
+        format!(
+            "resolve Git worktree {}",
+            discovered_repository_root.display()
+        )
+    })?;
     let mut repository_spellings = Vec::new();
     if let Some(alias) = lexical_repository_alias(cwd, &repository_root)? {
         push_unique(&mut repository_spellings, alias);
@@ -1297,7 +1295,10 @@ mod tests {
         let canonical = repository.canonicalize().unwrap();
         let aliased = repository.join("child").join("..");
 
-        assert_eq!(lexical_repository_alias(&aliased, &canonical).unwrap(), None);
+        assert_eq!(
+            lexical_repository_alias(&aliased, &canonical).unwrap(),
+            None
+        );
     }
 
     #[test]
