@@ -178,7 +178,13 @@ fn validate_identity(connection: &Connection) -> Result<u32> {
             (SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')
         ",
         [],
-        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?, row.get::<_, i64>(2)?)),
+        |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
     )?;
     if (current != 0 || application_id != 0 || user_objects != 0)
         && application_id != APPLICATION_ID

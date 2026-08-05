@@ -19,11 +19,12 @@ class AppendNativeNoticesTests(unittest.TestCase):
         self.report.write_bytes(b"cargo dependency notices\n")
         self.sysroot = self.root / "sysroot"
         self.rust_docs = self.sysroot / "share" / "doc" / "rust"
-        self.rust_docs.mkdir(parents=True)
+        self.rust_licenses = self.rust_docs / "licenses"
+        self.rust_licenses.mkdir(parents=True)
         self.apache = b"apache notice exact bytes\x00\xff"
         self.mit = b"mit notice exact bytes\x00\xfe"
-        (self.rust_docs / "LICENSE-APACHE").write_bytes(self.apache)
-        (self.rust_docs / "LICENSE-MIT").write_bytes(self.mit)
+        (self.rust_licenses / "Apache-2.0.txt").write_bytes(self.apache)
+        (self.rust_licenses / "MIT.txt").write_bytes(self.mit)
 
     def test_prefers_library_notice_and_preserves_exact_bytes(self) -> None:
         library = b"library notice exact bytes\x00\xfd"
@@ -56,9 +57,9 @@ class AppendNativeNoticesTests(unittest.TestCase):
 
     def test_missing_either_toolchain_license_fails_closed(self) -> None:
         (self.rust_docs / "COPYRIGHT-library.html").write_bytes(b"library notice")
-        for missing in ("LICENSE-APACHE", "LICENSE-MIT"):
+        for missing in ("Apache-2.0.txt", "MIT.txt"):
             with self.subTest(missing=missing):
-                path = self.rust_docs / missing
+                path = self.rust_licenses / missing
                 content = path.read_bytes()
                 path.unlink()
                 try:

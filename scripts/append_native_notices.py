@@ -41,11 +41,31 @@ def append_rust_notices(report: Path, rust_sysroot: Path) -> None:
         f"Rust standard library and runtime — {copyright_notice.name}",
         copyright_notice,
     )
-    for name in ("LICENSE-APACHE", "LICENSE-MIT"):
+    license_notices = (
+        (
+            "Apache-2.0",
+            first_notice(
+                (
+                    rust_docs / "licenses" / "Apache-2.0.txt",
+                    rust_docs / "LICENSE-APACHE",
+                )
+            ),
+        ),
+        (
+            "MIT",
+            first_notice(
+                (
+                    rust_docs / "licenses" / "MIT.txt",
+                    rust_docs / "LICENSE-MIT",
+                )
+            ),
+        ),
+    )
+    for license_name, source in license_notices:
         append_section(
             report,
-            f"Rust toolchain used for this release — {name}",
-            rust_docs / name,
+            f"Rust toolchain used for this release — {license_name} ({source.name})",
+            source,
         )
 
 
