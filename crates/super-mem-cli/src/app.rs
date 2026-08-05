@@ -982,7 +982,10 @@ fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
+// Keep one fallible contract across platform implementations: the Windows
+// handle query and unsupported-platform fallback can fail closed.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
 fn hard_link_count(_path: &Path, metadata: &fs::Metadata) -> anyhow::Result<u64> {
     Ok(metadata.nlink())
 }
