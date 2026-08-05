@@ -1071,7 +1071,10 @@ fn hooks_and_mcp_share_database_namespace_and_workspace_environment() {
     let scope_environment = [
         ("SUPER_MEM_DB", database.as_os_str()),
         ("SUPER_MEM_NAMESPACE", std::ffi::OsStr::new("team-memory")),
-        ("SUPER_MEM_WORKSPACE", std::ffi::OsStr::new("workspace-blue")),
+        (
+            "SUPER_MEM_WORKSPACE",
+            std::ffi::OsStr::new("workspace-blue"),
+        ),
     ];
     let stop = serde_json::json!({
         "hook_event_name": "Stop",
@@ -1158,9 +1161,11 @@ fn mcp_startup_survives_short_sqlite_writer_contention() {
     holder.join().unwrap();
     assert!(started.elapsed() >= Duration::from_millis(600));
     let response = String::from_utf8(output).unwrap();
-    assert!(response.lines().any(|line| {
-        serde_json::from_str::<Value>(line).is_ok_and(|value| value["id"] == 1)
-    }));
+    assert!(
+        response.lines().any(|line| {
+            serde_json::from_str::<Value>(line).is_ok_and(|value| value["id"] == 1)
+        })
+    );
 }
 
 #[test]

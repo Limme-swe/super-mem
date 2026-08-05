@@ -109,8 +109,7 @@ impl MemoryServer {
     where
         T: Send + 'static,
     {
-        let index = self.next_read_engine.fetch_add(1, Ordering::Relaxed)
-            % self.read_engines.len();
+        let index = self.next_read_engine.fetch_add(1, Ordering::Relaxed) % self.read_engines.len();
         let engine = Arc::clone(&self.read_engines[index]);
         let policy = self.policy.clone();
         tokio::task::spawn_blocking(move || operation(engine, policy))
@@ -432,9 +431,7 @@ fn is_private_in_memory_database(database: &Path) -> bool {
 
 fn production_read_pool_size() -> usize {
     std::thread::available_parallelism().map_or(MIN_READ_ENGINES, |parallelism| {
-        parallelism
-            .get()
-            .clamp(MIN_READ_ENGINES, MAX_READ_ENGINES)
+        parallelism.get().clamp(MIN_READ_ENGINES, MAX_READ_ENGINES)
     })
 }
 
