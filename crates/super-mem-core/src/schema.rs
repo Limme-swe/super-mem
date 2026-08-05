@@ -4,9 +4,11 @@ use std::{
     fs::File,
     io::{ErrorKind, Read},
     path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::{Durability, EngineOptions, Error, Result};
 
@@ -21,15 +23,35 @@ pub const APPLICATION_ID: u32 = 0x534D_454D;
 ///
 /// Returns an error if a recognized database's schema metadata cannot be read.
 pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
-    if !path.as_ref().is_file() {
+    let path = path.as_ref();
+    if !path.is_file() {
         return Ok(false);
     }
+
+    // Ask SQLite first so an open WAL is part of the view. This connection is
+    // strictly read-only; in particular, it cannot recover a rollback journal
+    // or mutate the file while a destructive maintenance command identifies
+    // it.
+    if let Ok(connection) = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        let application_id = connection
+            .query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0));
+        let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0));
+        if let (Ok(application_id), Ok(version)) = (application_id, version) {
+            return Ok(
+                application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version)
+            );
+        }
+    }
+
     let Ok(mut file) = File::open(path) else {
         return Ok(false);
     };
-    // Read immutable database-header fields directly. Opening SQLite here can
-    // trigger rollback-journal recovery or reject an otherwise identifiable
-    // store whose crash journal is damaged, exactly when purge is most useful.
+    // A damaged or incomplete crash journal can make even a read-only SQLite
+    // open fail. Fall back to immutable main-header fields so the store remains
+    // identifiable for purge without attempting journal recovery.
     let mut header = [0_u8; 72];
     if let Err(error) = file.read_exact(&mut header) {
         return if error.kind() == ErrorKind::UnexpectedEof {
@@ -47,7 +69,8 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
 }
 
 pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Result<()> {
-    connection.busy_timeout(std::time::Duration::from_millis(options.busy_timeout_ms))?;
+    let busy_timeout = Duration::from_millis(options.busy_timeout_ms);
+    connection.busy_timeout(busy_timeout)?;
     connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;")?;
 
     // Verify identity before enabling WAL, which would otherwise mutate an
@@ -56,8 +79,13 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
     // initialize an empty file between these two steps.
     validate_identity(connection)?;
 
-    let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    let mut journal_mode: String =
+        connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if journal_mode != "wal" && journal_mode != "memory" {
+        journal_mode = retry_busy(busy_timeout, || {
+            connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        })?;
+    }
     // In-memory databases correctly report `memory` rather than `wal`.
     if journal_mode != "wal" && journal_mode != "memory" {
         return Err(Error::Migration(format!(
@@ -69,7 +97,9 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
         Durability::Durable => connection.execute_batch("PRAGMA synchronous=FULL;")?,
     }
 
-    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    retry_busy(busy_timeout, || {
+        connection.execute_batch("BEGIN IMMEDIATE;")
+    })?;
     let migration = (|| {
         let current = validate_identity(connection)?;
         if current == 0 {
@@ -96,6 +126,38 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
             Err(error)
         }
     }
+}
+
+fn retry_busy<T>(
+    timeout: Duration,
+    mut operation: impl FnMut() -> rusqlite::Result<T>,
+) -> rusqlite::Result<T> {
+    let started = Instant::now();
+    let mut delay = Duration::from_millis(1);
+    loop {
+        match operation() {
+            Err(error) if is_busy(&error) && started.elapsed() < timeout => {
+                let remaining = timeout.saturating_sub(started.elapsed());
+                if remaining.is_zero() {
+                    return Err(error);
+                }
+                thread::sleep(delay.min(remaining));
+                delay = delay.saturating_mul(2).min(Duration::from_millis(25));
+            }
+            result => return result,
+        }
+    }
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(
+                failure.code,
+                ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+            )
+    )
 }
 
 fn validate_identity(connection: &Connection) -> Result<u32> {

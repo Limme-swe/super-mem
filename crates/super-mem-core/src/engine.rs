@@ -4228,8 +4228,10 @@ mod tests {
         assert_eq!(pack.sections.len(), 1);
         assert_eq!(pack.sections[0].items.len(), 1);
         assert_eq!(pack.hits[0].memory.body, pack.sections[0].items[0].body);
+        assert!(!pack.hits[0].memory.body.is_empty());
+        assert!(pack.hits[0].memory.body.len() < body.len());
         assert!(!pack.hits[0].memory.body.contains(omitted_tail));
-        assert!(pack.rendered.contains("budget-sentinel beginning"));
+        assert!(pack.rendered.contains(&pack.hits[0].memory.body));
 
         let encoded = serde_json::to_string(&pack).unwrap();
         assert!(!encoded.contains(omitted_tail));
