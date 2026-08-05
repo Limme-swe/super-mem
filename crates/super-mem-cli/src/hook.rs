@@ -290,10 +290,10 @@ fn tool_result_content(
 }
 
 fn compact_json(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into()))
+    value.as_str().map_or_else(
+        || serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".into()),
+        str::to_owned,
+    )
 }
 
 fn tool_exit_code(object: &Map<String, Value>) -> Option<i64> {

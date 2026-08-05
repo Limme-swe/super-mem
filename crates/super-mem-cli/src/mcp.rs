@@ -629,7 +629,6 @@ impl MemoryContextArgs {
                 error_fingerprint: self.error_fingerprint,
                 entities: self.entities,
                 artifacts,
-                ..ContextHints::default()
             },
             ..RecallRequest::default()
         }

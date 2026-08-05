@@ -232,7 +232,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             let engine = open_engine(&database)?;
             if arguments.history {
                 let history = engine.history(parse_memory_id(&arguments.memory_id)?)?;
-                print_value(&history, true, "history is only emitted as JSON".to_owned())?;
+                print_value(&history, true, "history is only emitted as JSON")?;
                 return Ok(());
             }
             let memory = engine.get(parse_memory_id(&arguments.memory_id)?)?;
