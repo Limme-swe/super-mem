@@ -1,8 +1,9 @@
 # Copy this server block to ~/.codex/config.toml or a trusted .codex/config.toml.
 [mcp_servers.super_mem]
 command = "supermem"
-args = ["mcp", "--root", ".", "--namespace", "default"]
-startup_timeout_sec = 5
+args = ["mcp", "--root", "."]
+env_vars = ["SUPER_MEM_DB", "SUPER_MEM_NAMESPACE", "SUPER_MEM_WORKSPACE"]
+startup_timeout_sec = 10
 tool_timeout_sec = 10
 enabled_tools = [
   "memory_context",

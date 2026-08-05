@@ -1,7 +1,7 @@
 //! SQLite-backed memory engine implementation.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Write as _,
     fs,
     io::Write,
@@ -20,21 +20,24 @@ use serde_json::{Value, json};
 
 use crate::{
     Applicability, ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextItem, ContextPack,
-    ContextSection, EngineOptions, EntityRef, Error, EventId, EventKind, EvidenceRef,
-    FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory, MemoryId, MemoryKind, MemoryState,
-    ObserveReceipt, ObserveRequest, QueryId, RecallHit, RecallRequest, RepositoryContext, Result,
-    RetractRequest, RetrievalSignal, Scope, Status, TrustLevel, WriteReceipt,
+    ContextSection, EngineOptions, EntityRef, Error, Event, EventId, EventKind, EvidenceRef,
+    FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory, MemoryFeedback, MemoryHistory,
+    MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState, ObserveReceipt, ObserveRequest,
+    QueryId, RecallHit, RecallRequest, RepositoryContext, Result, RetractRequest, RetrievalSignal,
+    Scope, Status, TrustLevel, WriteReceipt,
     applicability::classify_applicability_with_relation,
+    artifacts::materialize_current_artifacts,
     ranking::{Candidate, safe_fts_query, score_candidate, select_mmr},
     redaction::Redactor,
     schema::{SCHEMA_VERSION, initialize},
 };
 
 const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts),h.memory_id LIMIT 120";
-// Snapshot tables did not change in database schema v2; FTS and reverse
-// indexes are derived and rebuilt on import. Keep backups bidirectionally
-// compatible with v1 binaries rather than coupling them to `user_version`.
-const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+// Snapshot schema is independent from SQLite's user_version. Version 2 adds
+// immutable per-revision metadata and link provenance; version 1 remains
+// accepted for restore.
+const LEGACY_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const SNAPSHOT_SCHEMA_VERSION: u32 = 2;
 
 const SNAPSHOT_TABLES: &[(&str, &[&str])] = &[
     (
@@ -165,6 +168,39 @@ const SNAPSHOT_TABLES: &[(&str, &[&str])] = &[
             "idempotency_key",
             "request_hash",
             "receipt_json",
+            "created_at_ms",
+        ],
+    ),
+];
+
+const SNAPSHOT_V2_TABLES: &[(&str, &[&str])] = &[
+    (
+        "memory_revision_metadata",
+        &[
+            "memory_id",
+            "revision",
+            "kind",
+            "state",
+            "canonical_key",
+            "importance",
+            "confidence",
+            "trust",
+            "valid_from_ms",
+            "valid_until_ms",
+            "expires_at_ms",
+            "metadata_complete",
+        ],
+    ),
+    (
+        "memory_link_revisions",
+        &[
+            "link_id",
+            "source_memory_id",
+            "source_revision",
+            "target_memory_id",
+            "relation",
+            "weight",
+            "created_event_id",
             "created_at_ms",
         ],
     ),
@@ -363,6 +399,187 @@ impl MemoryEngine {
         )?;
         transaction.commit()?;
         Ok(receipt)
+    }
+
+    /// Enriches a checkpoint with immutable prompt, tool, command, and
+    /// verification events from the current session before recording it.
+    ///
+    /// This is intended for harness adapters: the model supplies the concise
+    /// outcome while Super Mem grounds it in tool evidence captured by hooks.
+    pub fn checkpoint_session(&self, mut request: CheckpointRequest) -> Result<WriteReceipt> {
+        normalize_repository(&mut request.scope.repository);
+        self.validate_scope(&request.scope)?;
+        let Some(current_session_id) = request.scope.session_id.clone() else {
+            return self.checkpoint(request);
+        };
+        validate_idempotency(request.idempotency_key.as_deref())?;
+
+        let connection = self.lock()?;
+        // A retry must see the same ambient session slice as its first
+        // execution. Resolve the original checkpoint boundary from the
+        // idempotency receipt; `checkpoint` still compares the full request
+        // fingerprint and rejects reuse of the key for different content.
+        let scoped_idempotency =
+            scoped_idempotency_key(&request.scope, request.idempotency_key.as_deref());
+        let retry_receipt = scoped_idempotency
+            .as_deref()
+            .map(|key| {
+                connection
+                    .query_row(
+                        "SELECT receipt_json FROM idempotency WHERE namespace=?1 AND operation='checkpoint' AND idempotency_key=?2",
+                        params![request.scope.namespace, key],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+            })
+            .transpose()?
+            .flatten()
+            .map(|encoded| serde_json::from_str::<WriteReceipt>(&encoded))
+            .transpose()?;
+        let retry_boundary = retry_receipt
+            .map(|receipt| {
+                connection.query_row(
+                    "SELECT seq,scope_json FROM events WHERE event_id=?1",
+                    [receipt.event_id.to_string()],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+            })
+            .transpose()?;
+        let (retry_before_seq, evidence_session_id) = if let Some((sequence, scope_json)) =
+            retry_boundary
+        {
+            let original_scope: Scope = serde_json::from_str(&scope_json)?;
+            if original_scope.key() != request.scope.key()
+                || original_scope.workspace_id.as_deref() != request.scope.workspace_id.as_deref()
+            {
+                return Err(Error::Conflict(
+                    "idempotent checkpoint crossed a durable scope boundary".into(),
+                ));
+            }
+            let original_session_id = original_scope.session_id.ok_or_else(|| {
+                Error::Migration("checkpoint receipt references an event without a session".into())
+            })?;
+            (Some(sequence), original_session_id)
+        } else {
+            (None, current_session_id)
+        };
+        let mut statement = connection.prepare_cached(
+            "SELECT event_id,kind,content,attributes_json FROM events \
+             WHERE namespace=?1 \
+               AND json_extract(scope_json,'$.workspace_id') IS ?2 \
+               AND json_extract(scope_json,'$.repository.repo_id') IS ?3 \
+               AND json_extract(scope_json,'$.repository.branch') IS ?4 \
+               AND json_extract(scope_json,'$.session_id')=?5 \
+               AND (?6 IS NULL OR seq < ?6) \
+             ORDER BY seq DESC LIMIT 128",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    request.scope.namespace,
+                    request.scope.workspace_id,
+                    request.scope.repo_id(),
+                    request.scope.branch(),
+                    evidence_session_id,
+                    retry_before_seq,
+                ],
+                |row| {
+                    Ok(SessionEvent {
+                        event_id: row.get(0)?,
+                        kind: row.get(1)?,
+                        content: row.get(2)?,
+                        attributes: serde_json::from_str(&row.get::<_, String>(3)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    3,
+                                    rusqlite::types::Type::Text,
+                                    Box::new(error),
+                                )
+                            },
+                        )?,
+                    })
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        drop(connection);
+
+        let mut events = Vec::new();
+        for event in rows {
+            if event.kind == EventKind::Checkpoint.as_str() {
+                break;
+            }
+            let is_user_prompt = event.kind == EventKind::ConversationTurn.as_str()
+                && event.attributes.get("role").and_then(Value::as_str) == Some("user");
+            events.push(event);
+            if is_user_prompt {
+                break;
+            }
+        }
+        events.reverse();
+
+        let mut seen_evidence = request
+            .evidence
+            .iter()
+            .map(|evidence| evidence.event_id)
+            .collect::<BTreeSet<_>>();
+        for event in events {
+            let event_id = parse_event_id(&event.event_id)?;
+            if seen_evidence.insert(event_id) {
+                request.evidence.push(EvidenceRef {
+                    event_id,
+                    span_start: None,
+                    span_end: None,
+                    relation: session_evidence_relation(&event).to_owned(),
+                });
+            }
+
+            if event.kind == EventKind::ConversationTurn.as_str()
+                && event.attributes.get("role").and_then(Value::as_str) == Some("user")
+                && is_generic_checkpoint_goal(&request.goal)
+            {
+                request.goal = truncate_to_tokens(&event.content, 256);
+            }
+
+            let succeeded = event_succeeded(&event);
+            if event.kind == EventKind::CommandResult.as_str()
+                || event.kind == EventKind::Verification.as_str()
+                || (event.kind == EventKind::ToolResult.as_str() && !succeeded)
+            {
+                let action = event_action(&event);
+                let result = truncate_to_tokens(&event.content, 768);
+                let fingerprint = event
+                    .attributes
+                    .get("error_fingerprint")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if !request.attempts.iter().any(|attempt| {
+                    attempt.action == action
+                        && attempt.fingerprint == fingerprint
+                        && attempt.result == result
+                }) {
+                    request.attempts.push(crate::CheckpointAttempt {
+                        action: action.clone(),
+                        result: result.clone(),
+                        succeeded,
+                        fingerprint,
+                    });
+                }
+                if event.kind == EventKind::Verification.as_str()
+                    || event
+                        .attributes
+                        .get("verification")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    let verification = format!("{action}: {result}");
+                    if !request.verification.contains(&verification) {
+                        request.verification.push(verification);
+                    }
+                }
+            }
+        }
+        self.checkpoint(request)
     }
 
     /// Atomically records a task episode, its decisions, attempts, outcome,
@@ -619,8 +836,8 @@ impl MemoryEngine {
         for entity in &request.hints.entities {
             validate_bounded_text("entity hint", entity, false, MAX_KEY_BYTES)?;
         }
-        for artifact in &request.hints.artifacts {
-            validate_artifact(artifact)?;
+        for artifact in &mut request.hints.artifacts {
+            normalize_artifact_for_scope(artifact, &request.scope)?;
         }
         let limit = request
             .limit
@@ -649,6 +866,59 @@ impl MemoryEngine {
         let candidate_ids = candidates.keys().copied().collect::<Vec<_>>();
         let mut memories = load_memories(&connection, &candidate_ids)?;
         let utilities = feedback_utilities(&connection, &candidate_ids)?;
+        let database_seq = latest_sequence(&connection)?;
+        // Hash the artifacts of the strongest retrieval candidates first. A
+        // lexical BTreeMap cap made freshness depend on path names once more
+        // than 128 candidate artifacts existed, potentially starving the best
+        // match of verification and making it look stale.
+        let mut artifact_candidate_ids = candidate_ids.clone();
+        artifact_candidate_ids.sort_by(|left, right| {
+            candidates
+                .get(right)
+                .map_or(0.0, Candidate::preliminary_score)
+                .total_cmp(
+                    &candidates
+                        .get(left)
+                        .map_or(0.0, Candidate::preliminary_score),
+                )
+                .then_with(|| left.cmp(right))
+        });
+        let mut artifact_keys = BTreeSet::new();
+        let mut historical_artifacts = Vec::new();
+        'candidates: for memory_id in artifact_candidate_ids {
+            let Some(memory) = memories.get(&memory_id) else {
+                continue;
+            };
+            for artifact in &memory.artifacts {
+                if artifact.content_hash.is_none() {
+                    continue;
+                }
+                let key = (
+                    artifact.repo_id.clone(),
+                    artifact.path.clone(),
+                    artifact.symbol.clone(),
+                    artifact.content_hash.clone(),
+                );
+                if artifact_keys.insert(key) {
+                    historical_artifacts.push(artifact.clone());
+                    if historical_artifacts.len() == MAX_COLLECTION_ITEMS {
+                        break 'candidates;
+                    }
+                }
+            }
+        }
+        drop(connection);
+
+        if let Some(repository) = &request.scope.repository
+            && let Some(root) = repository.root.as_deref()
+        {
+            let inferred = materialize_current_artifacts(
+                Path::new(root),
+                &repository.repo_id,
+                &historical_artifacts,
+            );
+            merge_artifact_hints(&mut request.hints.artifacts, inferred);
+        }
         let mut hits = Vec::new();
         let mut git_relations = HashMap::new();
         let mut resolve_git = |root: &str, stored: &str, current: &str| {
@@ -682,6 +952,7 @@ impl MemoryEngine {
             );
             if applicability == Applicability::Inapplicable
                 || (applicability == Applicability::Stale && !request.include_stale)
+                || (applicability == Applicability::Divergent && !request.include_divergent)
             {
                 continue;
             }
@@ -704,7 +975,6 @@ impl MemoryEngine {
                 .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
         });
         let selected = select_mmr(hits, limit, 0.78);
-        let database_seq = latest_sequence(&connection)?;
         Ok(compile_context(
             query_id,
             database_seq,
@@ -718,6 +988,55 @@ impl MemoryEngine {
     pub fn get(&self, memory_id: MemoryId) -> Result<Memory> {
         let connection = self.lock()?;
         load_memory(&connection, memory_id)
+    }
+
+    /// Loads every immutable revision and its cited source events and links.
+    pub fn history(&self, memory_id: MemoryId) -> Result<MemoryHistory> {
+        let connection = self.lock()?;
+        let current = load_memory(&connection, memory_id)?;
+        let revision_numbers = connection
+            .prepare_cached(
+                "SELECT revision FROM memory_revisions WHERE memory_id=?1 ORDER BY revision",
+            )?
+            .query_map([memory_id.to_string()], |row| row.get::<_, u32>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let revisions = revision_numbers
+            .into_iter()
+            .map(|revision| load_memory_revision(&connection, memory_id, revision))
+            .collect::<Result<Vec<_>>>()?;
+        let mut event_ids = revisions
+            .iter()
+            .flat_map(|revision| {
+                revision
+                    .memory
+                    .evidence
+                    .iter()
+                    .map(|evidence| evidence.event_id)
+            })
+            .collect::<BTreeSet<_>>();
+        let associated_events = connection
+            .prepare_cached(
+                "SELECT event_id FROM event_memories WHERE memory_id=?1 ORDER BY event_id",
+            )?
+            .query_map([memory_id.to_string()], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for event_id in associated_events {
+            event_ids.insert(parse_event_id(&event_id)?);
+        }
+        let links = load_memory_links(&connection, memory_id)?;
+        // Legacy stores associated a link-creation event only with its source.
+        // Include the immutable link ledger directly so inbound provenance is
+        // complete even before target-side event associations existed.
+        event_ids.extend(links.iter().map(|link| link.created_event_id));
+        let events = load_events(&connection, &event_ids.into_iter().collect::<Vec<_>>())?;
+        let feedback = load_memory_feedback(&connection, memory_id)?;
+        Ok(MemoryHistory {
+            current,
+            revisions,
+            events,
+            links,
+            feedback,
+        })
     }
 
     /// Records bounded retrieval feedback without altering factual confidence.
@@ -813,6 +1132,10 @@ impl MemoryEngine {
             "UPDATE memory_heads SET state='retracted', updated_at_ms=?2, updated_seq=?3 WHERE memory_id=?1",
             params![request.memory_id.to_string(), to_ms(now), sequence],
         )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_memories(event_id,memory_id) VALUES(?1,?2)",
+            params![event_id.to_string(), request.memory_id.to_string()],
+        )?;
         transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
         let receipt = WriteReceipt {
             event_id,
@@ -886,7 +1209,7 @@ impl MemoryEngine {
         )?;
         let mut row_hasher = blake3::Hasher::new();
         let mut row_counts = BTreeMap::new();
-        for &(table, columns) in SNAPSHOT_TABLES {
+        for (table, columns) in snapshot_tables(SNAPSHOT_SCHEMA_VERSION) {
             let count = export_table(&transaction, writer, table, columns, &mut row_hasher)?;
             row_counts.insert(table, count);
         }
@@ -907,6 +1230,7 @@ impl MemoryEngine {
     pub fn import_jsonl(&mut self, input: &str) -> Result<ImportReceipt> {
         let mut saw_header = false;
         let mut saw_footer = false;
+        let mut snapshot_version = None::<u32>;
         let mut row_hasher = blake3::Hasher::new();
         let mut actual_counts = BTreeMap::<String, usize>::new();
         let mut expected_counts = None::<BTreeMap<String, usize>>;
@@ -926,13 +1250,20 @@ impl MemoryEngine {
                             "snapshot must contain exactly one leading header".into(),
                         ));
                     }
+                    let version = value
+                        .get("schema_version")
+                        .and_then(Value::as_u64)
+                        .and_then(|version| u32::try_from(version).ok());
                     if value.get("format_version").and_then(Value::as_u64) != Some(2)
                         || value.get("mode").and_then(Value::as_str) != Some("full_snapshot")
-                        || value.get("schema_version").and_then(Value::as_u64)
-                            != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
+                        || !matches!(
+                            version,
+                            Some(LEGACY_SNAPSHOT_SCHEMA_VERSION..=SNAPSHOT_SCHEMA_VERSION)
+                        )
                     {
                         return Err(Error::InvalidInput("unsupported export format".into()));
                     }
+                    snapshot_version = version;
                     saw_header = true;
                 }
                 Some("row") => {
@@ -942,7 +1273,12 @@ impl MemoryEngine {
                         ));
                     }
                     let table = required_string(&value, "table")?.to_owned();
-                    if snapshot_columns(&table).is_none() {
+                    let Some(version) = snapshot_version else {
+                        return Err(Error::InvalidInput(
+                            "snapshot row appeared before a valid header".into(),
+                        ));
+                    };
+                    if snapshot_columns(&table, version).is_none() {
                         return Err(Error::InvalidInput(format!(
                             "snapshot table {table:?} is not allowed"
                         )));
@@ -957,7 +1293,7 @@ impl MemoryEngine {
                                 line_index + 1
                             ))
                         })?;
-                    self.validate_snapshot_row(&table, &row)?;
+                    self.validate_snapshot_row(&table, &row, version)?;
                     row_hasher.update(line.as_bytes());
                     row_hasher.update(b"\n");
                     *actual_counts.entry(table.clone()).or_default() += 1;
@@ -992,7 +1328,12 @@ impl MemoryEngine {
         if !saw_footer {
             return Err(Error::InvalidInput("import footer is missing".into()));
         }
-        for &(table, _) in SNAPSHOT_TABLES {
+        let Some(snapshot_version) = snapshot_version else {
+            return Err(Error::InvalidInput(
+                "snapshot header version is missing".into(),
+            ));
+        };
+        for (table, _) in snapshot_tables(snapshot_version) {
             actual_counts.entry(table.to_owned()).or_default();
         }
         let Some(expected_counts) = expected_counts else {
@@ -1014,17 +1355,20 @@ impl MemoryEngine {
 
         let mut connection = self.lock()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        for &(table, _) in SNAPSHOT_TABLES {
+        for (table, _) in snapshot_tables(snapshot_version) {
             if table_count(&transaction, table)? != 0 {
                 return Err(Error::Conflict(
                     "full snapshot restore requires an empty target database".into(),
                 ));
             }
         }
-        for &(table, columns) in SNAPSHOT_TABLES {
+        for (table, columns) in snapshot_tables(snapshot_version) {
             for row in tables.remove(table).unwrap_or_default() {
                 insert_snapshot_row(&transaction, table, columns, &row)?;
             }
+        }
+        if snapshot_version == LEGACY_SNAPSHOT_SCHEMA_VERSION {
+            backfill_revision_provenance(&transaction)?;
         }
         rebuild_all_fts(&transaction)?;
         let receipt = ImportReceipt {
@@ -1044,8 +1388,9 @@ impl MemoryEngine {
         &self,
         table: &str,
         row: &serde_json::Map<String, Value>,
+        snapshot_version: u32,
     ) -> Result<()> {
-        let columns = snapshot_columns(table).ok_or_else(|| {
+        let columns = snapshot_columns(table, snapshot_version).ok_or_else(|| {
             Error::InvalidInput(format!("snapshot table {table:?} is not allowed"))
         })?;
         if row.len() != columns.len() || columns.iter().any(|column| !row.contains_key(*column)) {
@@ -1053,7 +1398,10 @@ impl MemoryEngine {
                 "snapshot row for {table} has an invalid column set"
             )));
         }
-        if matches!(table, "memory_evidence" | "memory_links") {
+        if matches!(
+            table,
+            "memory_evidence" | "memory_links" | "memory_link_revisions"
+        ) {
             let relation = row.get("relation").and_then(Value::as_str).ok_or_else(|| {
                 Error::InvalidInput(format!("snapshot relation in {table} must be text"))
             })?;
@@ -1238,8 +1586,8 @@ impl MemoryEngine {
             )?;
             validate_bounded_text("entity display", &entity.display, false, MAX_TITLE_BYTES)?;
         }
-        for artifact in &request.artifacts {
-            validate_artifact(artifact)?;
+        for artifact in &mut request.artifacts {
+            normalize_artifact_for_scope(artifact, &request.scope)?;
         }
         for evidence in &mut request.evidence {
             self.validate_relation("evidence relation", &evidence.relation)?;
@@ -1439,8 +1787,8 @@ impl MemoryEngine {
         for tag in &request.tags {
             validate_bounded_text("checkpoint tag", tag, false, MAX_TAG_BYTES)?;
         }
-        for artifact in &request.artifacts {
-            validate_artifact(artifact)?;
+        for artifact in &mut request.artifacts {
+            normalize_artifact_for_scope(artifact, &request.scope)?;
         }
         for evidence in &mut request.evidence {
             self.validate_relation("checkpoint evidence relation", &evidence.relation)?;
@@ -1499,7 +1847,7 @@ impl MemoryEngine {
 fn restrict_sqlite_permissions(path: &Path) -> Result<()> {
     use std::{ffi::OsString, os::unix::fs::PermissionsExt};
 
-    for suffix in ["", "-wal", "-shm"] {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
         let candidate = if suffix.is_empty() {
             path.to_path_buf()
         } else {
@@ -1523,6 +1871,69 @@ fn redact_string_field(engine: &MemoryEngine, field: &mut String, count: &mut us
 struct PreparedMemory {
     request: crate::RememberRequest,
     redaction_count: usize,
+}
+
+struct SessionEvent {
+    event_id: String,
+    kind: String,
+    content: String,
+    attributes: BTreeMap<String, Value>,
+}
+
+fn session_evidence_relation(event: &SessionEvent) -> &'static str {
+    match event.kind.as_str() {
+        "conversation_turn" => "session_prompt",
+        "command_result" => "command_evidence",
+        "verification" => "verification_evidence",
+        "file_change" => "file_evidence",
+        _ => "tool_evidence",
+    }
+}
+
+fn is_generic_checkpoint_goal(goal: &str) -> bool {
+    matches!(
+        goal.trim().to_ascii_lowercase().as_str(),
+        "coding task"
+            | "complete the current coding turn"
+            | "complete the delegated coding task"
+            | "complete the current opencode coding turn"
+            | "complete the current pi coding turn"
+    )
+}
+
+fn event_succeeded(event: &SessionEvent) -> bool {
+    if let Some(succeeded) = event.attributes.get("succeeded").and_then(Value::as_bool) {
+        return succeeded;
+    }
+    if let Some(is_error) = event.attributes.get("is_error").and_then(Value::as_bool) {
+        return !is_error;
+    }
+    event
+        .attributes
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .is_none_or(|exit_code| exit_code == 0)
+}
+
+fn event_action(event: &SessionEvent) -> String {
+    let tool = event
+        .attributes
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .unwrap_or(if event.kind == EventKind::CommandResult.as_str() {
+            "command"
+        } else {
+            "tool"
+        });
+    let command = event
+        .attributes
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty());
+    truncate_to_tokens(
+        &command.map_or_else(|| tool.to_owned(), |command| format!("{tool}: {command}")),
+        256,
+    )
 }
 
 impl std::ops::Deref for PreparedMemory {
@@ -1592,6 +2003,53 @@ fn validate_artifact(artifact: &ArtifactRef) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn normalize_artifact_for_scope(artifact: &mut ArtifactRef, scope: &Scope) -> Result<()> {
+    artifact.repo_id = artifact.repo_id.trim().to_owned();
+    match (scope.repo_id(), artifact.repo_id.as_str()) {
+        (Some(repo_id), "") => artifact.repo_id = repo_id.to_owned(),
+        (Some(repo_id), supplied) if supplied != repo_id => {
+            return Err(Error::Conflict(
+                "an artifact cannot cross the memory's repository boundary".into(),
+            ));
+        }
+        _ => {}
+    }
+    artifact.path = normalize_artifact_path_checked(&artifact.path)?;
+    validate_artifact(artifact)
+}
+
+fn normalize_artifact_path_checked(path: &str) -> Result<String> {
+    let portable = path.trim().replace('\\', "/");
+    if portable.is_empty() || portable.starts_with('/') {
+        return Err(Error::InvalidInput(
+            "artifact paths must be non-empty and repository-relative".into(),
+        ));
+    }
+    let mut components = Vec::new();
+    for component in portable.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                return Err(Error::InvalidInput(
+                    "artifact paths must not contain parent traversal".into(),
+                ));
+            }
+            value if components.is_empty() && value.ends_with(':') => {
+                return Err(Error::InvalidInput(
+                    "artifact paths must not contain a drive root".into(),
+                ));
+            }
+            value => components.push(value),
+        }
+    }
+    if components.is_empty() {
+        return Err(Error::InvalidInput(
+            "artifact paths must name a repository-relative file".into(),
+        ));
+    }
+    Ok(components.join("/"))
 }
 
 fn validate_score(name: &str, value: f32) -> Result<()> {
@@ -1888,12 +2346,35 @@ fn upsert_memory(
                 "a memory cannot supersede, contest, or link to itself".into(),
             ));
         }
+        let link_id = LinkId::new().to_string();
         transaction.execute(
             "INSERT INTO memory_links(link_id,source_memory_id,target_memory_id,relation,weight,created_event_id,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(source_memory_id,target_memory_id,relation) DO UPDATE SET weight=excluded.weight,created_event_id=excluded.created_event_id,created_at_ms=excluded.created_at_ms",
-            params![LinkId::new().to_string(), memory_id.to_string(), link.target.to_string(), link.relation, i64::from(link.weight.min(1000)), event_id.to_string(), to_ms(now)],
+            params![link_id, memory_id.to_string(), link.target.to_string(), link.relation, i64::from(link.weight.min(1000)), event_id.to_string(), to_ms(now)],
+        )?;
+        transaction.execute(
+            "INSERT INTO memory_link_revisions(link_id,source_memory_id,source_revision,target_memory_id,relation,weight,created_event_id,created_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![link_id, memory_id.to_string(), revision, link.target.to_string(), link.relation, i64::from(link.weight.min(1000)), event_id.to_string(), to_ms(now)],
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO event_memories(event_id,memory_id) VALUES(?1,?2)",
+            params![event_id.to_string(), link.target.to_string()],
         )?;
     }
     apply_link_lifecycle(transaction, memory_id, &request.links, sequence, now)?;
+    let revision_state: String = transaction.query_row(
+        "SELECT state FROM memory_heads WHERE memory_id=?1",
+        [memory_id.to_string()],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO memory_revision_metadata(memory_id,revision,kind,state,canonical_key,importance,confidence,trust,valid_from_ms,valid_until_ms,expires_at_ms,metadata_complete) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,1)",
+        params![
+            memory_id.to_string(), revision, request.kind.as_str(), revision_state,
+            request.canonical_key, request.importance, request.confidence, request.trust.as_str(),
+            request.valid_from.map(to_ms), request.valid_until.map(to_ms),
+            request.expires_at.map(to_ms),
+        ],
+    )?;
     transaction.execute(
         "INSERT OR IGNORE INTO event_memories(event_id,memory_id) VALUES(?1,?2)",
         params![event_id.to_string(), memory_id.to_string()],
@@ -1980,14 +2461,14 @@ fn validate_evidence(
 ) -> Result<()> {
     for source in evidence {
         validate_bounded_text("evidence relation", &source.relation, false, 64)?;
-        let event_scope_json: Option<String> = transaction
+        let event: Option<(String, String)> = transaction
             .query_row(
-                "SELECT scope_json FROM events WHERE event_id=?1",
+                "SELECT scope_json,content FROM events WHERE event_id=?1",
                 [source.event_id.to_string()],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        let Some(event_scope_json) = event_scope_json else {
+        let Some((event_scope_json, event_content)) = event else {
             return Err(Error::NotFound {
                 kind: "evidence event",
                 id: source.event_id.to_string(),
@@ -2001,14 +2482,24 @@ fn validate_evidence(
                 "evidence cannot cross namespace, repository, workspace, or branch identity".into(),
             ));
         }
-        if source
-            .span_start
-            .zip(source.span_end)
-            .is_some_and(|(start, end)| start >= end)
-        {
-            return Err(Error::InvalidInput(
-                "evidence span_start must be before span_end".into(),
-            ));
+        match (source.span_start, source.span_end) {
+            (None, None) => {}
+            (Some(start), Some(end))
+                if start < end
+                    && end <= event_content.len()
+                    && event_content.is_char_boundary(start)
+                    && event_content.is_char_boundary(end) => {}
+            (Some(_), Some(_)) => {
+                return Err(Error::InvalidInput(
+                    "evidence spans must be ordered UTF-8 byte ranges within the source event"
+                        .into(),
+                ));
+            }
+            _ => {
+                return Err(Error::InvalidInput(
+                    "evidence span_start and span_end must be supplied together".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -2167,6 +2658,294 @@ struct RawMemoryRow {
     scope_json: String,
 }
 
+fn memory_from_raw(row: RawMemoryRow) -> Result<(MemoryId, Memory)> {
+    let memory_id = parse_memory_id(&row.memory_id)?;
+    let kind = MemoryKind::parse(&row.kind)
+        .ok_or_else(|| Error::Migration("unknown memory kind".into()))?;
+    let state = MemoryState::parse(&row.state)
+        .ok_or_else(|| Error::Migration("unknown memory state".into()))?;
+    let trust = TrustLevel::parse(&row.trust)
+        .ok_or_else(|| Error::Migration("unknown trust level".into()))?;
+    Ok((
+        memory_id,
+        Memory {
+            memory_id,
+            revision: row.revision,
+            kind,
+            state,
+            scope: serde_json::from_str(&row.scope_json)?,
+            canonical_key: row.canonical_key,
+            title: row.title,
+            body: row.body,
+            importance: row.importance,
+            confidence: row.confidence,
+            trust,
+            valid_from: row.valid_from.map(from_ms).transpose()?,
+            valid_until: row.valid_until.map(from_ms).transpose()?,
+            expires_at: row.expires.map(from_ms).transpose()?,
+            created_at: from_ms(row.created)?,
+            updated_at: from_ms(row.updated)?,
+            attributes: serde_json::from_str(&row.attributes_json)?,
+            tags: Vec::new(),
+            entities: Vec::new(),
+            artifacts: Vec::new(),
+            evidence: Vec::new(),
+        },
+    ))
+}
+
+fn load_memory_revision(
+    connection: &Connection,
+    memory_id: MemoryId,
+    revision: u32,
+) -> Result<MemoryRevision> {
+    let row = connection
+        .query_row(
+            "SELECT r.memory_id,r.revision,m.kind,m.state,m.canonical_key,m.importance,m.confidence,m.trust,m.valid_from_ms,m.valid_until_ms,m.expires_at_ms,h.created_at_ms,r.recorded_at_ms,r.title,r.body,r.attributes_json,r.scope_json,m.metadata_complete FROM memory_revisions r JOIN memory_revision_metadata m ON m.memory_id=r.memory_id AND m.revision=r.revision JOIN memory_heads h ON h.memory_id=r.memory_id WHERE r.memory_id=?1 AND r.revision=?2",
+            params![memory_id.to_string(), revision],
+            |row| {
+                Ok((
+                    RawMemoryRow {
+                        memory_id: row.get(0)?,
+                        revision: row.get(1)?,
+                        kind: row.get(2)?,
+                        state: row.get(3)?,
+                        canonical_key: row.get(4)?,
+                        importance: row.get(5)?,
+                        confidence: row.get(6)?,
+                        trust: row.get(7)?,
+                        valid_from: row.get(8)?,
+                        valid_until: row.get(9)?,
+                        expires: row.get(10)?,
+                        created: row.get(11)?,
+                        updated: row.get(12)?,
+                        title: row.get(13)?,
+                        body: row.get(14)?,
+                        attributes_json: row.get(15)?,
+                        scope_json: row.get(16)?,
+                    },
+                    row.get::<_, bool>(17)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound {
+            kind: "memory revision",
+            id: format!("{memory_id}@{revision}"),
+        })?;
+    let (row, metadata_complete) = row;
+    let (_, mut memory) = memory_from_raw(row)?;
+
+    memory.tags = connection
+        .prepare_cached(
+            "SELECT tag FROM memory_tags WHERE memory_id=?1 AND revision=?2 ORDER BY normalized",
+        )?
+        .query_map(params![memory_id.to_string(), revision], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    memory.entities = connection
+        .prepare_cached(
+            "SELECT e.kind,e.canonical,e.display FROM memory_entities me JOIN entities e ON e.entity_id=me.entity_id WHERE me.memory_id=?1 AND me.revision=?2 ORDER BY e.kind,e.canonical",
+        )?
+        .query_map(params![memory_id.to_string(), revision], |row| {
+            Ok(EntityRef {
+                kind: row.get(0)?,
+                canonical: row.get(1)?,
+                display: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    memory.artifacts = connection
+        .prepare_cached(
+            "SELECT a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language FROM memory_artifacts ma JOIN artifacts a ON a.artifact_id=ma.artifact_id WHERE ma.memory_id=?1 AND ma.revision=?2 ORDER BY a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language,a.artifact_id",
+        )?
+        .query_map(params![memory_id.to_string(), revision], |row| {
+            let symbol: String = row.get(2)?;
+            let content_hash: String = row.get(3)?;
+            let git_oid: String = row.get(4)?;
+            let language: String = row.get(5)?;
+            Ok(ArtifactRef {
+                repo_id: row.get(0)?,
+                path: row.get(1)?,
+                symbol: (!symbol.is_empty()).then_some(symbol),
+                content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                git_oid: (!git_oid.is_empty()).then_some(git_oid),
+                language: (!language.is_empty()).then_some(language),
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    memory.evidence = connection
+        .prepare_cached(
+            "SELECT event_id,span_start,span_end,relation FROM memory_evidence WHERE memory_id=?1 AND revision=?2 ORDER BY event_id,relation,span_start,span_end",
+        )?
+        .query_map(params![memory_id.to_string(), revision], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(event_id, span_start, span_end, relation)| {
+            Ok(EvidenceRef {
+                event_id: parse_event_id(&event_id)?,
+                span_start: span_start.map(|value| value as usize),
+                span_end: span_end.map(|value| value as usize),
+                relation,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(MemoryRevision {
+        memory,
+        metadata_complete,
+    })
+}
+
+fn load_events(connection: &Connection, event_ids: &[EventId]) -> Result<Vec<Event>> {
+    if event_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let placeholders = sql_placeholders(event_ids.len());
+    let sql = format!(
+        "SELECT seq,event_id,kind,scope_json,content,attributes_json,trust,occurred_at_ms,ingested_at_ms,redaction_count FROM events WHERE event_id IN ({placeholders}) ORDER BY seq"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(
+            params_from_iter(event_ids.iter().map(ToString::to_string)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                seq,
+                event_id,
+                kind,
+                scope_json,
+                content,
+                attributes_json,
+                trust,
+                occurred_at,
+                ingested_at,
+                redaction_count,
+            )| {
+                Ok(Event {
+                    seq,
+                    event_id: parse_event_id(&event_id)?,
+                    kind: EventKind::parse(&kind)
+                        .ok_or_else(|| Error::Migration("unknown event kind".into()))?,
+                    scope: serde_json::from_str(&scope_json)?,
+                    content,
+                    attributes: serde_json::from_str(&attributes_json)?,
+                    trust: TrustLevel::parse(&trust)
+                        .ok_or_else(|| Error::Migration("unknown event trust level".into()))?,
+                    occurred_at: from_ms(occurred_at)?,
+                    ingested_at: from_ms(ingested_at)?,
+                    redaction_count: usize::try_from(redaction_count)
+                        .map_err(|_| Error::Migration("negative event redaction count".into()))?,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_memory_links(connection: &Connection, memory_id: MemoryId) -> Result<Vec<MemoryLink>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT link_id,source_memory_id,source_revision,target_memory_id,relation,weight,created_event_id,created_at_ms FROM memory_link_revisions WHERE source_memory_id=?1 OR target_memory_id=?1 ORDER BY created_at_ms,source_memory_id,source_revision,target_memory_id,relation",
+    )?;
+    let rows = statement
+        .query_map([memory_id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, u32>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(
+                link_id,
+                source_memory_id,
+                source_revision,
+                target_memory_id,
+                relation,
+                weight,
+                created_event_id,
+                created_at,
+            )| {
+                Ok(MemoryLink {
+                    link_id: parse_link_id(&link_id)?,
+                    source_memory_id: parse_memory_id(&source_memory_id)?,
+                    source_revision,
+                    target_memory_id: parse_memory_id(&target_memory_id)?,
+                    relation,
+                    weight: u16::try_from(weight)
+                        .map_err(|_| Error::Migration("invalid memory link weight".into()))?,
+                    created_event_id: parse_event_id(&created_event_id)?,
+                    created_at: from_ms(created_at)?,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_memory_feedback(
+    connection: &Connection,
+    memory_id: MemoryId,
+) -> Result<Vec<MemoryFeedback>> {
+    let mut statement = connection.prepare_cached(
+        "SELECT feedback_id,query_id,memory_id,signal,note,created_at_ms FROM feedback WHERE memory_id=?1 ORDER BY feedback_id",
+    )?;
+    let rows = statement
+        .query_map([memory_id.to_string()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    rows.into_iter()
+        .map(
+            |(feedback_id, query_id, memory_id, signal, note, created_at)| {
+                Ok(MemoryFeedback {
+                    feedback_id,
+                    query_id: query_id.as_deref().map(parse_query_id).transpose()?,
+                    memory_id: parse_memory_id(&memory_id)?,
+                    signal: crate::FeedbackSignal::parse(&signal)
+                        .ok_or_else(|| Error::Migration("unknown feedback signal".into()))?,
+                    note,
+                    created_at: from_ms(created_at)?,
+                })
+            },
+        )
+        .collect()
+}
+
 fn load_memories(
     connection: &Connection,
     memory_ids: &[MemoryId],
@@ -2206,39 +2985,8 @@ fn load_memories(
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         for row in rows {
-            let memory_id = parse_memory_id(&row.memory_id)?;
-            let kind = MemoryKind::parse(&row.kind)
-                .ok_or_else(|| Error::Migration("unknown memory kind".into()))?;
-            let state = MemoryState::parse(&row.state)
-                .ok_or_else(|| Error::Migration("unknown memory state".into()))?;
-            let trust = TrustLevel::parse(&row.trust)
-                .ok_or_else(|| Error::Migration("unknown trust level".into()))?;
-            memories.insert(
-                memory_id,
-                Memory {
-                    memory_id,
-                    revision: row.revision,
-                    kind,
-                    state,
-                    scope: serde_json::from_str(&row.scope_json)?,
-                    canonical_key: row.canonical_key,
-                    title: row.title,
-                    body: row.body,
-                    importance: row.importance,
-                    confidence: row.confidence,
-                    trust,
-                    valid_from: row.valid_from.map(from_ms).transpose()?,
-                    valid_until: row.valid_until.map(from_ms).transpose()?,
-                    expires_at: row.expires.map(from_ms).transpose()?,
-                    created_at: from_ms(row.created)?,
-                    updated_at: from_ms(row.updated)?,
-                    attributes: serde_json::from_str(&row.attributes_json)?,
-                    tags: Vec::new(),
-                    entities: Vec::new(),
-                    artifacts: Vec::new(),
-                    evidence: Vec::new(),
-                },
-            );
+            let (memory_id, memory) = memory_from_raw(row)?;
+            memories.insert(memory_id, memory);
         }
     }
     if memories.len() != memory_ids.len() {
@@ -2690,15 +3438,35 @@ fn feedback_score(positive: i64, negative: i64) -> f64 {
 }
 
 fn artifact_verified(memory: &[ArtifactRef], current: &[ArtifactRef]) -> bool {
-    memory.iter().any(|old| {
-        current.iter().any(|now| {
-            old.repo_id == now.repo_id
-                && old.path == now.path
-                && old.symbol == now.symbol
-                && old.content_hash.is_some()
-                && old.content_hash == now.content_hash
+    let verifiable = memory
+        .iter()
+        .filter(|artifact| artifact.content_hash.is_some())
+        .collect::<Vec<_>>();
+    !verifiable.is_empty()
+        && verifiable.iter().all(|old| {
+            current.iter().any(|now| {
+                old.repo_id == now.repo_id
+                    && old.path == now.path
+                    && old.symbol == now.symbol
+                    && old.content_hash == now.content_hash
+            })
         })
-    })
+}
+
+fn merge_artifact_hints(current: &mut Vec<ArtifactRef>, inferred: Vec<ArtifactRef>) {
+    for artifact in inferred {
+        if current.len() >= MAX_COLLECTION_ITEMS {
+            break;
+        }
+        let already_present = current.iter().any(|existing| {
+            existing.repo_id == artifact.repo_id
+                && existing.path == artifact.path
+                && existing.symbol == artifact.symbol
+        });
+        if !already_present {
+            current.push(artifact);
+        }
+    }
 }
 
 fn valid_at(memory: &Memory, at: DateTime<Utc>) -> bool {
@@ -2716,42 +3484,97 @@ fn compile_context(
     let mut grouped = BTreeMap::<u8, (String, Vec<ContextItem>)>::new();
     // Reserve space for the compact, single untrusted envelope added by
     // adapters. This constant is part of the adapter/core budget contract.
-    let envelope_reserve = 40.min(token_budget);
-    let mut remaining = token_budget.saturating_sub(envelope_reserve);
+    let envelope_reserve = 37.min(token_budget);
+    let render_budget = token_budget.saturating_sub(envelope_reserve);
+    let mut rendered_tokens = 0_usize;
     let mut warnings = Vec::new();
     let mut accepted_hits = Vec::new();
 
     // MMR already orders by relevance/diversity. Allocate the scarce token
     // budget in that order, then group accepted items only for presentation.
-    for hit in hits {
+    // Budget the exact escaped fragments that will be rendered; otherwise
+    // `&<>`, citations, and warnings can expand after selection and force a
+    // blind truncation that disagrees with the structured views.
+    for mut hit in hits {
         let (priority, section) = section_for(hit.memory.kind);
-        let overhead = estimate_tokens(&hit.memory.title).saturating_add(24);
-        if remaining <= overhead {
-            continue;
-        }
-        let available_body = remaining - overhead;
-        let body = truncate_to_tokens(&hit.memory.body, available_body);
-        let estimated_tokens = overhead + estimate_tokens(&body);
-        if estimated_tokens > remaining || body.is_empty() {
-            continue;
-        }
-        remaining -= estimated_tokens;
+        let section_tokens = if grouped.contains_key(&priority) {
+            0
+        } else {
+            estimate_tokens(&format!("\n[{section}]\n"))
+        };
+        let mut hit_warnings = Vec::new();
         if matches!(
             hit.applicability,
             Applicability::Stale | Applicability::Divergent
         ) {
-            warnings.push(format!(
+            hit_warnings.push(format!(
                 "Memory {} is {}; verify it against the current repository before acting.",
                 hit.memory.memory_id,
                 hit.applicability.as_str()
             ));
         }
         if hit.memory.state == MemoryState::Contested {
-            warnings.push(format!(
+            hit_warnings.push(format!(
                 "Memory {} is contested by other evidence.",
                 hit.memory.memory_id
             ));
         }
+        let warning_header_tokens = if !hit_warnings.is_empty() && warnings.is_empty() {
+            estimate_tokens("\n[warnings]\n")
+        } else {
+            0
+        };
+        let warning_tokens = hit_warnings
+            .iter()
+            .map(|warning| estimate_tokens(&render_warning(warning)))
+            .sum::<usize>();
+        let fixed_tokens = section_tokens
+            .saturating_add(warning_header_tokens)
+            .saturating_add(warning_tokens);
+        let Some(item_budget) = render_budget
+            .checked_sub(rendered_tokens)
+            .and_then(|remaining| remaining.checked_sub(fixed_tokens))
+        else {
+            continue;
+        };
+
+        let mut low = 1_usize;
+        let mut high = item_budget.max(1);
+        let mut selected = None;
+        while low <= high {
+            let middle = low + (high - low) / 2;
+            let body = truncate_to_tokens(&hit.memory.body, middle);
+            let fragment = render_context_item(
+                &hit.memory.title,
+                &body,
+                hit.memory.memory_id,
+                hit.memory.revision,
+                hit.applicability,
+            );
+            let fragment_tokens = estimate_tokens(&fragment);
+            if !body.is_empty() && fragment_tokens <= item_budget {
+                selected = Some((body, fragment_tokens));
+                low = middle.saturating_add(1);
+            } else {
+                if middle == 0 {
+                    break;
+                }
+                high = middle - 1;
+            }
+        }
+        let Some((body, estimated_tokens)) = selected else {
+            continue;
+        };
+
+        rendered_tokens = rendered_tokens
+            .saturating_add(fixed_tokens)
+            .saturating_add(estimated_tokens);
+        warnings.extend(hit_warnings);
+        // `ContextPack::hits` is part of the structured recall result, so it
+        // must obey the same body budget as `sections` and `rendered`. Dropping
+        // the original allocation here also prevents a short excerpt from
+        // retaining a potentially megabyte-sized source body in the pack.
+        hit.memory.body.clone_from(&body);
         let item = ContextItem {
             memory_id: hit.memory.memory_id,
             revision: hit.memory.revision,
@@ -2791,9 +3614,9 @@ fn compile_context(
             hits: accepted_hits,
         };
     }
-    let rendered = render_context(query_id, &sections, &warnings);
-    let rendered = truncate_to_tokens(&rendered, token_budget.saturating_sub(envelope_reserve));
+    let rendered = render_context(&sections, &warnings);
     let estimated_tokens = estimate_tokens(&rendered).saturating_add(envelope_reserve);
+    debug_assert!(estimated_tokens <= token_budget);
     ContextPack {
         query_id,
         database_seq,
@@ -2857,34 +3680,49 @@ fn truncate_to_tokens(text: &str, tokens: usize) -> String {
     truncated
 }
 
-fn render_context(query_id: QueryId, sections: &[ContextSection], warnings: &[String]) -> String {
-    let mut output = format!("Query: `{query_id}`\n");
+fn render_context(sections: &[ContextSection], warnings: &[String]) -> String {
+    let mut output = String::new();
     for section in sections {
         let _ = write!(output, "\n[{}]\n", section.name);
         for item in &section.items {
-            let title = escape_rendered_data(&item.title).replace(['\r', '\n'], " ");
-            let body = escape_rendered_data(&item.body)
-                .replace("\r\n", "\n")
-                .replace('\r', "\n")
-                .replace('\n', "\n  ");
-            let _ = writeln!(
-                output,
-                "- {}: {} [memory:{} rev:{}; {}]",
-                title,
-                body,
+            output.push_str(&render_context_item(
+                &item.title,
+                &item.body,
                 item.memory_id,
                 item.revision,
-                item.applicability.as_str()
-            );
+                item.applicability,
+            ));
         }
     }
     if !warnings.is_empty() {
         output.push_str("\n[warnings]\n");
         for warning in warnings {
-            let _ = writeln!(output, "- {}", escape_rendered_data(warning));
+            output.push_str(&render_warning(warning));
         }
     }
     output
+}
+
+fn render_context_item(
+    title: &str,
+    body: &str,
+    memory_id: MemoryId,
+    revision: u32,
+    applicability: Applicability,
+) -> String {
+    let title = escape_rendered_data(title).replace(['\r', '\n'], " ");
+    let body = escape_rendered_data(body)
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "\n  ");
+    format!(
+        "- {title}: {body} [memory:{memory_id} rev:{revision}; {}]\n",
+        applicability.as_str()
+    )
+}
+
+fn render_warning(warning: &str) -> String {
+    format!("- {}\n", escape_rendered_data(warning))
 }
 
 fn escape_rendered_data(text: &str) -> String {
@@ -2935,6 +3773,18 @@ fn parse_event_id(value: &str) -> Result<EventId> {
         .map_err(|error| Error::Migration(format!("invalid event UUID {value}: {error}")))
 }
 
+fn parse_query_id(value: &str) -> Result<QueryId> {
+    uuid::Uuid::parse_str(value)
+        .map(QueryId)
+        .map_err(|error| Error::Migration(format!("invalid query UUID {value}: {error}")))
+}
+
+fn parse_link_id(value: &str) -> Result<LinkId> {
+    uuid::Uuid::parse_str(value)
+        .map(LinkId)
+        .map_err(|error| Error::Migration(format!("invalid link UUID {value}: {error}")))
+}
+
 fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
     value
         .get(field)
@@ -2942,10 +3792,55 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::InvalidInput(format!("import field {field:?} must be a string")))
 }
 
-fn snapshot_columns(table: &str) -> Option<&'static [&'static str]> {
+fn snapshot_tables(version: u32) -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
+    let additions: &'static [(&'static str, &'static [&'static str])] =
+        if version >= SNAPSHOT_SCHEMA_VERSION {
+            SNAPSHOT_V2_TABLES
+        } else {
+            &[]
+        };
     SNAPSHOT_TABLES
         .iter()
-        .find_map(|(candidate, columns)| (*candidate == table).then_some(*columns))
+        .copied()
+        .chain(additions.iter().copied())
+}
+
+fn snapshot_columns(table: &str, version: u32) -> Option<&'static [&'static str]> {
+    snapshot_tables(version)
+        .find_map(|(candidate, columns)| (candidate == table).then_some(columns))
+}
+
+fn backfill_revision_provenance(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r"
+        INSERT OR IGNORE INTO memory_revision_metadata(
+            memory_id,revision,kind,state,canonical_key,importance,
+            confidence,trust,valid_from_ms,valid_until_ms,expires_at_ms,
+            metadata_complete
+        )
+        SELECT r.memory_id,r.revision,h.kind,h.state,h.canonical_key,
+               h.importance,h.confidence,h.trust,h.valid_from_ms,
+               h.valid_until_ms,h.expires_at_ms,
+               CASE WHEN r.revision=h.head_revision
+                         AND r.recorded_seq=h.updated_seq
+                    THEN 1 ELSE 0 END
+        FROM memory_revisions r
+        JOIN memory_heads h ON h.memory_id=r.memory_id;
+
+        INSERT OR IGNORE INTO memory_link_revisions(
+            link_id,source_memory_id,source_revision,target_memory_id,
+            relation,weight,created_event_id,created_at_ms
+        )
+        SELECT l.link_id,l.source_memory_id,r.revision,
+               l.target_memory_id,l.relation,l.weight,
+               l.created_event_id,l.created_at_ms
+        FROM memory_links l
+        JOIN events e ON e.event_id=l.created_event_id
+        JOIN memory_revisions r
+          ON r.memory_id=l.source_memory_id AND r.recorded_seq=e.seq;
+        ",
+    )?;
+    Ok(())
 }
 
 fn export_table(
@@ -3059,7 +3954,7 @@ fn rebuild_all_fts(transaction: &Transaction<'_>) -> Result<()> {
 }
 
 fn table_count(connection: &Connection, table: &str) -> Result<usize> {
-    if snapshot_columns(table).is_none() {
+    if snapshot_columns(table, SNAPSHOT_SCHEMA_VERSION).is_none() {
         return Err(Error::InvalidInput(format!(
             "unknown snapshot table {table}"
         )));
@@ -3084,6 +3979,41 @@ mod tests {
 
     fn engine() -> MemoryEngine {
         MemoryEngine::open_in_memory(EngineOptions::default()).unwrap()
+    }
+
+    fn as_legacy_v1_snapshot(snapshot: &str) -> String {
+        let mut lines = snapshot.lines();
+        let mut header: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        header["schema_version"] = json!(LEGACY_SNAPSHOT_SCHEMA_VERSION);
+        let mut rows = Vec::new();
+        let mut counts = BTreeMap::<String, usize>::new();
+        let mut digest = blake3::Hasher::new();
+        for line in lines {
+            let value: Value = serde_json::from_str(line).unwrap();
+            if value["record_type"] == "super_mem_export_end" {
+                break;
+            }
+            let table = value["table"].as_str().unwrap();
+            if matches!(table, "memory_revision_metadata" | "memory_link_revisions") {
+                continue;
+            }
+            digest.update(line.as_bytes());
+            digest.update(b"\n");
+            *counts.entry(table.to_owned()).or_default() += 1;
+            rows.push(line.to_owned());
+        }
+        for (table, _) in snapshot_tables(LEGACY_SNAPSHOT_SCHEMA_VERSION) {
+            counts.entry(table.to_owned()).or_default();
+        }
+        let footer = json!({
+            "record_type": "super_mem_export_end",
+            "row_counts": counts,
+            "rows_blake3": digest.finalize().to_hex().to_string(),
+        });
+        let mut output = vec![serde_json::to_string(&header).unwrap()];
+        output.extend(rows);
+        output.push(serde_json::to_string(&footer).unwrap());
+        output.join("\n") + "\n"
     }
 
     fn remember_request(title: &str, body: &str) -> RememberRequest {
@@ -3150,6 +4080,109 @@ mod tests {
     }
 
     #[test]
+    fn revision_metadata_and_link_provenance_are_immutable() {
+        let engine = engine();
+        let target = engine
+            .remember(remember_request("Target", "linked target"))
+            .unwrap()
+            .memory_ids[0];
+        let mut first = remember_request("Revision one", "first body");
+        first.canonical_key = Some("revision-history".into());
+        first.importance = 0.2;
+        first.confidence = 0.3;
+        first.trust = TrustLevel::External;
+        first.links = vec![crate::LinkInput {
+            target,
+            relation: "documents".into(),
+            weight: 100,
+        }];
+        let memory_id = engine.remember(first).unwrap().memory_ids[0];
+
+        let mut second = remember_request("Revision two", "second body");
+        second.canonical_key = Some("revision-history".into());
+        second.importance = 0.8;
+        second.confidence = 0.9;
+        second.trust = TrustLevel::UserConfirmed;
+        second.links = vec![crate::LinkInput {
+            target,
+            relation: "documents".into(),
+            weight: 900,
+        }];
+        assert_eq!(engine.remember(second).unwrap().memory_ids[0], memory_id);
+
+        let connection = engine.lock().unwrap();
+        let revisions = connection
+            .prepare(
+                "SELECT revision,importance,confidence,trust FROM memory_revision_metadata WHERE memory_id=?1 ORDER BY revision",
+            )
+            .unwrap()
+            .query_map([memory_id.to_string()], |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, f32>(1)?,
+                    row.get::<_, f32>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(revisions[0].0, 1);
+        assert_eq!(revisions[0].1.to_bits(), 0.2_f32.to_bits());
+        assert_eq!(revisions[0].2.to_bits(), 0.3_f32.to_bits());
+        assert_eq!(revisions[0].3, "external");
+        assert_eq!(revisions[1].0, 2);
+        assert_eq!(revisions[1].1.to_bits(), 0.8_f32.to_bits());
+        assert_eq!(revisions[1].2.to_bits(), 0.9_f32.to_bits());
+        assert_eq!(revisions[1].3, "user_confirmed");
+
+        let link_weights = connection
+            .prepare(
+                "SELECT source_revision,weight FROM memory_link_revisions WHERE source_memory_id=?1 ORDER BY source_revision",
+            )
+            .unwrap()
+            .query_map([memory_id.to_string()], |row| {
+                Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?))
+            })
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(link_weights, [(1, 100_i64), (2, 900_i64)]);
+        connection
+            .execute(
+                "DELETE FROM event_memories WHERE memory_id=?1 AND event_id IN (SELECT created_event_id FROM memory_link_revisions WHERE target_memory_id=?1)",
+                [target.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let history = engine.history(memory_id).unwrap();
+        assert_eq!(history.revisions.len(), 2);
+        assert_eq!(history.revisions[0].memory.title, "Revision one");
+        assert_eq!(history.revisions[0].memory.trust, TrustLevel::External);
+        assert!(history.revisions[0].metadata_complete);
+        assert_eq!(history.revisions[1].memory.title, "Revision two");
+        assert!(history.revisions[1].metadata_complete);
+        assert_eq!(history.links.len(), 2);
+        assert_eq!(history.events.len(), 2);
+        let target_history = engine.history(target).unwrap();
+        assert_eq!(target_history.links.len(), 2);
+        assert!(
+            target_history
+                .links
+                .iter()
+                .all(|link| link.target_memory_id == target)
+        );
+        assert!(target_history.links.iter().all(|link| {
+            target_history
+                .events
+                .iter()
+                .any(|event| event.event_id == link.created_event_id)
+        }));
+    }
+
+    #[test]
     fn recall_is_safe_ranked_and_budgeted() {
         let engine = engine();
         let mut request = remember_request(
@@ -3169,6 +4202,44 @@ mod tests {
         assert_eq!(pack.hits.len(), 1);
         assert!(pack.estimated_tokens <= 80);
         assert!(pack.rendered.contains("cargo clean"));
+    }
+
+    #[test]
+    fn structured_recall_does_not_retain_body_beyond_the_context_budget() {
+        let engine = engine();
+        let omitted_tail = "OMITTED_FULL_BODY_TAIL_SENTINEL";
+        let body = format!(
+            "budget-sentinel beginning {} {omitted_tail}",
+            "x".repeat(900_000)
+        );
+        engine
+            .remember(remember_request("Budget sentinel", &body))
+            .unwrap();
+
+        let pack = engine
+            .recall(RecallRequest {
+                query: "budget-sentinel".into(),
+                token_budget: Some(80),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(pack.hits.len(), 1);
+        assert_eq!(pack.sections.len(), 1);
+        assert_eq!(pack.sections[0].items.len(), 1);
+        assert_eq!(pack.hits[0].memory.body, pack.sections[0].items[0].body);
+        assert!(!pack.hits[0].memory.body.is_empty());
+        assert!(pack.hits[0].memory.body.len() < body.len());
+        assert!(!pack.hits[0].memory.body.contains(omitted_tail));
+        assert!(pack.rendered.contains(&pack.hits[0].memory.body));
+
+        let encoded = serde_json::to_string(&pack).unwrap();
+        assert!(!encoded.contains(omitted_tail));
+        assert!(
+            encoded.len() < 32 * 1024,
+            "structured recall unexpectedly serialized {} bytes",
+            encoded.len()
+        );
     }
 
     #[test]
@@ -3209,6 +4280,98 @@ mod tests {
     }
 
     #[test]
+    fn session_checkpoint_is_grounded_in_prompt_and_tool_events_and_retries_cleanly() {
+        let engine = engine();
+        let scope = Scope {
+            session_id: Some("session-1".into()),
+            ..Scope::default()
+        };
+        let prompt = engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Fix the SQLite migration race".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let tool = engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "all migration concurrency tests passed".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test migration")),
+                    ("succeeded".into(), json!(true)),
+                    ("verification".into(), json!(true)),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let request = CheckpointRequest {
+            idempotency_key: Some("session-checkpoint-1".into()),
+            scope,
+            goal: "coding task".into(),
+            summary: "Serialized migrations; password=verysecretvalue".into(),
+            outcome: CheckpointOutcome::Success,
+            ..CheckpointRequest::default()
+        };
+
+        let first = engine.checkpoint_session(request.clone()).unwrap();
+        let mut retry_request = request.clone();
+        retry_request.scope.session_id = Some("session-2".into());
+        let retry = engine.checkpoint_session(retry_request).unwrap();
+        assert!(retry.deduplicated);
+        assert_eq!(first.memory_ids, retry.memory_ids);
+        assert_eq!(first.memory_ids.len(), 2);
+
+        let episode = engine.get(first.memory_ids[0]).unwrap();
+        assert!(episode.title.contains("Fix the SQLite migration race"));
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == prompt.event_id)
+        );
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == tool.event_id)
+        );
+        assert!(episode.body.contains("cargo test migration"));
+
+        let second = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("session-checkpoint-2".into()),
+                scope: request.scope,
+                goal: "coding task".into(),
+                summary: request.summary,
+                outcome: CheckpointOutcome::Success,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert!(!second.deduplicated);
+        assert_eq!(second.memory_ids.len(), 1);
+        let second_episode = engine.get(second.memory_ids[0]).unwrap();
+        assert!(
+            !second_episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == prompt.event_id)
+        );
+        assert!(
+            !second_episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == tool.event_id)
+        );
+    }
+
+    #[test]
     fn feedback_does_not_change_confidence() {
         let engine = engine();
         let id = engine
@@ -3225,6 +4388,9 @@ mod tests {
             })
             .unwrap();
         assert!((engine.get(id).unwrap().confidence - before).abs() < f32::EPSILON);
+        let history = engine.history(id).unwrap();
+        assert_eq!(history.feedback.len(), 1);
+        assert_eq!(history.feedback[0].signal, FeedbackSignal::Helpful);
     }
 
     #[test]
@@ -3359,6 +4525,10 @@ mod tests {
             .unwrap();
         assert!(pack.hits.is_empty());
         assert!(engine.export_jsonl().unwrap().contains("deprecated_switch"));
+        let history = engine.history(id).unwrap();
+        assert!(history.events.iter().any(
+            |event| event.kind == EventKind::Lifecycle && event.content == "No longer applies"
+        ));
     }
 
     #[test]
@@ -3393,6 +4563,47 @@ mod tests {
                 .body
                 .contains("</super-mem-context>")
         );
+    }
+
+    #[test]
+    fn rendered_and_structured_context_remain_consistent_after_escaping_and_warnings() {
+        let engine = engine();
+        let memory_id = engine
+            .remember(remember_request(
+                &"<&>".repeat(10),
+                &format!("{} tail-sentinel", "<&>".repeat(500)),
+            ))
+            .unwrap()
+            .memory_ids[0];
+        let mut memory = engine.get(memory_id).unwrap();
+        memory.state = MemoryState::Contested;
+        let hit = RecallHit {
+            memory,
+            score: 1.0,
+            applicability: Applicability::Stale,
+            signals: vec![RetrievalSignal::Lexical],
+            reasons: vec!["lexical_match".into()],
+        };
+        let pack = compile_context(QueryId::new(), 1, 320, vec![hit]);
+
+        assert_eq!(pack.hits.len(), 1);
+        assert_eq!(pack.sections.len(), 1);
+        assert_eq!(pack.warnings.len(), 2);
+        assert_eq!(pack.hits[0].memory.body, pack.sections[0].items[0].body);
+        let item = &pack.sections[0].items[0];
+        let exact_fragment = render_context_item(
+            &item.title,
+            &item.body,
+            item.memory_id,
+            item.revision,
+            item.applicability,
+        );
+        assert!(pack.rendered.contains(&exact_fragment));
+        assert_eq!(
+            pack.rendered,
+            render_context(&pack.sections, &pack.warnings)
+        );
+        assert!(pack.estimated_tokens <= pack.token_budget);
     }
 
     #[test]
@@ -4304,7 +5515,52 @@ mod tests {
     }
 
     #[test]
-    fn v1_snapshot_accepts_legacy_duplicate_canonical_heads_losslessly() {
+    fn legacy_v1_snapshot_restores_text_and_marks_inferred_revision_metadata() {
+        let source = engine();
+        let target = source
+            .remember(remember_request("Legacy target", "link target exact text"))
+            .unwrap()
+            .memory_ids[0];
+        let mut first = remember_request("Legacy history", "revision one exact text");
+        first.canonical_key = Some("legacy-history".into());
+        first.importance = 0.2;
+        first.trust = TrustLevel::External;
+        first.links = vec![crate::LinkInput {
+            target,
+            relation: "documents".into(),
+            weight: 400,
+        }];
+        let memory_id = source.remember(first).unwrap().memory_ids[0];
+        let mut second = remember_request("Legacy history", "revision two exact text");
+        second.canonical_key = Some("legacy-history".into());
+        second.importance = 0.9;
+        second.trust = TrustLevel::UserConfirmed;
+        source.remember(second).unwrap();
+        source
+            .retract(RetractRequest {
+                memory_id,
+                reason: "legacy lifecycle change".into(),
+                idempotency_key: None,
+            })
+            .unwrap();
+
+        let legacy = as_legacy_v1_snapshot(&source.export_jsonl().unwrap());
+        let mut restored = engine();
+        restored.import_jsonl(&legacy).unwrap();
+        let history = restored.history(memory_id).unwrap();
+        assert_eq!(history.current.state, MemoryState::Retracted);
+        assert_eq!(history.revisions.len(), 2);
+        assert_eq!(history.revisions[0].memory.body, "revision one exact text");
+        assert!(!history.revisions[0].metadata_complete);
+        assert_eq!(history.revisions[1].memory.body, "revision two exact text");
+        assert!(!history.revisions[1].metadata_complete);
+        assert_eq!(history.links.len(), 1);
+        assert_eq!(history.links[0].source_revision, 1);
+        assert_eq!(history.links[0].target_memory_id, target);
+    }
+
+    #[test]
+    fn snapshot_accepts_legacy_duplicate_canonical_heads_losslessly() {
         let source = engine();
         let mut first = remember_request("Legacy duplicate A", "first explicit head");
         first.memory_id = Some(MemoryId::new());

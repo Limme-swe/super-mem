@@ -58,6 +58,18 @@ The production schema is richer; this smaller format is portable across evaluato
 
 A record can be absent from current context but available to a historical query. In the supersession case, `must_not_return` means “not current,” not “erase history.”
 
+## Deterministic fixture regression
+
+Run the checked-in contract test with Node.js:
+
+```sh
+node scripts/validate-eval-fixture.mjs
+```
+
+The script uses only the Node.js standard library. It checks case and record references, provenance, repository-graph integrity, supersession order, repository isolation, Git ancestry and divergence, changed artifact and symbol digests, exact diagnostic signals, required and forbidden results, and the evidence behind relative-rank assertions. CI runs the same command.
+
+This is a deterministic regression for the fixture and its labeled retrieval intent. It does not run the production engine or claim retrieval-quality measurements; a production evaluator must also follow the contract below.
+
 ## Evaluator contract
 
 For each case, an evaluator must:

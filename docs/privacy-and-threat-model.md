@@ -52,13 +52,13 @@ Repository policy belongs in AGENTS.md, CLAUDE.md, checked-in documentation, or 
 
 ### Poisoning and stale knowledge
 
-Records keep source evidence, outcome, revision history, and feedback. Failed attempts remain distinct from successful procedures. Corrections can supersede or contest older records without deleting their history.
+Records keep source evidence, outcome, revision history, revision-scoped links, and feedback. Failed attempts remain distinct from successful procedures. Corrections can supersede or contest older records without deleting their history. CLI and MCP history inspection exposes this audit data to an authorized caller.
 
-Repository memories are checked against current Git and artifact state. Stale or divergent records are labeled accordingly instead of being returned as current facts.
+Repository memories are checked against current Git and artifact state. Stale records require an explicit stale-data option, and divergent records require a separate opt-in. A complete matching artifact set can establish exact applicability despite unrelated dirty files; incomplete automatic Git capture is discarded rather than treated as proof.
 
 ### Local storage
 
-New database directories and files use restrictive permissions where the platform supports them. The default balanced mode uses SQLite WAL with synchronous=NORMAL: it preserves consistency across ordinary process crashes, but the newest acknowledged commit may be lost after an operating-system or power failure. Snapshot exports include table counts and an integrity footer. Import is atomic and only restores into an otherwise empty store.
+New database directories and files use restrictive permissions where the platform supports them. The default balanced mode uses SQLite WAL with synchronous=NORMAL: it preserves consistency across ordinary process crashes, but the newest acknowledged commit may be lost after an operating-system or power failure. Snapshot v2 exports include revision metadata, historical links, table counts, and an integrity footer. Import is atomic, only restores into an otherwise empty store, and accepts v1 snapshots. Historical non-head metadata unavailable in a legacy store or snapshot is marked incomplete rather than presented as exact.
 
 The database application ID is checked before destructive operations. Search indexes are derived state and can be rebuilt from canonical rows.
 
@@ -87,11 +87,11 @@ The operations have different meanings:
 | --- | --- |
 | Supersede | Keep history and make a newer revision current. |
 | Retract | Remove a memory from ordinary recall while retaining its audit history. |
-| Purge | Delete the complete local database, WAL, and shared-memory sidecar. |
+| Purge | Delete the complete local database, WAL, shared-memory, and rollback-journal files. |
 
 Purge is available only through the human-facing CLI and requires explicit confirmation. It is not exposed through MCP.
 
-Stop every CLI, MCP, hook, and harness process using the store before purging. SQLite cannot reliably detect a process that still holds an idle database handle. Such a process may retain or recreate WAL state after deletion.
+Stop every CLI, MCP, hook, and harness process using the store before purging. SQLite cannot reliably detect a process that still holds an idle database handle. Such a process may retain or recreate WAL or rollback-journal state after deletion.
 
 Purge refuses symlinks and, on Unix, paths with multiple hard links. V0.1 refuses purge on Windows because safe stable Rust does not expose the hard-link count needed to verify that no linked name survives.
 

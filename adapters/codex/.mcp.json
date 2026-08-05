@@ -1,0 +1,11 @@
+{
+  "super_mem": {
+    "command": "supermem",
+    "args": ["mcp", "--root", "."],
+    "env_vars": [
+      "SUPER_MEM_DB",
+      "SUPER_MEM_NAMESPACE",
+      "SUPER_MEM_WORKSPACE"
+    ]
+  }
+}

@@ -10,12 +10,8 @@
   "repository": "https://github.com/Limme-swe/super-mem",
   "license": "MIT",
   "keywords": ["memory", "coding-agents", "mcp", "git"],
-  "mcpServers": {
-    "super_mem": {
-      "command": "supermem",
-      "args": ["mcp", "--root", ".", "--namespace", "default"]
-    }
-  },
+  "mcpServers": "./.mcp.json",
+  "hooks": "./hooks/hooks.json",
   "interface": {
     "displayName": "Super Mem",
     "shortDescription": "Repository-aware memory for coding agents.",
@@ -23,6 +19,9 @@
     "developerName": "super-mem contributors",
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],
-    "defaultPrompt": "Recall relevant repository decisions and failed attempts before I start."
+    "defaultPrompt": [
+      "Recall relevant repository decisions and failed attempts before I start.",
+      "Check memory for verified fixes related to this task."
+    ]
   }
 }

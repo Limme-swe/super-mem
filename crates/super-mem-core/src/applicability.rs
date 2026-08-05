@@ -64,31 +64,39 @@ where
         _ => {}
     }
 
-    let mut verified = false;
-    for historical in memory_artifacts {
-        if historical.repo_id.is_empty() {
-            continue;
-        }
-        for current in current_artifacts {
-            if historical.repo_id == current.repo_id
+    let mut verifiable = 0_usize;
+    let mut verified = 0_usize;
+    for historical in memory_artifacts
+        .iter()
+        .filter(|artifact| artifact.content_hash.is_some())
+    {
+        verifiable += 1;
+        let current = current_artifacts.iter().find(|current| {
+            historical.repo_id == current.repo_id
                 && historical.path == current.path
                 && historical.symbol == current.symbol
-            {
-                match (&historical.content_hash, &current.content_hash) {
-                    (Some(old), Some(now)) if old != now => return Applicability::Stale,
-                    (Some(_), Some(_)) => verified = true,
-                    _ => {}
-                }
-            }
+        });
+        match (
+            historical.content_hash.as_deref(),
+            current.and_then(|artifact| artifact.content_hash.as_deref()),
+        ) {
+            (Some(old), Some(now)) if old != now => return Applicability::Stale,
+            (Some(_), Some(_)) => verified += 1,
+            _ => {}
         }
     }
+    let artifact_set_verified = verifiable > 0 && verified == verifiable;
 
     if memory_repo.dirty_hash != current_repo.dirty_hash
         && (memory_repo.dirty_hash.is_some() || current_repo.dirty_hash.is_some())
     {
-        return Applicability::Stale;
+        return if artifact_set_verified {
+            Applicability::Exact
+        } else {
+            Applicability::Stale
+        };
     }
-    if verified {
+    if artifact_set_verified {
         return Applicability::Exact;
     }
 
@@ -185,6 +193,39 @@ mod tests {
         current.repository.as_mut().unwrap().dirty_hash = Some("dirty".into());
         assert_eq!(
             classify_applicability(&memory, &current, &[], &[]),
+            Applicability::Stale
+        );
+    }
+
+    #[test]
+    fn complete_artifact_verification_survives_unrelated_dirty_changes() {
+        let mut memory = scope("repo", "main");
+        let mut current = memory.clone();
+        memory.repository.as_mut().unwrap().dirty_hash = Some("before".into());
+        current.repository.as_mut().unwrap().dirty_hash = Some("after".into());
+        let first = ArtifactRef {
+            repo_id: "repo".into(),
+            path: "src/lib.rs".into(),
+            content_hash: Some("lib-hash".into()),
+            ..ArtifactRef::default()
+        };
+        let second = ArtifactRef {
+            path: "tests/integration.rs".into(),
+            content_hash: Some("test-hash".into()),
+            ..first.clone()
+        };
+
+        assert_eq!(
+            classify_applicability(
+                &memory,
+                &current,
+                &[first.clone(), second.clone()],
+                &[first.clone(), second.clone()]
+            ),
+            Applicability::Exact
+        );
+        assert_eq!(
+            classify_applicability(&memory, &current, &[first, second], &[]),
             Applicability::Stale
         );
     }

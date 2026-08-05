@@ -15,6 +15,7 @@
 //! Events and memory revisions are immutable; search indexes are derived state.
 
 mod applicability;
+mod artifacts;
 mod engine;
 mod error;
 mod git;
@@ -24,6 +25,7 @@ mod schema;
 mod types;
 
 pub use applicability::classify_applicability;
+pub use artifacts::{capture_artifact_paths, capture_changed_artifacts};
 pub use engine::MemoryEngine;
 pub use error::{Error, Result};
 pub use git::{canonical_path_digest, compare_revisions, discover_repository, normalize_remote};

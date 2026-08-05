@@ -14,9 +14,10 @@ use serde_json::json;
 #[cfg(unix)]
 use super_mem_core::is_super_mem_database;
 use super_mem_core::{
-    CheckpointOutcome, CheckpointRequest, EngineOptions, EventKind, FeedbackRequest,
-    FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest, QueryId, RecallRequest,
-    RememberRequest, RetractRequest, Scope, TrustLevel, discover_repository,
+    ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextHints, EngineOptions, EventKind,
+    FeedbackRequest, FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest, QueryId,
+    RecallRequest, RememberRequest, RetractRequest, Scope, TrustLevel, capture_artifact_paths,
+    capture_changed_artifacts, discover_repository,
 };
 use uuid::Uuid;
 
@@ -73,6 +74,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             }
             let title = arguments.title.unwrap_or_else(|| title_from_body(&body));
             let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+            let artifacts = capture_scope_artifacts(&scope, &arguments.files, false)?;
             let receipt = engine.remember(RememberRequest {
                 idempotency_key: arguments.idempotency_key,
                 kind: memory_kind(arguments.kind),
@@ -84,6 +86,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 confidence: arguments.confidence,
                 trust: trust(arguments.trust),
                 tags: arguments.tags,
+                artifacts,
                 ..RememberRequest::default()
             })?;
             print_value(
@@ -107,6 +110,18 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 attributes.insert("harness".into(), json!(harness));
             }
             attributes.insert("adapter_kind".into(), json!(observe_name(arguments.kind)));
+            if let Some(tool_name) = &arguments.tool_name {
+                attributes.insert("tool_name".into(), json!(tool_name));
+            }
+            if let Some(succeeded) = arguments.succeeded {
+                attributes.insert("succeeded".into(), json!(succeeded));
+            }
+            if arguments.verification {
+                attributes.insert("verification".into(), json!(true));
+            }
+            if let Some(error_fingerprint) = &arguments.error_fingerprint {
+                attributes.insert("error_fingerprint".into(), json!(error_fingerprint));
+            }
             let idempotency_key = arguments.idempotency_key.or_else(|| {
                 arguments.event_id.as_deref().map(|event_id| {
                     observe_event_idempotency_key(
@@ -140,7 +155,9 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 arguments.summary.unwrap_or_default()
             };
             let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
-            let receipt = engine.checkpoint(CheckpointRequest {
+            let artifacts =
+                capture_scope_artifacts(&scope, &arguments.files, !arguments.no_auto_artifacts)?;
+            let receipt = engine.checkpoint_session(CheckpointRequest {
                 idempotency_key: arguments.idempotency_key,
                 scope,
                 goal: arguments.goal,
@@ -150,6 +167,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 open_tasks: arguments.open_task,
                 trust: trust(arguments.trust),
                 tags: arguments.tags,
+                artifacts,
                 ..CheckpointRequest::default()
             })?;
             print_value(
@@ -170,6 +188,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 query
             };
             let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+            let artifacts = capture_scope_artifacts(&scope, &arguments.files, false)?;
             if arguments.observe_prompt {
                 let harness = arguments.scope.harness.as_deref().unwrap_or("cli");
                 let attributes = std::collections::BTreeMap::from([
@@ -196,7 +215,12 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 limit: arguments.limit,
                 token_budget: Some(arguments.token_budget),
                 include_stale: arguments.include_stale,
+                include_divergent: arguments.include_divergent,
                 include_superseded: arguments.include_superseded,
+                hints: ContextHints {
+                    artifacts,
+                    ..ContextHints::default()
+                },
                 ..RecallRequest::default()
             })?;
             match arguments.format {
@@ -206,6 +230,11 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Inspect(arguments) => {
             let engine = open_engine(&database)?;
+            if arguments.history {
+                let history = engine.history(parse_memory_id(&arguments.memory_id)?)?;
+                print_value(&history, true, "history is only emitted as JSON")?;
+                return Ok(());
+            }
             let memory = engine.get(parse_memory_id(&arguments.memory_id)?)?;
             print_value(
                 &memory,
@@ -323,7 +352,13 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Hook(arguments) => {
             let input = read_stdin().unwrap_or_default();
-            let response = hook::process(&database, arguments.harness, &input);
+            let response = hook::process(
+                &database,
+                arguments.harness,
+                &arguments.namespace,
+                arguments.workspace.as_deref(),
+                &input,
+            );
             // Hook stdout is always one protocol JSON object, independent of --json.
             println!("{}", serde_json::to_string(&response)?);
         }
@@ -341,6 +376,55 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn capture_scope_artifacts(
+    scope: &Scope,
+    explicit_paths: &[PathBuf],
+    include_changed: bool,
+) -> anyhow::Result<Vec<ArtifactRef>> {
+    if explicit_paths.is_empty() && !include_changed {
+        return Ok(Vec::new());
+    }
+    let Some(repository) = scope.repository.as_ref() else {
+        if explicit_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        bail!("--file requires a Git repository discovered from --cwd");
+    };
+    let root = repository
+        .root
+        .as_deref()
+        .context("repository discovery did not return a worktree root")?;
+    let mut artifacts = if explicit_paths.is_empty() {
+        Vec::new()
+    } else {
+        capture_artifact_paths(root, &repository.repo_id, explicit_paths)?
+    };
+    if include_changed {
+        let inferred = capture_changed_artifacts(root, &repository.repo_id)?;
+        let inferred = inferred
+            .into_iter()
+            .filter(|artifact| {
+                !artifacts.iter().any(|existing| {
+                    existing.repo_id == artifact.repo_id
+                        && existing.path == artifact.path
+                        && existing.symbol == artifact.symbol
+                })
+            })
+            .collect::<Vec<_>>();
+        // Automatic capture is useful only as a complete applicability set.
+        // When explicit paths plus every changed path exceed the core bound,
+        // retain the caller's explicit set rather than append a misleading
+        // prefix or fail an otherwise valid checkpoint.
+        if artifacts.len().saturating_add(inferred.len()) <= 128 {
+            artifacts.extend(inferred);
+        }
+    }
+    artifacts.sort_by(|left, right| {
+        (&left.repo_id, &left.path, &left.symbol).cmp(&(&right.repo_id, &right.path, &right.symbol))
+    });
+    Ok(artifacts)
 }
 
 /// Runs one parsed Super Mem command from an existing async runtime.
@@ -727,6 +811,7 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
         database.to_path_buf(),
         sidecar(database, "-wal"),
         sidecar(database, "-shm"),
+        sidecar(database, "-journal"),
     ];
     for path in &paths {
         validate_purge_path(path)?;
@@ -736,6 +821,12 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
             "refusing to purge {} because it is not a Super Mem database",
             database.display()
         );
+    }
+    // A read-only WAL inspection may create a shared-memory sidecar. Validate
+    // the complete deletion set again after identity detection so it cannot
+    // introduce an unchecked path.
+    for path in &paths {
+        validate_purge_path(path)?;
     }
     for path in paths {
         match fs::remove_file(&path) {
@@ -1158,5 +1249,26 @@ mod tests {
         );
         validate_database_for_scope(&newline.join("memory.sqlite3"), &newline).unwrap();
         assert!(validate_database_for_scope(&plain.join("memory.sqlite3"), &plain).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_removes_every_sqlite_sidecar_including_rollback_journal() {
+        let temp = TempDir::new().unwrap();
+        let database = temp.path().join("memory.sqlite3");
+        drop(open_engine(&database).unwrap());
+        let journal = sidecar(&database, "-journal");
+        fs::write(&journal, b"sensitive rollback pages").unwrap();
+
+        purge_database(&database).unwrap();
+
+        for path in [
+            database.clone(),
+            sidecar(&database, "-wal"),
+            sidecar(&database, "-shm"),
+            journal,
+        ] {
+            assert!(!path.exists(), "{} was not removed", path.display());
+        }
     }
 }

@@ -42,7 +42,7 @@ When `scope.repository` is present, `RepositoryContext` contains:
 | `remote` | Normalized remote URL or opaque caller-supplied identity. |
 | `dirty_hash` | Fingerprint of tracked and untracked changes. |
 
-Canonical snapshot state includes events, memory heads and revisions, evidence, tags, entities, artifacts, links, event-memory mappings, feedback, and idempotency records. Only contentless FTS and ordinary SQLite indexes are derived and rebuilt on import; events alone cannot reconstruct the current tables.
+Canonical snapshot state includes events, memory heads and revisions, per-revision metadata, evidence, tags, entities, artifacts, current and historical links, event-memory mappings, feedback, and idempotency records. Only contentless FTS and ordinary SQLite indexes are derived and rebuilt on import; events alone cannot reconstruct the current tables.
 
 ## Memory kinds
 
@@ -60,7 +60,7 @@ Canonical snapshot state includes events, memory heads and revisions, evidence, 
 | `Task` | Work that remains. |
 | `Observation` | Low-level observation from the event stream. |
 
-Each memory head is `Active`, `Contested`, `Superseded`, or `Retracted` and points to its current revision. Revisions can attach event spans, artifacts, entities, and tags; memories can link to other memories. Writing a memory cannot erase its source event. Reference adapters do not request or capture hidden model reasoning.
+Each memory head is `Active`, `Contested`, `Superseded`, or `Retracted` and points to its current revision. Revisions retain their own kind, lifecycle state, canonical key, scores, trust, validity window, event spans, artifacts, entities, and tags. Links retain the source revision that created them. Writing a memory cannot erase its source event. `inspect --history` and MCP `memory_manage` history return this ledger, including feedback and a metadata-fidelity flag for every revision. Reference adapters do not request or capture hidden model reasoning.
 
 ## Repository applicability
 
@@ -70,14 +70,14 @@ Recall assigns one applicability class:
 
 | Class | Meaning |
 | --- | --- |
-| `exact` | No dirty-state mismatch, plus the same commit or a matching artifact content hash. |
+| `exact` | Same repository state, or a complete set of matching artifact content hashes. |
 | `compatible` | Stored commit is an ancestor of the current commit. |
-| `stale` | Dirty state differs or a matching artifact's content hash changed. |
+| `stale` | A matching artifact changed, or dirty state differs without complete artifact verification. |
 | `divergent` | Stored commit is a descendant, Git history diverged, or branch names differ without commit data. |
 | `unversioned` | Repository or Git data is insufficient for classification. |
 | `inapplicable` | Namespace, required workspace, or repository scope is incompatible; excluded before ranking. |
 
-Divergent memories can both be valid. Artifact comparison matches repository ID, path, and optional symbol before comparing content hashes. Language-aware symbol identity and rename remapping are future work.
+Divergent memories can both be valid, but normal recall excludes them; callers must use `--include-divergent` or the corresponding MCP option. Artifact comparison matches repository ID, path, and optional symbol before comparing content hashes. If every stored artifact is re-fingerprinted and matches, unrelated dirty changes do not make the memory stale. Automatic changed-file capture is all-or-nothing: a partial Git result is discarded and cannot establish exact applicability. Language-aware symbol identity and rename remapping are future work.
 
 ## Lifecycle links, trust, and removal
 
@@ -85,7 +85,7 @@ Lifecycle changes are explicit. A `supersedes` link marks its target superseded.
 
 Trust is a ranking factor, not proof of truth: `External`, `Agent`, `ToolVerified`, and `UserConfirmed` receive increasing weights. Supersession and retraction preserve history; retracted memories are excluded from normal recall.
 
-On Unix, `purge --yes` removes the database, WAL, and shared-memory sidecars after rejecting symlinks and multiple hard links. Stop all database users first; SQLite cannot portably identify idle open handles. v0.1 refuses Windows purge because stable Rust cannot verify hard-link counts without prohibited unsafe FFI. Item-level physical erasure is unavailable.
+On Unix, `purge --yes` removes the database, WAL, shared-memory, and rollback-journal files after rejecting symlinks and multiple hard links. Stop all database users first; SQLite cannot portably identify idle open handles. v0.1 refuses Windows purge because stable Rust cannot verify hard-link counts without prohibited unsafe FFI. Item-level physical erasure is unavailable.
 
 ## Capture
 
@@ -99,7 +99,9 @@ harness event
     -> lexical index update when memory changes
 ```
 
-Automatic hook capture is capped at 64 KiB. Oversized UTF-8 input keeps its head and tail with an explicit middle-omitted marker. Hook failures fail open so the coding session continues. The Rust hook prints errors to stderr, but the OpenCode and Pi adapters discard that stream, so diagnostics are not always visible.
+All four reference adapters record exposed tool, command, test, and file outcomes. Test, lint, type-check, and build commands are marked as verification evidence; successful and failed results remain distinct. Automatic hook capture is capped at 64 KiB. Oversized UTF-8 input keeps its head and tail with an explicit middle-omitted marker. Hook failures fail open so the coding session continues. The Rust hook prints errors to stderr, but the OpenCode and Pi adapters discard that stream, so diagnostics are not always visible.
+
+`remember`, `recall`, and `checkpoint` accept repeatable repository-relative `--file` arguments. Checkpoints also attempt to hash every staged, unstaged, deleted, and untracked path. Automatic capture attaches only a complete bounded set; explicit paths can be used when targeted evidence is preferable.
 
 Future embeddings, model extraction, and consolidation must stay outside the critical path. Exact and lexical retrieval must continue without models, downloads, or network access.
 
@@ -110,9 +112,11 @@ Recall runs in four stages:
 1. **Scope:** resolve identity, repository, branch/worktree, session, and current or historical view. Access filters run before ranking.
 2. **Candidates:** combine exact IDs and diagnostics, lexical FTS, and structured lookups. Scope, lifecycle, kind, and time predicates run before channel limits so ineligible rows cannot crowd out eligible ones. IDs and attachments hydrate in bounded batches.
 3. **Ranking:** fuse exact text, error fingerprint, verified artifact, lexical, sparse identifier/artifact, entity, and recency signals. The score also applies importance, confidence, lifecycle state, age, trust, Git applicability, and feedback utility before diversity selection.
-4. **Assembly:** select within budget and emit `constraints_and_preferences`, `decisions`, `attempts_and_outcomes`, `procedures`, `open_tasks`, and `relevant_history`. Warnings cover stale, divergent, and contested records. Items retain applicability, reasons, token estimates, and citations.
+4. **Assembly:** select within budget and emit `constraints_and_preferences`, `decisions`, `attempts_and_outcomes`, `procedures`, `open_tasks`, and `relevant_history`. Warnings cover included stale or divergent records and contested records. Items retain applicability, reasons, token estimates, and citations.
 
 Fusion and diversity selection are totally ordered by score and memory ID. Incremental maximum-redundancy updates are exactly equivalent to full recomputation while reducing broad MMR selection from quadratic-in-output to linear-in-output work per candidate.
+
+Assembly budgets the exact escaped fragments before accepting an item. `ContextPack.sections`, `ContextPack.hits`, and the rendered text therefore use the same selected and safely truncated bodies. The pack's token estimate is computed from the final rendering plus the adapter envelope reserve and does not exceed the requested budget.
 
 Embeddings and graph expansion are possible future channels, not replacements for exact and lexical retrieval.
 
@@ -120,7 +124,9 @@ Embeddings and graph expansion are possible future channels, not replacements fo
 
 SQLite stores canonical events, revisions, evidence, links, and feedback. Contentless FTS5 is rebuildable; hot statements use a bounded prepared cache, and related rows load in batches.
 
-Schema v2 added contentless FTS and entity/artifact indexes. Schema v3 made canonical lookup workspace-aware and indexed scope-partitioned attachments. Entity display and artifact language metadata are partitioned by scope, so workspaces cannot overwrite each other's attachments. Canonical columns did not change: lossless snapshots remain schema v1, and derived indexes are never snapshot truth.
+Schema v2 added contentless FTS and entity/artifact indexes. Schema v3 made canonical lookup workspace-aware and indexed scope-partitioned attachments. Schema v4 adds a session-scope event index, immutable per-revision metadata, and revision-scoped link history. Entity display and artifact language metadata remain partitioned by scope, so workspaces cannot overwrite each other's attachments.
+
+Snapshot schema v2 includes the schema-v4 revision metadata and historical links. Import still accepts snapshot v1. When a v1 snapshot or a pre-v4 database lacks historical revision metadata, exact revision text and attachments are retained, but reconstructed non-head metadata is marked incomplete; the current head remains complete. Derived indexes are never snapshot truth.
 
 Artifact and dirty-state checks precede Git history traversal. Commit-DAG queries are lazy and cached per recall by root and stored/current object-ID tuple.
 
@@ -130,7 +136,7 @@ Enforced invariants:
 - Reprocessing a stable harness event is idempotent.
 - Concurrent subagents remain inside their resolved scope.
 - Schema migrations are explicit; export and backup provide the recovery path.
-- Export, empty-target import, and re-export preserve canonical SQLite scalar values, including exact floating-point bit patterns and the snapshot integrity footer. Import restores atomically and rebuilds FTS.
+- Export, empty-target import, and re-export preserve canonical SQLite scalar values, including exact floating-point bit patterns, revision metadata, link history, and the snapshot integrity footer. Import restores atomically and rebuilds FTS.
 
 SQLite uses WAL. The default `Balanced` mode sets `synchronous=NORMAL`: transactions survive process crashes, but the latest acknowledged commit can be lost after power loss. `Durable` mode sets `synchronous=FULL` and fsyncs every acknowledged commit.
 
@@ -140,16 +146,16 @@ The default database is outside the worktree. On Unix, scope-sensitive commands,
 
 ## MCP server
 
-The server uses the [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). Trusted stdio launch pins root, namespace, and optional workspace; every call rebuilds Git scope. MCP revision 2026-07-28 is stateless, so a model session ID is provenance, not a security boundary.
+The server uses the [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). Trusted stdio launch pins root, namespace, optional workspace, and the launch repository identity. Every call rediscovers Git state and fails closed if the repository appears, disappears, changes ID, or changes common directory. File-backed servers open one primary connection for writes and a bounded pool of two to four reader connections for concurrent recalls; literal in-memory databases retain one connection so their state stays shared. MCP revision 2026-07-28 is stateless, so a model session ID is provenance, not a security boundary.
 
 The model-facing tools are:
 
 - `memory_context`: scoped recall under a token budget.
 - `memory_feedback`: retrieval feedback tied to a memory and optional query.
-- `memory_manage`: inspect or retract; status and purge remain CLI-only.
+- `memory_manage`: inspect, load immutable revision, event, link, and feedback history, or retract; status and purge remain CLI-only.
 - `memory_record`: record a memory, checkpoint, or observation.
 
-Tools return compact text blocks and JSON-text receipts. `ContextPack` retains hits, applicability, reasons, and citations for CLI JSON and future structured MCP output. Deterministic schemas reject unknown fields and omit namespace, working directory, repository, and workspace, preventing model calls from spoofing scope.
+Tools return compact text blocks and JSON-text receipts. `ContextPack` retains the same budgeted bodies in rendered text, sections, and ranked hits, together with applicability, reasons, and citations for CLI JSON. Deterministic schemas reject unknown fields and omit namespace, working directory, repository, and workspace, preventing model calls from spoofing scope.
 
 ## Limitations
 

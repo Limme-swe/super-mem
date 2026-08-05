@@ -3,7 +3,11 @@
     "super_mem": {
       "type": "stdio",
       "command": "supermem",
-      "args": ["mcp", "--root", ".", "--namespace", "default"],
+      "args": [
+        "mcp",
+        "--root",
+        "${CLAUDE_PROJECT_DIR:-.}"
+      ],
       "env": {}
     }
   }

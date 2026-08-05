@@ -7,7 +7,7 @@
           {
             "type": "command",
             "command": "supermem hook codex",
-            "timeout": 2,
+            "timeout": 8,
             "statusMessage": "Loading memory",
             "additionalContextLimit": 2000
           }
@@ -20,7 +20,7 @@
           {
             "type": "command",
             "command": "supermem hook codex",
-            "timeout": 2,
+            "timeout": 8,
             "statusMessage": "Recalling memory",
             "additionalContextLimit": 2000
           }
@@ -33,8 +33,19 @@
           {
             "type": "command",
             "command": "supermem hook codex",
-            "timeout": 2,
+            "timeout": 8,
             "additionalContextLimit": 1200
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "supermem hook codex",
+            "timeout": 8
           }
         ]
       }
@@ -45,7 +56,7 @@
           {
             "type": "command",
             "command": "supermem hook codex",
-            "timeout": 2
+            "timeout": 8
           }
         ]
       }
@@ -56,7 +67,7 @@
           {
             "type": "command",
             "command": "supermem hook codex",
-            "timeout": 2
+            "timeout": 8
           }
         ]
       }

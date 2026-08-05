@@ -372,6 +372,22 @@ impl EventKind {
             Self::Lifecycle => "lifecycle",
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "conversation_turn" => Self::ConversationTurn,
+            "tool_call" => Self::ToolCall,
+            "tool_result" => Self::ToolResult,
+            "command_result" => Self::CommandResult,
+            "file_change" => Self::FileChange,
+            "verification" => Self::Verification,
+            "explicit_memory" => Self::ExplicitMemory,
+            "checkpoint" => Self::Checkpoint,
+            "manual_note" => Self::ManualNote,
+            "lifecycle" => Self::Lifecycle,
+            _ => return None,
+        })
+    }
 }
 
 /// An artifact referenced by a memory or current query.
@@ -423,7 +439,7 @@ pub struct LinkInput {
     pub target: MemoryId,
     /// Typed relationship.
     pub relation: String,
-    /// Weight in `[0, 1]`.
+    /// Integer weight in `[0, 1000]`.
     pub weight: u16,
 }
 
@@ -497,6 +513,53 @@ pub struct Memory {
     pub artifacts: Vec<ArtifactRef>,
     /// Grounding evidence.
     pub evidence: Vec<EvidenceRef>,
+}
+
+/// One immutable link as it existed on a specific source revision.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct MemoryLink {
+    /// Stable link ID.
+    pub link_id: LinkId,
+    /// Source memory.
+    pub source_memory_id: MemoryId,
+    /// Source revision that recorded this link.
+    pub source_revision: u32,
+    /// Target memory.
+    pub target_memory_id: MemoryId,
+    /// Typed relationship.
+    pub relation: String,
+    /// Integer weight in `[0, 1000]`.
+    pub weight: u16,
+    /// Event that created this revision of the link.
+    pub created_event_id: EventId,
+    /// Commit time.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One immutable memory revision and the fidelity of its historical metadata.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct MemoryRevision {
+    /// Materialized revision content and metadata.
+    pub memory: Memory,
+    /// Whether ranking, validity, trust, and lifecycle metadata were captured
+    /// at write time. Older v1-v3 stores can recover revision text exactly but
+    /// only know current-head metadata for pre-migration revisions.
+    pub metadata_complete: bool,
+}
+
+/// Inspectable provenance ledger for one logical memory.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct MemoryHistory {
+    /// Current materialized head.
+    pub current: Memory,
+    /// Every immutable revision, oldest first.
+    pub revisions: Vec<MemoryRevision>,
+    /// Immutable source and lifecycle events associated with the memory.
+    pub events: Vec<Event>,
+    /// Immutable links with this memory as source or target.
+    pub links: Vec<MemoryLink>,
+    /// Retrieval feedback in database order.
+    pub feedback: Vec<MemoryFeedback>,
 }
 
 /// An event ingestion request.
@@ -759,6 +822,8 @@ pub struct RecallRequest {
     pub as_of: Option<DateTime<Utc>>,
     /// Include artifact-stale memories.
     pub include_stale: bool,
+    /// Include memories from a descendant or diverged Git history.
+    pub include_divergent: bool,
     /// Include superseded memory heads.
     pub include_superseded: bool,
     /// Current repository and task hints.
@@ -926,6 +991,35 @@ impl FeedbackSignal {
             Self::Dismissed => "dismissed",
         }
     }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "used" => Self::Used,
+            "helpful" => Self::Helpful,
+            "harmful" => Self::Harmful,
+            "incorrect" => Self::Incorrect,
+            "outdated" => Self::Outdated,
+            "dismissed" => Self::Dismissed,
+            _ => return None,
+        })
+    }
+}
+
+/// One immutable retrieval-feedback record.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct MemoryFeedback {
+    /// Monotonic feedback row ID.
+    pub feedback_id: i64,
+    /// Query that produced the memory, when supplied.
+    pub query_id: Option<QueryId>,
+    /// Memory that received the signal.
+    pub memory_id: MemoryId,
+    /// Recorded feedback signal.
+    pub signal: FeedbackSignal,
+    /// Optional redacted note.
+    pub note: Option<String>,
+    /// Commit time.
+    pub created_at: DateTime<Utc>,
 }
 
 /// Feedback request; signals affect retrieval utility but never factual confidence.

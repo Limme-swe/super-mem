@@ -6,8 +6,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2,
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8,
             "statusMessage": "Loading memory"
           }
         ]
@@ -18,8 +19,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2,
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8,
             "statusMessage": "Recalling memory"
           }
         ]
@@ -30,8 +32,35 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(?!mcp__super_mem__).*$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "^(?!mcp__super_mem__).*$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
           }
         ]
       }
@@ -41,8 +70,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
           }
         ]
       }
@@ -52,8 +82,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
           }
         ]
       }
@@ -63,8 +94,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 2
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
           }
         ]
       }
@@ -74,8 +106,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "supermem hook claude",
-            "timeout": 3
+            "command": "supermem",
+            "args": ["hook", "claude"],
+            "timeout": 8
           }
         ]
       }
