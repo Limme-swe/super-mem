@@ -822,6 +822,12 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
             database.display()
         );
     }
+    // A read-only WAL inspection may create a shared-memory sidecar. Validate
+    // the complete deletion set again after identity detection so it cannot
+    // introduce an unchecked path.
+    for path in &paths {
+        validate_purge_path(path)?;
+    }
     for path in paths {
         match fs::remove_file(&path) {
             Ok(()) => {}

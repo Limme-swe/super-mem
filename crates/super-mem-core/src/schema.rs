@@ -28,10 +28,9 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
         return Ok(false);
     }
 
-    // Ask SQLite first so an open WAL is part of the view. This connection is
-    // strictly read-only; in particular, it cannot recover a rollback journal
-    // or mutate the file while a destructive maintenance command identifies
-    // it.
+    // Ask SQLite first so an open WAL is part of the view. The main database
+    // is opened read-only, so this cannot perform rollback-journal recovery
+    // while a destructive maintenance command identifies the store.
     if let Ok(connection) = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -44,6 +43,14 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
                 application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version)
             );
         }
+    }
+
+    // The main header can be stale whenever a WAL exists. If SQLite could not
+    // read the live view, fail closed instead of trusting that stale header.
+    let mut wal_path = path.as_os_str().to_os_string();
+    wal_path.push("-wal");
+    if Path::new(&wal_path).exists() {
+        return Ok(false);
     }
 
     let Ok(mut file) = File::open(path) else {
@@ -79,13 +86,15 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
     // initialize an empty file between these two steps.
     validate_identity(connection)?;
 
-    let mut journal_mode: String =
-        connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-    if journal_mode != "wal" && journal_mode != "memory" {
-        journal_mode = retry_busy(busy_timeout, || {
+    let journal_mode = retry_busy(busy_timeout, || {
+        let current: String =
+            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if current == "wal" || current == "memory" {
+            Ok(current)
+        } else {
             connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
-        })?;
-    }
+        }
+    })?;
     // In-memory databases correctly report `memory` rather than `wal`.
     if journal_mode != "wal" && journal_mode != "memory" {
         return Err(Error::Migration(format!(
