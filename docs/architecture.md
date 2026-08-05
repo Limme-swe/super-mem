@@ -85,7 +85,7 @@ Lifecycle changes are explicit. A `supersedes` link marks its target superseded.
 
 Trust is a ranking factor, not proof of truth: `External`, `Agent`, `ToolVerified`, and `UserConfirmed` receive increasing weights. Supersession and retraction preserve history; retracted memories are excluded from normal recall.
 
-On Unix, `purge --yes` removes the database, WAL, shared-memory, and rollback-journal files after rejecting symlinks and multiple hard links. Stop all database users first; SQLite cannot portably identify idle open handles. v0.1 refuses Windows purge because stable Rust cannot verify hard-link counts without prohibited unsafe FFI. Item-level physical erasure is unavailable.
+On Linux, macOS, and Windows, `purge --yes` removes the database, WAL, shared-memory, and rollback-journal files after rejecting database or sidecar symlinks, user-controlled symlink or Windows reparse-point components, and multiple hard links. The fixed macOS `/var` and `/tmp` system aliases are accepted. Windows obtains the link count from a native file handle without elevation. Stop all database users first; SQLite cannot portably identify idle open handles. Item-level physical erasure is unavailable.
 
 ## Capture
 
@@ -142,7 +142,7 @@ SQLite uses WAL. The default `Balanced` mode sets `synchronous=NORMAL`: transact
 
 The database is not a security boundary; see the [privacy and threat model](privacy-and-threat-model.md).
 
-The default database is outside the worktree. On Unix, scope-sensitive commands, hooks, and MCP allow a repository-local database only when its main file and possible `-wal`, `-shm`, and `-journal` sidecars are untracked and ignored. Raw and resolved paths reject `..`, symlink components, multiple hard links, and tracked aliases. Non-Unix v0.1 rejects repository-local databases for these operations because hard-link aliases cannot be verified. The non-scoped `init`, `inspect`, `feedback`, `retract`, `status`, `doctor`, `export`, `import`, and `purge` commands skip this Git-applicability guard.
+The default database is outside the worktree. On Linux, macOS, and Windows, scope-sensitive commands, hooks, and MCP allow a repository-local database only when its main file and possible `-wal`, `-shm`, and `-journal` sidecars are untracked and ignored. Raw and resolved paths reject `..`, symbolic-link or reparse-point components, multiple hard links, and tracked aliases. Existing external database files receive the same alias check so an outside path cannot mutate a tracked hard link. Windows verifies link counts through the native file handle and fails closed if metadata is unavailable. The non-scoped `init`, `inspect`, `feedback`, `retract`, `status`, `doctor`, `export`, and `import` commands skip the Git-applicability guard; purge retains its database-identity and link checks.
 
 ## MCP server
 

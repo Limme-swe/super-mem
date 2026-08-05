@@ -3,7 +3,7 @@
 ## Install
 
 1. Install supermem on PATH.
-2. From a repository checkout, open `/plugins` in Codex CLI, choose the Super Mem repository marketplace, and install Super Mem. In ChatGPT Work or Codex desktop, restart the app and install it from the Super Mem source in Plugins.
+2. From an extracted release archive or repository checkout, open `/plugins` in Codex CLI, choose the Super Mem repository marketplace, and install Super Mem. In ChatGPT Work or Codex desktop, restart the app and install it from the Super Mem source in Plugins.
 3. Review the hook commands before trusting them.
 4. Verify hooks with /hooks and MCP with codex mcp list or /mcp verbose.
 

@@ -66,16 +66,18 @@ The database application ID is checked before destructive operations. Search ind
 
 The portable default is a database outside the repository.
 
-For scope-sensitive commands, hooks, and MCP, Unix builds allow a repository-local database only when:
+For scope-sensitive commands, hooks, and MCP, Linux, macOS, and Windows allow a repository-local database only when:
 
 - the main file and possible -wal, -shm, and -journal sidecars are untracked and Git-ignored;
-- no path component is a symbolic link;
+- no path component is a symbolic link or Windows reparse point;
 - existing files have one hard link;
 - the supplied path contains no .. component.
 
 Both logical and resolved paths are checked. These rules keep SQLite writes from changing the Git state used to classify memories.
 
-Non-Unix v0.1 builds reject repository-local database paths for scope-sensitive operations because hard-link aliases cannot be verified safely with the current safe Rust implementation.
+Linux and macOS read hard-link counts from filesystem metadata. Windows reads the count from a native file handle without requiring elevation. The same single-link check applies to existing external database files and sidecars so an external name cannot alias tracked repository data.
+
+Windows database paths are supported on local NTFS and ReFS volumes. Network shares are outside the supported threat model because remote servers can expose different SQLite locking and partial file-identity metadata; use the default local `%LOCALAPPDATA%` store instead.
 
 The unscoped init, inspect, feedback, retract, status, doctor, export, import, and purge commands do not apply the Git-state guard. Their other path and database-identity checks still apply.
 
@@ -93,7 +95,7 @@ Purge is available only through the human-facing CLI and requires explicit confi
 
 Stop every CLI, MCP, hook, and harness process using the store before purging. SQLite cannot reliably detect a process that still holds an idle database handle. Such a process may retain or recreate WAL or rollback-journal state after deletion.
 
-Purge refuses symlinks and, on Unix, paths with multiple hard links. V0.1 refuses purge on Windows because safe stable Rust does not expose the hard-link count needed to verify that no linked name survives.
+Purge refuses a database or sidecar that is a symbolic link or Windows reparse point, any user-controlled symlink or reparse-point component, and paths with multiple hard links. It accepts the fixed macOS `/var → private/var` and `/tmp → private/tmp` system aliases. A platform metadata failure also refuses the operation.
 
 Purge does not remove exported snapshots, user-managed backups, filesystem snapshots, or copies held by another program. Flash storage can also retain physical remnants after application-level deletion.
 

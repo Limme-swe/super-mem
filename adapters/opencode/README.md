@@ -1,6 +1,6 @@
 # OpenCode adapter
 
-The manifest is configured for @super-mem/opencode, but the package is not published. For a checkout:
+The manifest is configured for @super-mem/opencode, but the package is not published. From an extracted release archive or repository checkout:
 
 1. Install supermem on PATH.
 2. Copy src/index.ts to .opencode/plugins/super-mem.ts.

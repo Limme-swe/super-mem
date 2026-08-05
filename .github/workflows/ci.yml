@@ -38,17 +38,28 @@ jobs:
             --config 'patch.crates-io.super-mem-core.path="crates/super-mem-core"'
 
   msrv:
-    name: Rust 1.88 compatibility
-    runs-on: ubuntu-latest
+    name: Rust 1.88 compatibility (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: Windows
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: msrv
-      - run: cargo check --workspace --all-targets --locked
+          key: msrv-${{ matrix.target }}
+      - run: cargo check --workspace --all-targets --locked --target ${{ matrix.target }}
 
   policy:
     name: Dependency policy
@@ -67,12 +78,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
       - uses: actions/setup-node@v5
         with:
           node-version: 24
           package-manager-cache: false
       - name: Validate evaluation fixture contract
         run: node scripts/validate-eval-fixture.mjs
+      - name: Validate release tooling and metadata
+        run: |
+          python -m py_compile scripts/*.py
+          python scripts/release_metadata.py
       - name: Validate adapter contracts
         run: |
           python -m json.tool adapters/codex/.codex-plugin/plugin.json >/dev/null
@@ -199,16 +217,45 @@ jobs:
           npm pack --dry-run ./adapters/pi
 
   platforms:
-    name: Build (${{ matrix.os }})
+    name: Test (${{ matrix.name }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - name: Linux x86-64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/supermem
+          - name: Windows x86-64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/supermem.exe
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/supermem
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/supermem
     runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.target, 'aarch64-apple') && '11.0' || startsWith(matrix.target, 'x86_64-apple') && '11.0' || '' }}
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.97.1
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - run: cargo build --workspace --release
+        with:
+          key: platform-${{ matrix.target }}
+      - name: Run native test suite
+        run: cargo test --workspace --all-targets --all-features --locked --target ${{ matrix.target }}
+      - name: Build native release binary
+        run: cargo build -p super-mem --bin supermem --release --locked --target ${{ matrix.target }}
+      - name: Smoke-test native release binary
+        run: python scripts/release_smoke.py --binary "${{ matrix.binary }}"

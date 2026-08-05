@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -11,7 +13,7 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use serde_json::json;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use super_mem_core::is_super_mem_database;
 use super_mem_core::{
     ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextHints, EngineOptions, EventKind,
@@ -462,12 +464,26 @@ pub(crate) fn open_engine_and_scope(
 }
 
 pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow::Result<()> {
-    let Some(repository_root) = native_git_root(cwd)? else {
+    let Some(discovered_repository_root) = native_git_root(cwd)? else {
         return Ok(());
     };
-    let repository_root = repository_root
-        .canonicalize()
-        .with_context(|| format!("resolve Git worktree {}", repository_root.display()))?;
+    // Keep both spellings. On Windows, `canonicalize` adds a verbatim `\\?\`
+    // prefix while Git and CLI arguments ordinarily use drive-letter paths.
+    // The lexical spelling is required to inspect junction components before
+    // they are resolved; the canonical spelling covers ordinary aliases.
+    let repository_lexical = absolute_lexical_path(&discovered_repository_root)?;
+    let repository_root = discovered_repository_root.canonicalize().with_context(|| {
+        format!(
+            "resolve Git worktree {}",
+            discovered_repository_root.display()
+        )
+    })?;
+    let mut repository_spellings = Vec::new();
+    if let Some(alias) = lexical_repository_alias(cwd, &repository_root)? {
+        push_unique(&mut repository_spellings, alias);
+    }
+    push_unique(&mut repository_spellings, repository_lexical);
+    push_unique(&mut repository_spellings, repository_root.clone());
     let database_lexical = absolute_lexical_path(database)?;
     let database_entry = canonical_entry_path(&database_lexical)?;
     let mut database_bases = vec![database_lexical];
@@ -494,7 +510,14 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
     }
 
     for candidate in candidates {
-        let Ok(relative) = candidate.strip_prefix(&repository_root) else {
+        let repository_location = repository_spellings.iter().find_map(|spelling| {
+            candidate
+                .strip_prefix(spelling)
+                .ok()
+                .map(|relative| (relative, spelling.as_path()))
+        });
+        let Some((relative, lexical_root)) = repository_location else {
+            validate_scoped_database_path(&candidate)?;
             continue;
         };
         if relative.as_os_str().is_empty() {
@@ -503,7 +526,11 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
                 repository_root.display()
             );
         }
-        validate_repo_local_candidate(&candidate, &repository_root)?;
+        // Inspect lexical components before opening the final file. Otherwise
+        // a parent symlink/junction is followed by `symlink_metadata`, and a
+        // redirected file can look like a harmless external database.
+        validate_repo_local_candidate(&candidate, lexical_root)?;
+        validate_scoped_database_path(&candidate)?;
         if git_path_matches(&repository_root, "ls-files", &["--error-unmatch"], relative)? {
             bail!(
                 "refusing scoped memory operation because {} is tracked by Git; move --db outside {}",
@@ -527,25 +554,34 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
     Ok(())
 }
 
+fn lexical_repository_alias(cwd: &Path, canonical_root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    // `..` is valid in a caller's cwd but intentionally forbidden in database
+    // paths. Alias recovery is only an extra lexical spelling, so fall back to
+    // Git's discovered/canonical roots when preserving that spelling would be
+    // ambiguous around symbolic links.
+    if cwd
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        return Ok(None);
+    }
+    let mut cursor = absolute_lexical_path(cwd)?;
+    loop {
+        if cursor
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == canonical_root)
+        {
+            return Ok(Some(cursor));
+        }
+        if !cursor.pop() {
+            return Ok(None);
+        }
+    }
+}
+
 fn validate_repo_local_candidate(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
     reject_symlink_components(candidate, repository_root)?;
-    let metadata = match fs::symlink_metadata(candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return validate_repo_local_link_policy(candidate, repository_root, None);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", candidate.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing scoped memory operation because {} is a symbolic link and may redirect writes into tracked worktree data; move --db outside {}",
-            candidate.display(),
-            repository_root.display()
-        );
-    }
-    validate_repo_local_link_policy(candidate, repository_root, Some(&metadata))
+    Ok(())
 }
 
 fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
@@ -560,9 +596,9 @@ fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow
     for component in relative.components() {
         cursor.push(component.as_os_str());
         match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_like(&metadata) => {
                 bail!(
-                    "refusing scoped memory operation because {} contains symbolic-link component {}; move --db outside {}",
+                    "refusing scoped memory operation because {} contains symbolic-link component or Windows reparse point {}; move --db outside {}",
                     candidate.display(),
                     cursor.display(),
                     repository_root.display()
@@ -578,33 +614,33 @@ fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow
     Ok(())
 }
 
-#[cfg(unix)]
-fn validate_repo_local_link_policy(
-    candidate: &Path,
-    repository_root: &Path,
-    metadata: Option<&fs::Metadata>,
-) -> anyhow::Result<()> {
-    if metadata.is_some_and(|metadata| metadata.nlink() > 1) {
+fn validate_scoped_database_path(candidate: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", candidate.display()));
+        }
+    };
+    if metadata_is_link_like(&metadata) {
         bail!(
-            "refusing scoped memory operation because {} has multiple hard links and may alias tracked worktree data; move --db outside {}",
-            candidate.display(),
-            repository_root.display()
+            "refusing scoped memory operation because {} is a symbolic link or reparse point",
+            candidate.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!(
+            "refusing scoped memory operation because {} is not a regular file",
+            candidate.display()
+        );
+    }
+    if hard_link_count(candidate, &metadata)? > 1 {
+        bail!(
+            "refusing scoped memory operation because {} has multiple hard links and may alias tracked worktree data",
+            candidate.display()
         );
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_repo_local_link_policy(
-    candidate: &Path,
-    repository_root: &Path,
-    _metadata: Option<&fs::Metadata>,
-) -> anyhow::Result<()> {
-    bail!(
-        "refusing scoped memory operation because repo-local databases are not supported on this platform: hard-link aliases cannot be verified safely; move --db outside {} (candidate {})",
-        repository_root.display(),
-        candidate.display()
-    )
 }
 
 fn native_git_root(cwd: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -767,13 +803,20 @@ pub(crate) fn resolve_database(explicit: Option<&Path>) -> anyhow::Result<PathBu
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(base).join("super-mem/memory.sqlite3"));
     }
-    if cfg!(windows)
-        && let Some(base) = std::env::var_os("LOCALAPPDATA")
-    {
-        return Ok(PathBuf::from(base).join("super-mem/memory.sqlite3"));
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join("Library/Application Support/super-mem/memory.sqlite3"));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+        let base = PathBuf::from(base);
+        if base.is_absolute() {
+            return Ok(base.join("super-mem/memory.sqlite3"));
+        }
     }
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -805,7 +848,7 @@ pub(crate) fn title_from_body(body: &str) -> String {
     title
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn purge_database(database: &Path) -> anyhow::Result<()> {
     let paths = [
         database.to_path_buf(),
@@ -838,7 +881,7 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn purge_database(database: &Path) -> anyhow::Result<()> {
     bail!(
         "refusing to purge {}: safe purge is not supported on this platform because hard-link counts cannot be verified",
@@ -846,18 +889,40 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
+    let absolute = absolute_lexical_path(path)?;
+    let mut cursor = PathBuf::new();
+    for component in absolute.components() {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata)
+                if metadata_is_link_like(&metadata)
+                    && !trusted_macos_system_alias(&cursor, &metadata) =>
+            {
+                bail!(
+                    "refusing to purge {} because path component {} is a symbolic link or reparse point",
+                    path.display(),
+                    cursor.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", cursor.display()));
+            }
+        }
+    }
+    let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", path.display()));
+            return Err(error).with_context(|| format!("inspect {}", absolute.display()));
         }
     };
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_like(&metadata) {
         bail!(
-            "refusing to purge {} because it is a symbolic link",
+            "refusing to purge {} because it is a symbolic link or reparse point",
             path.display()
         );
     }
@@ -867,13 +932,103 @@ fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    if metadata.nlink() > 1 {
+    if hard_link_count(path, &metadata)? > 1 {
         bail!(
             "refusing to purge {} because it has multiple hard links",
             path.display()
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_macos_system_alias(path: &Path, metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    let expected = if path == Path::new("/var") {
+        Path::new("/private/var")
+    } else if path == Path::new("/tmp") {
+        Path::new("/private/tmp")
+    } else {
+        return false;
+    };
+    fs::read_link(path).is_ok_and(|target| {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            Path::new("/").join(target)
+        };
+        target == expected
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trusted_macos_system_alias(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    // Junctions and mount points are reparse points but are not always
+    // reported by `FileType::is_symlink`.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+// Keep one fallible contract across platform implementations: the Windows
+// handle query and unsupported-platform fallback can fail closed.
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn hard_link_count(_path: &Path, metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    Ok(metadata.nlink())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("open {} to verify hard links", path.display()))?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a live Windows file handle for the full call and
+    // `information` points to writable storage of exactly the structure the
+    // API initializes. Success is checked before `assume_init`.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("verify hard links for {}", path.display()));
+    }
+    // SAFETY: a successful `GetFileInformationByHandle` initialized the full
+    // `BY_HANDLE_FILE_INFORMATION` value.
+    let information = unsafe { information.assume_init() };
+    if information.nNumberOfLinks == 0 {
+        bail!(
+            "refusing database operation because Windows returned an invalid zero hard-link count for {}",
+            path.display()
+        );
+    }
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    bail!(
+        "refusing database operation because hard-link counts are unavailable for {}",
+        path.display()
+    )
 }
 
 fn export_private_file(engine: &MemoryEngine, path: &Path) -> anyhow::Result<()> {
@@ -1081,12 +1236,15 @@ pub(crate) const fn feedback(value: FeedbackArg) -> FeedbackSignal {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::fs;
+    #[cfg(unix)]
+    use std::process::Command;
 
     use tempfile::TempDir;
 
     use super::*;
 
+    #[cfg(unix)]
     fn git(repository: &Path, arguments: &[&str]) {
         assert!(
             Command::new("git")
@@ -1098,6 +1256,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn init_repository(repository: &Path) {
         fs::create_dir(repository).unwrap();
         git(repository, &["init", "--quiet"]);
@@ -1129,6 +1288,20 @@ mod tests {
         assert!(bounded.starts_with("sm1:"));
         assert_eq!(bounded.len(), 68);
         assert!(bounded.len() <= 256);
+    }
+
+    #[test]
+    fn lexical_repository_alias_is_best_effort_for_parent_components() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        let canonical = repository.canonicalize().unwrap();
+        let aliased = repository.join("child").join("..");
+
+        assert_eq!(
+            lexical_repository_alias(&aliased, &canonical).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -1251,7 +1424,7 @@ mod tests {
         assert!(validate_database_for_scope(&plain.join("memory.sqlite3"), &plain).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn purge_removes_every_sqlite_sidecar_including_rollback_journal() {
         let temp = TempDir::new().unwrap();
@@ -1270,5 +1443,22 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} was not removed", path.display());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_purge_accepts_only_the_fixed_var_and_tmp_aliases() {
+        use std::os::unix::fs::symlink;
+
+        for path in [Path::new("/var"), Path::new("/tmp")] {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(trusted_macos_system_alias(path, &metadata));
+        }
+
+        let temp = TempDir::new().unwrap();
+        let user_alias = temp.path().join("var-lookalike");
+        symlink("/private/var", &user_alias).unwrap();
+        let metadata = fs::symlink_metadata(&user_alias).unwrap();
+        assert!(!trusted_macos_system_alias(&user_alias, &metadata));
     }
 }

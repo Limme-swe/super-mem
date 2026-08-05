@@ -53,17 +53,21 @@ pub(crate) fn build_scope(arguments: &ScopeArgs) -> Scope {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn fallback_workspaces_distinguish_non_utf8_paths() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};

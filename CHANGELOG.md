@@ -1,8 +1,10 @@
 # Changelog
 
-Notable changes are recorded here. Semantic Versioning begins with the first stable release.
+Notable changes are recorded here. Versioning follows Semantic Versioning. Before 1.0, minor releases may contain breaking changes.
 
 ## [Unreleased]
+
+## [0.1.0] - 2026-08-06
 
 ### Added
 
@@ -12,6 +14,7 @@ Notable changes are recorded here. Semantic Versioning begins with the first sta
 - Explicit artifact fingerprinting for record and recall operations, plus all-or-nothing changed-file capture for checkpoints.
 - CLI and MCP history inspection with immutable events, per-revision metadata fidelity, and revision-scoped links.
 - Executable fixture-contract validation for the checked-in coding-memory scenarios.
+- Prebuilt release archives for Linux x86-64, Windows x86-64, and both Apple Silicon and Intel macOS, containing the native executable, adapters, documentation, and tracked source tree, with checksums and build-provenance attestations.
 
 ### Changed
 
@@ -32,4 +35,7 @@ Notable changes are recorded here. Semantic Versioning begins with the first sta
 
 - Bounded, domain-separated, length-framed automatic idempotency keys.
 - Native-byte and trailing-newline repository identity handling; scope-sensitive commands reject repository-local database paths that could alter tracked Git state through non-ignored files, links, or aliases.
-- Full-store purge removes the rollback journal as well as the database, WAL, and shared-memory sidecars on supported Unix systems.
+- Full-store purge removes the rollback journal as well as the database, WAL, and shared-memory sidecars after rejecting database or sidecar symlinks, user-controlled symlink or Windows reparse-point components, and hard-link aliases. The fixed macOS `/var` and `/tmp` system aliases are accepted.
+
+[Unreleased]: https://github.com/Limme-swe/super-mem/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Limme-swe/super-mem/releases/tag/v0.1.0

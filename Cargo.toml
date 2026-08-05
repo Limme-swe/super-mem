@@ -32,7 +32,9 @@ tokio = { version = "1.53", features = ["macros", "rt"] }
 uuid = { version = "1.24", features = ["serde", "v7"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+# Unsafe code is denied everywhere by default. The CLI has one item-scoped,
+# documented Win32 call to read a file's hard-link count without elevation.
+unsafe_code = "deny"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
