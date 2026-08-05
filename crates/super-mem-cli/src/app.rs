@@ -464,12 +464,28 @@ pub(crate) fn open_engine_and_scope(
 }
 
 pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow::Result<()> {
-    let Some(repository_root) = native_git_root(cwd)? else {
+    let Some(discovered_repository_root) = native_git_root(cwd)? else {
         return Ok(());
     };
-    let repository_root = repository_root
+    // Keep both spellings. On Windows, `canonicalize` adds a verbatim `\\?\`
+    // prefix while Git and CLI arguments ordinarily use drive-letter paths.
+    // The lexical spelling is required to inspect junction components before
+    // they are resolved; the canonical spelling covers ordinary aliases.
+    let repository_lexical = absolute_lexical_path(&discovered_repository_root)?;
+    let repository_root = discovered_repository_root
         .canonicalize()
-        .with_context(|| format!("resolve Git worktree {}", repository_root.display()))?;
+        .with_context(|| {
+            format!(
+                "resolve Git worktree {}",
+                discovered_repository_root.display()
+            )
+        })?;
+    let mut repository_spellings = Vec::new();
+    if let Some(alias) = lexical_repository_alias(cwd, &repository_root)? {
+        push_unique(&mut repository_spellings, alias);
+    }
+    push_unique(&mut repository_spellings, repository_lexical);
+    push_unique(&mut repository_spellings, repository_root.clone());
     let database_lexical = absolute_lexical_path(database)?;
     let database_entry = canonical_entry_path(&database_lexical)?;
     let mut database_bases = vec![database_lexical];
@@ -496,8 +512,14 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
     }
 
     for candidate in candidates {
-        validate_scoped_database_path(&candidate)?;
-        let Ok(relative) = candidate.strip_prefix(&repository_root) else {
+        let repository_location = repository_spellings.iter().find_map(|spelling| {
+            candidate
+                .strip_prefix(spelling)
+                .ok()
+                .map(|relative| (relative, spelling.as_path()))
+        });
+        let Some((relative, lexical_root)) = repository_location else {
+            validate_scoped_database_path(&candidate)?;
             continue;
         };
         if relative.as_os_str().is_empty() {
@@ -506,7 +528,11 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
                 repository_root.display()
             );
         }
-        validate_repo_local_candidate(&candidate, &repository_root)?;
+        // Inspect lexical components before opening the final file. Otherwise
+        // a parent symlink/junction is followed by `symlink_metadata`, and a
+        // redirected file can look like a harmless external database.
+        validate_repo_local_candidate(&candidate, lexical_root)?;
+        validate_scoped_database_path(&candidate)?;
         if git_path_matches(&repository_root, "ls-files", &["--error-unmatch"], relative)? {
             bail!(
                 "refusing scoped memory operation because {} is tracked by Git; move --db outside {}",
@@ -528,6 +554,21 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
         }
     }
     Ok(())
+}
+
+fn lexical_repository_alias(cwd: &Path, canonical_root: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let mut cursor = absolute_lexical_path(cwd)?;
+    loop {
+        if cursor
+            .canonicalize()
+            .is_ok_and(|resolved| resolved == canonical_root)
+        {
+            return Ok(Some(cursor));
+        }
+        if !cursor.pop() {
+            return Ok(None);
+        }
+    }
 }
 
 fn validate_repo_local_candidate(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
@@ -847,7 +888,10 @@ fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
     for component in absolute.components() {
         cursor.push(component.as_os_str());
         match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata_is_link_like(&metadata) => {
+            Ok(metadata)
+                if metadata_is_link_like(&metadata)
+                    && !trusted_macos_system_alias(&cursor, &metadata) =>
+            {
                 bail!(
                     "refusing to purge {} because path component {} is a symbolic link or reparse point",
                     path.display(),
@@ -887,6 +931,33 @@ fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_macos_system_alias(path: &Path, metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    let expected = if path == Path::new("/var") {
+        Path::new("/private/var")
+    } else if path == Path::new("/tmp") {
+        Path::new("/private/tmp")
+    } else {
+        return false;
+    };
+    fs::read_link(path).is_ok_and(|target| {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            Path::new("/").join(target)
+        };
+        target == expected
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trusted_macos_system_alias(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
 }
 
 #[cfg(windows)]
@@ -1154,12 +1225,15 @@ pub(crate) const fn feedback(value: FeedbackArg) -> FeedbackSignal {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process::Command};
+    use std::fs;
+    #[cfg(unix)]
+    use std::process::Command;
 
     use tempfile::TempDir;
 
     use super::*;
 
+    #[cfg(unix)]
     fn git(repository: &Path, arguments: &[&str]) {
         assert!(
             Command::new("git")
@@ -1171,6 +1245,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     fn init_repository(repository: &Path) {
         fs::create_dir(repository).unwrap();
         git(repository, &["init", "--quiet"]);
@@ -1343,5 +1418,22 @@ mod tests {
         ] {
             assert!(!path.exists(), "{} was not removed", path.display());
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_purge_accepts_only_the_fixed_var_and_tmp_aliases() {
+        use std::os::unix::fs::symlink;
+
+        for path in [Path::new("/var"), Path::new("/tmp")] {
+            let metadata = fs::symlink_metadata(path).unwrap();
+            assert!(trusted_macos_system_alias(path, &metadata));
+        }
+
+        let temp = TempDir::new().unwrap();
+        let user_alias = temp.path().join("var-lookalike");
+        symlink("/private/var", &user_alias).unwrap();
+        let metadata = fs::symlink_metadata(&user_alias).unwrap();
+        assert!(!trusted_macos_system_alias(&user_alias, &metadata));
     }
 }

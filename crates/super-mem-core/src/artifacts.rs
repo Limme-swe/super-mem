@@ -1,5 +1,7 @@
 //! Safe, deterministic fingerprints for repository-relative artifacts.
 
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -8,8 +10,6 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
-#[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
 
 use crate::{ArtifactRef, Error, Result};
 

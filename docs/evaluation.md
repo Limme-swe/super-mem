@@ -29,7 +29,7 @@ The repository includes checks for these storage and retrieval invariants:
 - Rendered text, structured sections, and ranked hits retain the same selected and truncated bodies under the reported token budget.
 - Complete matching artifact sets can remain exact across unrelated dirty changes; partial automatic changed-file capture cannot establish exact applicability.
 - Schema-v4 history retains source events, revision metadata fidelity, and immutable revision-scoped links. Legacy non-head metadata is explicitly incomplete.
-- On Linux, macOS, and Windows, full-store purge removes the database, WAL, shared-memory, and rollback-journal files while leaving unrelated, symbolic-link, reparse-point, and multiply hard-linked paths untouched.
+- On Linux, macOS, and Windows, full-store purge removes the database, WAL, shared-memory, and rollback-journal files while leaving unrelated files, database or sidecar symlinks, user-controlled symlink or reparse-point paths, and multiply hard-linked paths untouched. The fixed macOS `/var` and `/tmp` system aliases are accepted.
 - Scope-sensitive opening rejects a repository-local database or sidecar that is tracked, not ignored, reached through a symbolic link, reparse point, or redirected ancestor, or has a hard-link alias. External database names receive the same alias check.
 - Workspaces sharing a repository cannot merge canonical identities or idempotency keys, revise each other's explicit IDs, attach each other's evidence or memory links, or overwrite each other's entity displays or artifact language metadata.
 

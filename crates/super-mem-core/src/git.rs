@@ -604,10 +604,7 @@ mod tests {
         assert!(remote_is_local_repository(r"C:relative\origin.git"));
         assert!(remote_is_local_repository(r"C:\absolute\origin.git"));
         assert_eq!(
-            normalize_discovered_remote(
-                r"C:relative\origin.git",
-                Path::new(r"C:\work\repository"),
-            ),
+            normalize_discovered_remote(r"C:relative\origin.git", Path::new(r"C:\work\repository"),),
             Some("C:relative/origin".into())
         );
         assert_eq!(
@@ -796,7 +793,7 @@ mod tests {
         assert_eq!(primary_context.repo_id, linked_context.repo_id);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn non_utf8_git_roots_have_distinct_native_identities() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};

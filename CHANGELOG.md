@@ -35,7 +35,7 @@ Notable changes are recorded here. Versioning follows Semantic Versioning. Befor
 
 - Bounded, domain-separated, length-framed automatic idempotency keys.
 - Native-byte and trailing-newline repository identity handling; scope-sensitive commands reject repository-local database paths that could alter tracked Git state through non-ignored files, links, or aliases.
-- Full-store purge removes the rollback journal as well as the database, WAL, and shared-memory sidecars after rejecting symbolic links, Windows reparse points, and hard-link aliases.
+- Full-store purge removes the rollback journal as well as the database, WAL, and shared-memory sidecars after rejecting database or sidecar symlinks, user-controlled symlink or Windows reparse-point components, and hard-link aliases. The fixed macOS `/var` and `/tmp` system aliases are accepted.
 
 [Unreleased]: https://github.com/Limme-swe/super-mem/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Limme-swe/super-mem/releases/tag/v0.1.0

@@ -85,7 +85,7 @@ Lifecycle changes are explicit. A `supersedes` link marks its target superseded.
 
 Trust is a ranking factor, not proof of truth: `External`, `Agent`, `ToolVerified`, and `UserConfirmed` receive increasing weights. Supersession and retraction preserve history; retracted memories are excluded from normal recall.
 
-On Linux, macOS, and Windows, `purge --yes` removes the database, WAL, shared-memory, and rollback-journal files after rejecting symbolic links, Windows reparse points, and multiple hard links. Windows obtains the link count from a native file handle without elevation. Stop all database users first; SQLite cannot portably identify idle open handles. Item-level physical erasure is unavailable.
+On Linux, macOS, and Windows, `purge --yes` removes the database, WAL, shared-memory, and rollback-journal files after rejecting database or sidecar symlinks, user-controlled symlink or Windows reparse-point components, and multiple hard links. The fixed macOS `/var` and `/tmp` system aliases are accepted. Windows obtains the link count from a native file handle without elevation. Stop all database users first; SQLite cannot portably identify idle open handles. Item-level physical erasure is unavailable.
 
 ## Capture
 

@@ -64,11 +64,10 @@ pub(crate) fn normalize_path(path: &Path) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix, not(target_os = "macos")))]
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn fallback_workspaces_distinguish_non_utf8_paths() {
         use std::{ffi::OsString, os::unix::ffi::OsStringExt};

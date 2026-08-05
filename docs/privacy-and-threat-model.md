@@ -95,7 +95,7 @@ Purge is available only through the human-facing CLI and requires explicit confi
 
 Stop every CLI, MCP, hook, and harness process using the store before purging. SQLite cannot reliably detect a process that still holds an idle database handle. Such a process may retain or recreate WAL or rollback-journal state after deletion.
 
-Purge refuses symbolic links, Windows reparse points, and paths with multiple hard links. A platform metadata failure also refuses the operation.
+Purge refuses a database or sidecar that is a symbolic link or Windows reparse point, any user-controlled symlink or reparse-point component, and paths with multiple hard links. It accepts the fixed macOS `/var → private/var` and `/tmp → private/tmp` system aliases. A platform metadata failure also refuses the operation.
 
 Purge does not remove exported snapshots, user-managed backups, filesystem snapshots, or copies held by another program. Flash storage can also retain physical remnants after application-level deletion.
 

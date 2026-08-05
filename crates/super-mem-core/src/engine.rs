@@ -226,7 +226,9 @@ impl MemoryEngine {
     /// Opens or creates a database at `path`.
     pub fn open(path: impl AsRef<Path>, options: EngineOptions) -> Result<Self> {
         let path = path.as_ref();
+        #[cfg(unix)]
         let database_was_missing = !path.exists();
+        #[cfg(unix)]
         let parent_was_missing = path.parent().is_some_and(|parent| !parent.exists());
         if let Some(parent) = path
             .parent()
