@@ -35,13 +35,11 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     ) {
-        let application_id = connection
-            .query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0));
+        let application_id =
+            connection.query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0));
         let version = connection.query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0));
         if let (Ok(application_id), Ok(version)) = (application_id, version) {
-            return Ok(
-                application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version)
-            );
+            return Ok(application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version));
         }
     }
 
@@ -87,8 +85,7 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
     validate_identity(connection)?;
 
     let journal_mode = retry_busy(busy_timeout, || {
-        let current: String =
-            connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        let current: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         if current == "wal" || current == "memory" {
             Ok(current)
         } else {
