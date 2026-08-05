@@ -123,6 +123,18 @@ requires an otherwise empty Super Mem database rather than attempting
 ambiguous record merges. Export streams directly to stdout or a private file;
 the current import API still buffers the complete snapshot in memory.
 
+Keep the database outside the repository when possible. Before a
+scope-sensitive command (`remember`, `observe`, `checkpoint`, or `recall`), a
+hook, or MCP opens SQLite, Unix builds accept a database inside the worktree
+only when all four possible paths (the main file plus `-wal`, `-shm`, and
+`-journal`) are untracked, Git-ignored, and free of symbolic links or multiple
+hard links. These paths also reject `..`; pass a canonical path instead. V0.1
+requires repository-local databases to be moved outside the worktree on
+non-Unix platforms because safe hard-link verification is unavailable.
+The non-scoped `init`, `inspect`, `feedback`, `retract`, `status`, `doctor`,
+`export`, `import`, and `purge` commands intentionally do not apply this
+Git-applicability guard.
+
 ## MCP surface
 
 The model-facing surface is deliberately small so tool schemas do not consume unnecessary context:
@@ -138,6 +150,23 @@ Automatic capture should use deterministic harness hooks rather than relying on 
 Namespace, workspace, root, and repository identity are pinned by the trusted
 MCP launch command and never accepted from model tool arguments. The server
 rediscovers current Git state from the pinned root on every call.
+
+## Lossless performance design
+
+SQLite remains the canonical event and revision store. Recall batches the
+canonical rows and their evidence instead of issuing per-memory queries. Its
+contentless FTS5 table is a rebuildable projection, and static hot-path SQL
+uses a bounded prepared-statement cache. Eligibility is applied before channel
+limits, and every tied collector, scorer, and diversity-selection step has an
+explicit deterministic order.
+These optimizations do not lower candidate limits, omit evidence, weaken
+durability, or approximate similarity. Snapshot tests compare canonical rows,
+floating-point bit patterns, and integrity footers across export and restore.
+
+The OpenCode and Pi adapters preserve the existing UTF-8-safe lifecycle cap
+while scanning oversized messages without materializing an array of every
+Unicode code point. The cap and its truncation marker are data-minimization
+policy, not a performance shortcut introduced by this optimization.
 
 ## How it differs from generic vector memory
 

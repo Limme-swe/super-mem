@@ -30,6 +30,12 @@ use crate::{
     schema::{SCHEMA_VERSION, initialize},
 };
 
+const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts),h.memory_id LIMIT 120";
+// Snapshot tables did not change in database schema v2; FTS and reverse
+// indexes are derived and rebuilt on import. Keep backups bidirectionally
+// compatible with v1 binaries rather than coupling them to `user_version`.
+const SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+
 const SNAPSHOT_TABLES: &[(&str, &[&str])] = &[
     (
         "events",
@@ -218,6 +224,7 @@ impl MemoryEngine {
     fn from_connection(connection: Connection, options: EngineOptions) -> Result<Self> {
         validate_options(&options)?;
         initialize(&connection, &options)?;
+        connection.set_prepared_statement_cache_capacity(32);
         let redactor = options.redact_secrets.then(Redactor::new).transpose()?;
         Ok(Self {
             connection: Mutex::new(connection),
@@ -624,25 +631,34 @@ impl MemoryEngine {
             .unwrap_or(self.options.default_token_budget)
             .clamp(64, 100_000);
         let now = request.as_of.unwrap_or_else(Utc::now);
+        request.as_of = Some(now);
+        let eligibility = CandidateEligibility::new(&request)?;
+        let terms = identifier_terms(&request.query);
         let query_id = QueryId::new();
         let connection = self.lock()?;
         let mut candidates = HashMap::<MemoryId, Candidate>::new();
 
-        collect_exact(&connection, &request, &mut candidates)?;
-        collect_fts(&connection, &request, &mut candidates)?;
-        collect_sparse(&connection, &request, &mut candidates)?;
-        collect_entities(&connection, &request, &mut candidates)?;
-        collect_error_fingerprint(&connection, &request, &mut candidates)?;
-        collect_recent(&connection, &request, &mut candidates)?;
+        collect_exact(&connection, &request, &eligibility, &mut candidates)?;
+        collect_fts(&connection, &request, &eligibility, &mut candidates)?;
+        collect_sparse(&connection, &request, &eligibility, &terms, &mut candidates)?;
+        collect_entities(&connection, &request, &eligibility, &terms, &mut candidates)?;
+        collect_error_fingerprint(&connection, &request, &eligibility, &mut candidates)?;
+        collect_recent(&connection, &request, &eligibility, &mut candidates)?;
         prune_candidates(&mut candidates, 256);
 
+        let candidate_ids = candidates.keys().copied().collect::<Vec<_>>();
+        let mut memories = load_memories(&connection, &candidate_ids)?;
+        let utilities = feedback_utilities(&connection, &candidate_ids)?;
         let mut hits = Vec::new();
         let mut git_relations = HashMap::new();
         let mut resolve_git = |root: &str, stored: &str, current: &str| {
             crate::compare_revisions(root, stored, current)
         };
         for (memory_id, mut candidate) in candidates {
-            let memory = load_memory(&connection, memory_id)?;
+            let memory = memories.remove(&memory_id).ok_or_else(|| Error::NotFound {
+                kind: "memory",
+                id: memory_id.to_string(),
+            })?;
             if !request.kinds.is_empty() && !request.kinds.contains(&memory.kind) {
                 continue;
             }
@@ -655,18 +671,14 @@ impl MemoryEngine {
             if !valid_at(&memory, now) {
                 continue;
             }
-            let relation = cached_git_relation(
-                &memory.scope,
-                &request.scope,
-                &mut git_relations,
-                &mut resolve_git,
-            );
             let applicability = classify_applicability_with_relation(
                 &memory.scope,
                 &request.scope,
                 &memory.artifacts,
                 &request.hints.artifacts,
-                relation,
+                |root, stored, current| {
+                    cached_git_relation(root, stored, current, &mut git_relations, &mut resolve_git)
+                },
             );
             if applicability == Applicability::Inapplicable
                 || (applicability == Applicability::Stale && !request.include_stale)
@@ -676,7 +688,7 @@ impl MemoryEngine {
             if artifact_verified(&memory.artifacts, &request.hints.artifacts) {
                 candidate.record(RetrievalSignal::ArtifactVerified, 1);
             }
-            let utility = feedback_utility(&connection, memory_id)?;
+            let utility = utilities.get(&memory_id).copied().unwrap_or(0.0);
             hits.push(score_candidate(
                 memory,
                 &candidate,
@@ -685,7 +697,12 @@ impl MemoryEngine {
                 now,
             ));
         }
-        hits.sort_by(|left, right| right.score.total_cmp(&left.score));
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+        });
         let selected = select_mmr(hits, limit, 0.78);
         let database_seq = latest_sequence(&connection)?;
         Ok(compile_context(
@@ -861,7 +878,7 @@ impl MemoryEngine {
             &json!({
                 "record_type": "super_mem_export",
                 "format_version": 2,
-                "schema_version": SCHEMA_VERSION,
+                "schema_version": SNAPSHOT_SCHEMA_VERSION,
                 "mode": "full_snapshot",
                 "requires_empty_target": true,
                 "exported_at": Utc::now(),
@@ -912,7 +929,7 @@ impl MemoryEngine {
                     if value.get("format_version").and_then(Value::as_u64) != Some(2)
                         || value.get("mode").and_then(Value::as_str) != Some("full_snapshot")
                         || value.get("schema_version").and_then(Value::as_u64)
-                            != Some(u64::from(SCHEMA_VERSION))
+                            != Some(u64::from(SNAPSHOT_SCHEMA_VERSION))
                     {
                         return Err(Error::InvalidInput("unsupported export format".into()));
                     }
@@ -1606,6 +1623,13 @@ fn scoped_idempotency_key(scope: &Scope, key: Option<&str>) -> Option<String> {
         let mut hasher = blake3::Hasher::new();
         hasher.update(scope.key().as_bytes());
         hasher.update(&[0]);
+        // `Scope::key` intentionally preserves the legacy repository/branch
+        // digest stored in snapshots. A workspace is still an isolation
+        // boundary when a repository is present, so bind it independently.
+        if let Some(workspace_id) = scope.repository.as_ref().and(scope.workspace_id.as_deref()) {
+            hasher.update(b"workspace-v1\0");
+            hasher.update(blake3::hash(workspace_id.as_bytes()).as_bytes());
+        }
         hasher.update(key.as_bytes());
         hasher.finalize().to_hex().to_string()
     })
@@ -1614,13 +1638,51 @@ fn scoped_idempotency_key(scope: &Scope, key: Option<&str>) -> Option<String> {
 fn stabilize_scope(scope: &mut Scope) {
     scope.session_id = None;
     if let Some(repository) = &mut scope.repository {
-        scope.workspace_id = None;
         repository.root = None;
         repository.common_dir = None;
         repository.head_oid = None;
         repository.remote = None;
         repository.dirty_hash = None;
     }
+}
+
+fn same_durable_scope(
+    stored_scope_key: &str,
+    stored_workspace: Option<&str>,
+    scope: &Scope,
+) -> bool {
+    stored_scope_key == scope.key() && stored_workspace == scope.workspace_id.as_deref()
+}
+
+fn attachment_namespace(scope: &Scope, attachment_kind: &[u8], variant: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"super-mem:attachment-scope:v1\0");
+    hasher.update(scope.key().as_bytes());
+    hasher.update(&[0]);
+    match scope.workspace_id.as_deref() {
+        Some(workspace_id) => {
+            hasher.update(b"workspace\0");
+            hasher.update(blake3::hash(workspace_id.as_bytes()).as_bytes());
+        }
+        None => {
+            hasher.update(b"no-workspace");
+        }
+    }
+    hasher.update(&[0]);
+    hasher.update(attachment_kind);
+    hasher.update(&[0]);
+    hasher.update(variant.as_bytes());
+    format!("{}\u{1f}{}", scope.namespace, hasher.finalize().to_hex())
+}
+
+fn memory_content_hash(title: &str, body: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"super-mem:memory-content:v2\0");
+    // Fixed-width component hashes avoid ambiguous delimiter concatenation
+    // while streaming arbitrarily large bodies without a second full buffer.
+    hasher.update(blake3::hash(title.as_bytes()).as_bytes());
+    hasher.update(blake3::hash(body.as_bytes()).as_bytes());
+    hasher.finalize().to_hex().to_string()
 }
 
 fn normalize_repository(repository: &mut Option<RepositoryContext>) {
@@ -1677,13 +1739,19 @@ fn upsert_memory(
     let existing = if let Some(memory_id) = request.memory_id {
         transaction
             .query_row(
-                "SELECT memory_id,docid,head_revision,created_at_ms,created_seq,namespace,scope_key,state,kind FROM memory_heads WHERE memory_id=?1",
+                "SELECT memory_id,docid,head_revision,created_at_ms,created_seq,namespace,scope_key,workspace_id,state,kind FROM memory_heads WHERE memory_id=?1",
                 [memory_id.to_string()],
-                |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?,row.get::<_, u32>(2)?,row.get::<_, i64>(3)?,row.get::<_, i64>(4)?,row.get::<_, String>(5)?,row.get::<_, String>(6)?,row.get::<_, String>(7)?,row.get::<_, String>(8)?)),
+                |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?,row.get::<_, u32>(2)?,row.get::<_, i64>(3)?,row.get::<_, i64>(4)?,row.get::<_, String>(5)?,row.get::<_, String>(6)?,row.get::<_, Option<String>>(7)?,row.get::<_, String>(8)?,row.get::<_, String>(9)?)),
             )
             .optional()?
-            .map(|(id,docid,revision,created_at,created_seq,namespace,existing_scope,state,kind)| {
-                if namespace != request.scope.namespace || existing_scope != scope_key {
+            .map(|(id,docid,revision,created_at,created_seq,namespace,existing_scope,workspace_id,state,kind)| {
+                if namespace != request.scope.namespace
+                    || !same_durable_scope(
+                        &existing_scope,
+                        workspace_id.as_deref(),
+                        &request.scope,
+                    )
+                {
                     return Err(Error::Conflict(
                         "an explicit memory revision cannot change namespace, repository, workspace, or branch identity".into(),
                     ));
@@ -1706,8 +1774,8 @@ fn upsert_memory(
     } else if let Some(canonical_key) = request.canonical_key.as_deref() {
         transaction
             .query_row(
-                "SELECT memory_id,docid,head_revision,created_at_ms,created_seq FROM memory_heads WHERE namespace=?1 AND scope_key=?2 AND kind=?3 AND canonical_key=?4 AND state IN ('active','contested') ORDER BY updated_seq DESC LIMIT 1",
-                params![request.scope.namespace, scope_key, request.kind.as_str(), canonical_key],
+                "SELECT memory_id,docid,head_revision,created_at_ms,created_seq FROM memory_heads WHERE namespace=?1 AND scope_key=?2 AND kind=?3 AND canonical_key=?4 AND workspace_id IS ?5 AND state IN ('active','contested') ORDER BY updated_seq DESC,memory_id LIMIT 1",
+                params![request.scope.namespace, scope_key, request.kind.as_str(), canonical_key, request.scope.workspace_id],
                 |row| Ok((row.get::<_, String>(0)?,row.get::<_, i64>(1)?,row.get::<_, u32>(2)?,row.get::<_, i64>(3)?,row.get::<_, i64>(4)?)),
             )
             .optional()?
@@ -1748,9 +1816,7 @@ fn upsert_memory(
 
     let scope_json = serde_json::to_string(&request.scope)?;
     let attributes_json = serde_json::to_string(&request.attributes)?;
-    let content_hash = blake3::hash(format!("{}\0{}", request.title, request.body).as_bytes())
-        .to_hex()
-        .to_string();
+    let content_hash = memory_content_hash(&request.title, &request.body);
     transaction.execute(
         "INSERT INTO memory_revisions(memory_id,revision,title,body,attributes_json,scope_json,content_hash,recorded_at_ms,recorded_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![memory_id.to_string(), revision, request.title, request.body, attributes_json, scope_json, content_hash, to_ms(now), sequence],
@@ -1784,16 +1850,14 @@ fn upsert_memory(
         )?;
     }
     for entity in &request.entities {
-        transaction.execute(
-            "INSERT INTO entities(namespace,kind,canonical,display) VALUES(?1,?2,?3,?4) ON CONFLICT(namespace,kind,canonical) DO UPDATE SET display=excluded.display",
-            params![request.scope.namespace, entity.kind, entity.canonical.to_ascii_lowercase(), entity.display],
-        )?;
+        let storage_namespace = attachment_namespace(&request.scope, b"entity", &entity.display);
         let entity_id: i64 = transaction.query_row(
-            "SELECT entity_id FROM entities WHERE namespace=?1 AND kind=?2 AND canonical=?3",
+            "INSERT INTO entities(namespace,kind,canonical,display) VALUES(?1,?2,?3,?4) ON CONFLICT(namespace,kind,canonical) DO UPDATE SET entity_id=entities.entity_id RETURNING entity_id",
             params![
-                request.scope.namespace,
+                storage_namespace,
                 entity.kind,
-                entity.canonical.to_ascii_lowercase()
+                entity.canonical.to_ascii_lowercase(),
+                entity.display,
             ],
             |row| row.get(0),
         )?;
@@ -1803,13 +1867,14 @@ fn upsert_memory(
         )?;
     }
     for artifact in &request.artifacts {
-        transaction.execute(
-            "INSERT OR IGNORE INTO artifacts(namespace,repo_id,path,symbol,content_hash,git_oid,language) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![request.scope.namespace, artifact.repo_id, normalize_artifact_path(&artifact.path), artifact.symbol.as_deref().unwrap_or(""), artifact.content_hash.as_deref().unwrap_or(""), artifact.git_oid.as_deref().unwrap_or(""), artifact.language.as_deref().unwrap_or("")],
-        )?;
+        let storage_namespace = attachment_namespace(
+            &request.scope,
+            b"artifact",
+            artifact.language.as_deref().unwrap_or(""),
+        );
         let artifact_id: i64 = transaction.query_row(
-            "SELECT artifact_id FROM artifacts WHERE namespace=?1 AND repo_id=?2 AND path=?3 AND symbol=?4 AND content_hash=?5 AND git_oid=?6",
-            params![request.scope.namespace, artifact.repo_id, normalize_artifact_path(&artifact.path), artifact.symbol.as_deref().unwrap_or(""), artifact.content_hash.as_deref().unwrap_or(""), artifact.git_oid.as_deref().unwrap_or("")],
+            "INSERT INTO artifacts(namespace,repo_id,path,symbol,content_hash,git_oid,language) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(namespace,repo_id,path,symbol,content_hash,git_oid) DO UPDATE SET artifact_id=artifacts.artifact_id RETURNING artifact_id",
+            params![storage_namespace, artifact.repo_id, normalize_artifact_path(&artifact.path), artifact.symbol.as_deref().unwrap_or(""), artifact.content_hash.as_deref().unwrap_or(""), artifact.git_oid.as_deref().unwrap_or(""), artifact.language.as_deref().unwrap_or("")],
             |row| row.get(0),
         )?;
         transaction.execute(
@@ -1929,7 +1994,9 @@ fn validate_evidence(
             });
         };
         let event_scope: Scope = serde_json::from_str(&event_scope_json)?;
-        if event_scope.key() != scope.key() {
+        if event_scope.key() != scope.key()
+            || event_scope.workspace_id.as_deref() != scope.workspace_id.as_deref()
+        {
             return Err(Error::Conflict(
                 "evidence cannot cross namespace, repository, workspace, or branch identity".into(),
             ));
@@ -1953,18 +2020,18 @@ fn validate_links(
     scope: &Scope,
 ) -> Result<()> {
     for link in links {
-        let target_scope = transaction
+        let (target_scope, target_workspace) = transaction
             .query_row(
-                "SELECT scope_key FROM memory_heads WHERE memory_id=?1",
+                "SELECT scope_key,workspace_id FROM memory_heads WHERE memory_id=?1",
                 [link.target.to_string()],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()?
             .ok_or_else(|| Error::NotFound {
                 kind: "memory",
                 id: link.target.to_string(),
             })?;
-        if target_scope != scope.key() {
+        if !same_durable_scope(&target_scope, target_workspace.as_deref(), scope) {
             return Err(Error::Conflict(
                 "memory links cannot cross namespace, repository, workspace, or branch identity"
                     .into(),
@@ -2053,168 +2120,279 @@ fn put_idempotent<T: Serialize>(
 }
 
 fn request_fingerprint(value: &impl Serialize) -> Result<String> {
-    let encoded = serde_json::to_vec(value)?;
-    Ok(blake3::hash(&encoded).to_hex().to_string())
+    let mut hasher = blake3::Hasher::new();
+    serde_json::to_writer(HashWriter(&mut hasher), value)?;
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+struct HashWriter<'a>(&'a mut blake3::Hasher);
+
+impl Write for HashWriter<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn load_memory(connection: &Connection, memory_id: MemoryId) -> Result<Memory> {
-    #[allow(clippy::type_complexity)]
-    let row = connection
-        .query_row(
-            "SELECT h.head_revision,h.kind,h.state,h.canonical_key,h.importance,h.confidence,h.trust,h.valid_from_ms,h.valid_until_ms,h.expires_at_ms,h.created_at_ms,h.updated_at_ms,r.title,r.body,r.attributes_json,r.scope_json FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1",
-            [memory_id.to_string()],
-            |row| {
-                Ok((
-                    row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?, row.get::<_, f32>(4)?, row.get::<_, f32>(5)?,
-                    row.get::<_, String>(6)?, row.get::<_, Option<i64>>(7)?, row.get::<_, Option<i64>>(8)?,
-                    row.get::<_, Option<i64>>(9)?, row.get::<_, i64>(10)?, row.get::<_, i64>(11)?,
-                    row.get::<_, String>(12)?, row.get::<_, String>(13)?, row.get::<_, String>(14)?,
-                    row.get::<_, String>(15)?,
-                ))
-            },
-        )
-        .optional()?
-        .ok_or_else(|| Error::NotFound { kind: "memory", id: memory_id.to_string() })?;
-    let (
-        revision,
-        kind,
-        state,
-        canonical_key,
-        importance,
-        confidence,
-        trust,
-        valid_from,
-        valid_until,
-        expires,
-        created,
-        updated,
-        title,
-        body,
-        attributes_json,
-        scope_json,
-    ) = row;
-    let kind =
-        MemoryKind::parse(&kind).ok_or_else(|| Error::Migration("unknown memory kind".into()))?;
-    let state = MemoryState::parse(&state)
-        .ok_or_else(|| Error::Migration("unknown memory state".into()))?;
-    let trust =
-        TrustLevel::parse(&trust).ok_or_else(|| Error::Migration("unknown trust level".into()))?;
+    load_memories(connection, &[memory_id])?
+        .remove(&memory_id)
+        .ok_or_else(|| Error::NotFound {
+            kind: "memory",
+            id: memory_id.to_string(),
+        })
+}
 
-    let tags = query_strings(
-        connection,
-        "SELECT tag FROM memory_tags WHERE memory_id=?1 AND revision=?2 ORDER BY normalized",
-        memory_id,
-        revision,
-    )?;
-    let entities = {
-        let mut statement = connection.prepare(
-            "SELECT e.kind,e.canonical,e.display FROM memory_entities me JOIN entities e ON e.entity_id=me.entity_id WHERE me.memory_id=?1 AND me.revision=?2 ORDER BY e.kind,e.canonical",
-        )?;
-        statement
-            .query_map(params![memory_id.to_string(), revision], |row| {
-                Ok(EntityRef {
-                    kind: row.get(0)?,
-                    canonical: row.get(1)?,
-                    display: row.get(2)?,
+struct RawMemoryRow {
+    memory_id: String,
+    revision: u32,
+    kind: String,
+    state: String,
+    canonical_key: Option<String>,
+    importance: f32,
+    confidence: f32,
+    trust: String,
+    valid_from: Option<i64>,
+    valid_until: Option<i64>,
+    expires: Option<i64>,
+    created: i64,
+    updated: i64,
+    title: String,
+    body: String,
+    attributes_json: String,
+    scope_json: String,
+}
+
+fn load_memories(
+    connection: &Connection,
+    memory_ids: &[MemoryId],
+) -> Result<HashMap<MemoryId, Memory>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = sql_placeholders(memory_ids.len());
+    let id_params = || memory_ids.iter().map(ToString::to_string);
+    let mut memories = HashMap::with_capacity(memory_ids.len());
+    {
+        let sql = format!(
+            "SELECT h.memory_id,h.head_revision,h.kind,h.state,h.canonical_key,h.importance,h.confidence,h.trust,h.valid_from_ms,h.valid_until_ms,h.expires_at_ms,h.created_at_ms,h.updated_at_ms,r.title,r.body,r.attributes_json,r.scope_json FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                Ok(RawMemoryRow {
+                    memory_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: row.get(3)?,
+                    canonical_key: row.get(4)?,
+                    importance: row.get(5)?,
+                    confidence: row.get(6)?,
+                    trust: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    expires: row.get(10)?,
+                    created: row.get(11)?,
+                    updated: row.get(12)?,
+                    title: row.get(13)?,
+                    body: row.get(14)?,
+                    attributes_json: row.get(15)?,
+                    scope_json: row.get(16)?,
                 })
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let artifacts = {
-        let mut statement = connection.prepare(
-            "SELECT a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language FROM memory_artifacts ma JOIN artifacts a ON a.artifact_id=ma.artifact_id WHERE ma.memory_id=?1 AND ma.revision=?2 ORDER BY a.repo_id,a.path,a.symbol",
-        )?;
-        statement
-            .query_map(params![memory_id.to_string(), revision], |row| {
-                let symbol: String = row.get(2)?;
-                let content_hash: String = row.get(3)?;
-                let git_oid: String = row.get(4)?;
-                let language: String = row.get(5)?;
-                Ok(ArtifactRef {
-                    repo_id: row.get(0)?,
-                    path: row.get(1)?,
-                    symbol: (!symbol.is_empty()).then_some(symbol),
-                    content_hash: (!content_hash.is_empty()).then_some(content_hash),
-                    git_oid: (!git_oid.is_empty()).then_some(git_oid),
-                    language: (!language.is_empty()).then_some(language),
-                })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in rows {
+            let memory_id = parse_memory_id(&row.memory_id)?;
+            let kind = MemoryKind::parse(&row.kind)
+                .ok_or_else(|| Error::Migration("unknown memory kind".into()))?;
+            let state = MemoryState::parse(&row.state)
+                .ok_or_else(|| Error::Migration("unknown memory state".into()))?;
+            let trust = TrustLevel::parse(&row.trust)
+                .ok_or_else(|| Error::Migration("unknown trust level".into()))?;
+            memories.insert(
+                memory_id,
+                Memory {
+                    memory_id,
+                    revision: row.revision,
+                    kind,
+                    state,
+                    scope: serde_json::from_str(&row.scope_json)?,
+                    canonical_key: row.canonical_key,
+                    title: row.title,
+                    body: row.body,
+                    importance: row.importance,
+                    confidence: row.confidence,
+                    trust,
+                    valid_from: row.valid_from.map(from_ms).transpose()?,
+                    valid_until: row.valid_until.map(from_ms).transpose()?,
+                    expires_at: row.expires.map(from_ms).transpose()?,
+                    created_at: from_ms(row.created)?,
+                    updated_at: from_ms(row.updated)?,
+                    attributes: serde_json::from_str(&row.attributes_json)?,
+                    tags: Vec::new(),
+                    entities: Vec::new(),
+                    artifacts: Vec::new(),
+                    evidence: Vec::new(),
+                },
+            );
+        }
+    }
+    if memories.len() != memory_ids.len() {
+        let missing = memory_ids
+            .iter()
+            .find(|id| !memories.contains_key(id))
+            .expect("different lengths imply a missing memory");
+        return Err(Error::NotFound {
+            kind: "memory",
+            id: missing.to_string(),
+        });
+    }
+
+    {
+        let sql = format!(
+            "SELECT t.memory_id,t.tag FROM memory_tags t JOIN memory_heads h ON h.memory_id=t.memory_id AND h.head_revision=t.revision WHERE t.memory_id IN ({placeholders}) ORDER BY t.memory_id,t.normalized"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
-            .collect::<std::result::Result<Vec<_>, _>>()?
-    };
-    let evidence = {
-        let mut statement = connection.prepare(
-            "SELECT event_id,span_start,span_end,relation FROM memory_evidence WHERE memory_id=?1 AND revision=?2 ORDER BY event_id",
-        )?;
-        let raw = statement
-            .query_map(params![memory_id.to_string(), revision], |row| {
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, tag) in rows {
+            memory_mut(&mut memories, &id)?.tags.push(tag);
+        }
+    }
+    {
+        let sql = format!(
+            "SELECT me.memory_id,e.kind,e.canonical,e.display FROM memory_entities me JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision JOIN entities e ON e.entity_id=me.entity_id WHERE me.memory_id IN ({placeholders}) ORDER BY me.memory_id,e.kind,e.canonical"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
                 Ok((
                     row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, String>(3)?,
+                    EntityRef {
+                        kind: row.get(1)?,
+                        canonical: row.get(2)?,
+                        display: row.get(3)?,
+                    },
                 ))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        raw.into_iter()
-            .map(|(id, start, end, relation)| {
-                Ok(EvidenceRef {
-                    event_id: parse_event_id(&id)?,
-                    span_start: start.map(|value| value as usize),
-                    span_end: end.map(|value| value as usize),
-                    relation,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?
-    };
-
-    Ok(Memory {
-        memory_id,
-        revision,
-        kind,
-        state,
-        scope: serde_json::from_str(&scope_json)?,
-        canonical_key,
-        title,
-        body,
-        importance,
-        confidence,
-        trust,
-        valid_from: valid_from.map(from_ms).transpose()?,
-        valid_until: valid_until.map(from_ms).transpose()?,
-        expires_at: expires.map(from_ms).transpose()?,
-        created_at: from_ms(created)?,
-        updated_at: from_ms(updated)?,
-        attributes: serde_json::from_str(&attributes_json)?,
-        tags,
-        entities,
-        artifacts,
-        evidence,
-    })
+        for (id, entity) in rows {
+            memory_mut(&mut memories, &id)?.entities.push(entity);
+        }
+    }
+    {
+        let sql = format!(
+            "SELECT ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language FROM memory_artifacts ma JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision JOIN artifacts a ON a.artifact_id=ma.artifact_id WHERE ma.memory_id IN ({placeholders}) ORDER BY ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language,a.artifact_id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                let symbol: String = row.get(3)?;
+                let content_hash: String = row.get(4)?;
+                let git_oid: String = row.get(5)?;
+                let language: String = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ArtifactRef {
+                        repo_id: row.get(1)?,
+                        path: row.get(2)?,
+                        symbol: (!symbol.is_empty()).then_some(symbol),
+                        content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                        git_oid: (!git_oid.is_empty()).then_some(git_oid),
+                        language: (!language.is_empty()).then_some(language),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, artifact) in rows {
+            memory_mut(&mut memories, &id)?.artifacts.push(artifact);
+        }
+    }
+    {
+        let sql = format!(
+            "SELECT me.memory_id,me.event_id,me.span_start,me.span_end,me.relation FROM memory_evidence me JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision WHERE me.memory_id IN ({placeholders}) ORDER BY me.memory_id,me.event_id,me.relation,me.span_start,me.span_end"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, event_id, span_start, span_end, relation) in rows {
+            memory_mut(&mut memories, &id)?.evidence.push(EvidenceRef {
+                event_id: parse_event_id(&event_id)?,
+                span_start: span_start.map(|value| value as usize),
+                span_end: span_end.map(|value| value as usize),
+                relation,
+            });
+        }
+    }
+    Ok(memories)
 }
 
-fn query_strings(
-    connection: &Connection,
-    sql: &str,
-    memory_id: MemoryId,
-    revision: u32,
-) -> Result<Vec<String>> {
-    let mut statement = connection.prepare(sql)?;
-    Ok(statement
-        .query_map(params![memory_id.to_string(), revision], |row| row.get(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?)
+fn memory_mut<'a>(
+    memories: &'a mut HashMap<MemoryId, Memory>,
+    raw_id: &str,
+) -> Result<&'a mut Memory> {
+    let memory_id = parse_memory_id(raw_id)?;
+    memories
+        .get_mut(&memory_id)
+        .ok_or_else(|| Error::Migration("memory attachment references a missing head".into()))
+}
+
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+struct CandidateEligibility {
+    include_superseded: bool,
+    all_kinds: bool,
+    kinds_json: String,
+    as_of_ms: i64,
+}
+
+impl CandidateEligibility {
+    fn new(request: &RecallRequest) -> Result<Self> {
+        let kinds = request
+            .kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>();
+        Ok(Self {
+            include_superseded: request.include_superseded,
+            all_kinds: kinds.is_empty(),
+            kinds_json: serde_json::to_string(&kinds)?,
+            as_of_ms: to_ms(request.as_of.expect("recall assigns as_of")),
+        })
+    }
 }
 
 fn collect_exact(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
     if request.query.trim().len() < 2 {
         return Ok(());
     }
-    let mut statement = connection.prepare(
-        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND (instr(lower(r.title),lower(:query))>0 OR instr(lower(r.body),lower(:query))>0) ORDER BY h.updated_seq DESC LIMIT 80",
+    let mut statement = connection.prepare_cached(
+        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (instr(lower(r.title),lower(:query))>0 OR instr(lower(r.body),lower(:query))>0) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 80",
     )?;
     let ids = statement
         .query_map(
@@ -2223,6 +2401,10 @@ fn collect_exact(
                 ":workspace": request.scope.workspace_id,
                 ":repo": request.scope.repo_id(),
                 ":query": request.query.trim(),
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
             },
             |row| row.get::<_, String>(0),
         )?
@@ -2233,14 +2415,15 @@ fn collect_exact(
 fn collect_fts(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
     let Some(query) = safe_fts_query(&request.query) else {
         return Ok(());
     };
-    let mut statement = connection.prepare(
-        "SELECT h.memory_id FROM memory_fts JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND memory_fts MATCH :query ORDER BY bm25(memory_fts) LIMIT 120",
-    )?;
+    // CROSS JOIN fixes the virtual table as the outer loop. Otherwise SQLite
+    // can probe the complete FTS index once per scoped memory head.
+    let mut statement = connection.prepare_cached(FTS_CANDIDATE_SQL)?;
     let ids = statement
         .query_map(
             named_params! {
@@ -2248,6 +2431,10 @@ fn collect_fts(
                 ":workspace": request.scope.workspace_id,
                 ":repo": request.scope.repo_id(),
                 ":query": query,
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
             },
             |row| row.get::<_, String>(0),
         )?
@@ -2258,11 +2445,13 @@ fn collect_fts(
 fn collect_sparse(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    terms: &[String],
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
-    for term in identifier_terms(&request.query).into_iter().take(8) {
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT h.memory_id FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id=a.artifact_id JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND (instr(lower(a.path),lower(:term))>0 OR lower(a.symbol)=lower(:term)) LIMIT 40",
+    for term in terms.iter().take(8) {
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT h.memory_id FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id=a.artifact_id JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (instr(lower(a.path),lower(:term))>0 OR lower(a.symbol)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
         )?;
         let ids = statement
             .query_map(
@@ -2271,14 +2460,18 @@ fn collect_sparse(
                     ":workspace": request.scope.workspace_id,
                     ":repo": request.scope.repo_id(),
                     ":term": term,
+                    ":include_superseded": eligibility.include_superseded,
+                    ":all_kinds": eligibility.all_kinds,
+                    ":kinds": eligibility.kinds_json,
+                    ":as_of": eligibility.as_of_ms,
                 },
                 |row| row.get::<_, String>(0),
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         add_candidates(candidates, ids, RetrievalSignal::Sparse)?;
 
-        let mut tags = connection.prepare(
-            "SELECT DISTINCT h.memory_id FROM memory_tags t JOIN memory_heads h ON h.memory_id=t.memory_id AND h.head_revision=t.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND t.normalized=:term LIMIT 40",
+        let mut tags = connection.prepare_cached(
+            "SELECT DISTINCT h.memory_id FROM memory_tags t JOIN memory_heads h ON h.memory_id=t.memory_id AND h.head_revision=t.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND t.normalized=:term ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
         )?;
         let ids = tags
             .query_map(
@@ -2287,6 +2480,10 @@ fn collect_sparse(
                     ":workspace": request.scope.workspace_id,
                     ":repo": request.scope.repo_id(),
                     ":term": term.to_ascii_lowercase(),
+                    ":include_superseded": eligibility.include_superseded,
+                    ":all_kinds": eligibility.all_kinds,
+                    ":kinds": eligibility.kinds_json,
+                    ":as_of": eligibility.as_of_ms,
                 },
                 |row| row.get::<_, String>(0),
             )?
@@ -2299,14 +2496,16 @@ fn collect_sparse(
 fn collect_entities(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    identifier_terms: &[String],
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
     let mut terms = request.hints.entities.clone();
-    terms.extend(identifier_terms(&request.query));
+    terms.extend_from_slice(identifier_terms);
     deduplicate_strings(&mut terms);
     for term in terms.into_iter().take(16) {
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT h.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND (e.canonical=lower(:term) OR lower(e.display)=lower(:term)) LIMIT 40",
+        let mut statement = connection.prepare_cached(
+            "SELECT DISTINCT h.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (e.canonical=lower(:term) OR lower(e.display)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
         )?;
         let ids = statement
             .query_map(
@@ -2315,6 +2514,10 @@ fn collect_entities(
                     ":workspace": request.scope.workspace_id,
                     ":repo": request.scope.repo_id(),
                     ":term": term,
+                    ":include_superseded": eligibility.include_superseded,
+                    ":all_kinds": eligibility.all_kinds,
+                    ":kinds": eligibility.kinds_json,
+                    ":as_of": eligibility.as_of_ms,
                 },
                 |row| row.get::<_, String>(0),
             )?
@@ -2327,13 +2530,14 @@ fn collect_entities(
 fn collect_error_fingerprint(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
     let Some(fingerprint) = request.hints.error_fingerprint.as_deref() else {
         return Ok(());
     };
-    let mut statement = connection.prepare(
-        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND json_extract(r.attributes_json,'$.error_fingerprint')=:fingerprint LIMIT 60",
+    let mut statement = connection.prepare_cached(
+        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND json_extract(r.attributes_json,'$.error_fingerprint')=:fingerprint ORDER BY h.updated_seq DESC,h.memory_id LIMIT 60",
     )?;
     let ids = statement
         .query_map(
@@ -2342,6 +2546,10 @@ fn collect_error_fingerprint(
                 ":workspace": request.scope.workspace_id,
                 ":repo": request.scope.repo_id(),
                 ":fingerprint": fingerprint,
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
             },
             |row| row.get::<_, String>(0),
         )?
@@ -2352,10 +2560,11 @@ fn collect_error_fingerprint(
 fn collect_recent(
     connection: &Connection,
     request: &RecallRequest,
+    eligibility: &CandidateEligibility,
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
-    let mut statement = connection.prepare(
-        "SELECT h.memory_id FROM memory_heads h WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) ORDER BY h.updated_seq DESC LIMIT 32",
+    let mut statement = connection.prepare_cached(
+        "SELECT h.memory_id FROM memory_heads h WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 32",
     )?;
     let ids = statement
         .query_map(
@@ -2363,6 +2572,10 @@ fn collect_recent(
                 ":namespace": request.scope.namespace,
                 ":workspace": request.scope.workspace_id,
                 ":repo": request.scope.repo_id(),
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
             },
             |row| row.get::<_, String>(0),
         )?
@@ -2400,25 +2613,19 @@ fn prune_candidates(candidates: &mut HashMap<MemoryId, Candidate>, maximum: usiz
 }
 
 fn cached_git_relation<F>(
-    memory_scope: &Scope,
-    current_scope: &Scope,
+    root: &str,
+    stored: &str,
+    current: &str,
     cache: &mut HashMap<(String, String, String), GitRelation>,
     resolver: &mut F,
-) -> Option<GitRelation>
+) -> GitRelation
 where
     F: FnMut(&str, &str, &str) -> GitRelation,
 {
-    let memory = memory_scope.repository.as_ref()?;
-    let current = current_scope.repository.as_ref()?;
-    let root = current.root.as_deref()?;
-    let stored = memory.head_oid.as_deref()?;
-    let current_oid = current.head_oid.as_deref()?;
-    let key = (root.to_owned(), stored.to_owned(), current_oid.to_owned());
-    Some(
-        *cache
-            .entry(key)
-            .or_insert_with(|| resolver(root, stored, current_oid)),
-    )
+    let key = (root.to_owned(), stored.to_owned(), current.to_owned());
+    *cache
+        .entry(key)
+        .or_insert_with(|| resolver(root, stored, current))
 }
 
 fn identifier_terms(query: &str) -> Vec<String> {
@@ -2441,16 +2648,45 @@ fn identifier_terms(query: &str) -> Vec<String> {
     terms
 }
 
-fn feedback_utility(connection: &Connection, memory_id: MemoryId) -> Result<f64> {
-    let (positive, negative): (i64, i64) = connection.query_row(
-        "SELECT coalesce(sum(CASE WHEN signal IN ('helpful','used') THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN signal IN ('harmful','incorrect','outdated','dismissed') THEN 1 ELSE 0 END),0) FROM feedback WHERE memory_id=?1",
-        [memory_id.to_string()],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
+fn feedback_utilities(
+    connection: &Connection,
+    memory_ids: &[MemoryId],
+) -> Result<HashMap<MemoryId, f64>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = sql_placeholders(memory_ids.len());
+    let sql = format!(
+        "SELECT memory_id,sum(CASE WHEN signal IN ('helpful','used') THEN 1 ELSE 0 END),sum(CASE WHEN signal IN ('harmful','incorrect','outdated','dismissed') THEN 1 ELSE 0 END) FROM feedback WHERE memory_id IN ({placeholders}) GROUP BY memory_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(
+            params_from_iter(memory_ids.iter().map(ToString::to_string)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut utilities = HashMap::with_capacity(rows.len());
+    for (memory_id, positive, negative) in rows {
+        utilities.insert(
+            parse_memory_id(&memory_id)?,
+            feedback_score(positive, negative),
+        );
+    }
+    Ok(utilities)
+}
+
+fn feedback_score(positive: i64, negative: i64) -> f64 {
     let positive = positive.max(0) as f64;
     let negative = negative.max(0) as f64;
     let posterior = (positive + 1.0) / (positive + negative + 2.0);
-    Ok((posterior - 0.5) * 0.20)
+    (posterior - 0.5) * 0.20
 }
 
 fn artifact_verified(memory: &[ArtifactRef], current: &[ArtifactRef]) -> bool {
@@ -2582,11 +2818,29 @@ fn section_for(kind: MemoryKind) -> (u8, &'static str) {
 }
 
 fn estimate_tokens(text: &str) -> usize {
-    text.chars().count().div_ceil(3).max(1)
+    let characters = if text.is_ascii() {
+        text.len()
+    } else {
+        text.chars().count()
+    };
+    characters.div_ceil(3).max(1)
 }
 
 fn truncate_to_tokens(text: &str, tokens: usize) -> String {
     let max_chars = tokens.saturating_mul(3);
+    if text.is_ascii() {
+        if text.len() <= max_chars {
+            return text.to_owned();
+        }
+        let mut truncated = text[..max_chars.saturating_sub(1)].to_owned();
+        if let Some(boundary) = truncated.rfind(['.', '\n', ';'])
+            && boundary >= truncated.len() / 2
+        {
+            truncated.truncate(boundary + 1);
+        }
+        truncated.push('…');
+        return truncated;
+    }
     if text.chars().count() <= max_chars {
         return text.to_owned();
     }
@@ -2634,9 +2888,19 @@ fn render_context(query_id: QueryId, sections: &[ContextSection], warnings: &[St
 }
 
 fn escape_rendered_data(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+    if !text.bytes().any(|byte| matches!(byte, b'&' | b'<' | b'>')) {
+        return text.to_owned();
+    }
+    let mut escaped = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
 }
 
 fn latest_sequence(connection: &Connection) -> Result<i64> {
@@ -2816,6 +3080,7 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 mod tests {
     use super::*;
     use crate::{CheckpointAttempt, CheckpointDecision, FeedbackSignal, RememberRequest};
+    use std::{hint::black_box, time::Instant};
 
     fn engine() -> MemoryEngine {
         MemoryEngine::open_in_memory(EngineOptions::default()).unwrap()
@@ -2844,6 +3109,12 @@ mod tests {
             session_id: Some(session_id.into()),
             ..Scope::default()
         }
+    }
+
+    fn repo_workspace_scope(repo_id: &str, workspace_id: &str, session_id: &str) -> Scope {
+        let mut scope = repo_scope(repo_id, session_id);
+        scope.workspace_id = Some(workspace_id.to_owned());
+        scope
     }
 
     #[test]
@@ -2957,6 +3228,115 @@ mod tests {
     }
 
     #[test]
+    fn feedback_is_aggregated_in_one_semantically_equivalent_batch() {
+        let engine = engine();
+        let positive = engine
+            .remember(remember_request("Positive", "feedback batch"))
+            .unwrap()
+            .memory_ids[0];
+        let untouched = engine
+            .remember(remember_request("Untouched", "feedback batch"))
+            .unwrap()
+            .memory_ids[0];
+        for signal in [
+            FeedbackSignal::Helpful,
+            FeedbackSignal::Used,
+            FeedbackSignal::Incorrect,
+        ] {
+            engine
+                .feedback(FeedbackRequest {
+                    query_id: None,
+                    memory_id: positive,
+                    signal,
+                    note: None,
+                })
+                .unwrap();
+        }
+        let connection = engine.lock().unwrap();
+        let utilities = feedback_utilities(&connection, &[positive, untouched]).unwrap();
+        assert_eq!(
+            utilities[&positive].to_bits(),
+            feedback_score(2, 1).to_bits()
+        );
+        assert!(!utilities.contains_key(&untouched));
+        assert_eq!(feedback_score(0, 0).to_bits(), 0.0_f64.to_bits());
+    }
+
+    #[test]
+    fn batched_attachment_order_matches_point_load_with_full_ties() {
+        let engine = engine();
+        let event_id = engine
+            .observe(ObserveRequest {
+                content: "shared evidence event".into(),
+                ..ObserveRequest::default()
+            })
+            .unwrap()
+            .event_id;
+        let mut request = remember_request("Attachment order", "batch hydration");
+        request.artifacts = vec![
+            ArtifactRef {
+                repo_id: "repo".into(),
+                path: "src/lib.rs".into(),
+                symbol: Some("same_symbol".into()),
+                content_hash: Some("bbbb".into()),
+                git_oid: Some("bbbbbbb".into()),
+                ..ArtifactRef::default()
+            },
+            ArtifactRef {
+                repo_id: "repo".into(),
+                path: "src/lib.rs".into(),
+                symbol: Some("same_symbol".into()),
+                content_hash: Some("aaaa".into()),
+                git_oid: Some("aaaaaaa".into()),
+                ..ArtifactRef::default()
+            },
+        ];
+        request.evidence = vec![
+            EvidenceRef {
+                event_id,
+                span_start: Some(5),
+                span_end: Some(8),
+                relation: "supports".into(),
+            },
+            EvidenceRef {
+                event_id,
+                span_start: Some(1),
+                span_end: Some(4),
+                relation: "contradicts".into(),
+            },
+        ];
+        let first = engine.remember(request).unwrap().memory_ids[0];
+        let second = engine
+            .remember(remember_request("Second", "batch companion"))
+            .unwrap()
+            .memory_ids[0];
+        let connection = engine.lock().unwrap();
+        let point = load_memories(&connection, &[first]).unwrap();
+        let batch = load_memories(&connection, &[second, first]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&point[&first]).unwrap(),
+            serde_json::to_value(&batch[&first]).unwrap()
+        );
+        assert_eq!(
+            batch[&first]
+                .artifacts
+                .iter()
+                .map(|artifact| artifact.content_hash.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            ["aaaa", "bbbb"]
+        );
+        assert_eq!(
+            batch[&first]
+                .evidence
+                .iter()
+                .filter(|evidence| evidence.event_id == event_id)
+                .map(|evidence| evidence.relation.as_str())
+                .collect::<Vec<_>>(),
+            ["contradicts", "supports"]
+        );
+    }
+
+    #[test]
     fn retracted_memory_leaves_history_but_not_search() {
         let engine = engine();
         let id = engine
@@ -3047,6 +3427,110 @@ mod tests {
     }
 
     #[test]
+    fn legacy_idempotency_scopes_preserve_digest_and_snapshot_retry() {
+        let mut repository_scope = repo_scope("legacy-repo", "session");
+        repository_scope.workspace_id = None;
+        let workspace_scope = Scope {
+            workspace_id: Some("legacy-workspace".into()),
+            ..Scope::default()
+        };
+        let source = engine();
+        let mut requests = Vec::new();
+        let mut first_ids = Vec::new();
+        for (index, scope) in [repository_scope, workspace_scope].into_iter().enumerate() {
+            let caller_key = format!("legacy-retry-{index}");
+            let mut legacy_hasher = blake3::Hasher::new();
+            legacy_hasher.update(scope.key().as_bytes());
+            legacy_hasher.update(&[0]);
+            legacy_hasher.update(caller_key.as_bytes());
+            assert_eq!(
+                scoped_idempotency_key(&scope, Some(&caller_key)).unwrap(),
+                legacy_hasher.finalize().to_hex().to_string()
+            );
+
+            let mut request = remember_request(
+                &format!("Legacy retry {index}"),
+                "same operation after restore",
+            );
+            request.scope = scope;
+            request.idempotency_key = Some(caller_key);
+            first_ids.push(source.remember(request.clone()).unwrap().memory_ids);
+            requests.push(request);
+        }
+        let snapshot = source.export_jsonl().unwrap();
+
+        let mut restored = MemoryEngine::open_in_memory(EngineOptions::default()).unwrap();
+        restored.import_jsonl(&snapshot).unwrap();
+        for (request, expected_ids) in requests.into_iter().zip(first_ids) {
+            let retry = restored.remember(request).unwrap();
+            assert!(retry.deduplicated);
+            assert_eq!(retry.memory_ids, expected_ids);
+        }
+    }
+
+    #[test]
+    fn workspace_idempotency_encoding_is_unambiguous_for_embedded_nuls() {
+        let left = repo_workspace_scope("repo", "a\0", "session");
+        let right = repo_workspace_scope("repo", "a", "session");
+        assert_ne!(
+            scoped_idempotency_key(&left, Some("b")),
+            scoped_idempotency_key(&right, Some("\0b"))
+        );
+    }
+
+    #[test]
+    fn attachment_partition_encoding_is_unambiguous_for_embedded_nuls() {
+        let left = repo_workspace_scope("repo", "a\0entity\0x", "session");
+        let right = repo_workspace_scope("repo", "a", "session");
+        assert_ne!(
+            attachment_namespace(&left, b"entity", "y"),
+            attachment_namespace(&right, b"entity", "x\0entity\0y")
+        );
+    }
+
+    #[test]
+    fn memory_content_hash_has_unambiguous_field_boundaries() {
+        assert_ne!(
+            memory_content_hash("a\0", "b"),
+            memory_content_hash("a", "\0b")
+        );
+
+        let engine = engine();
+        let first = engine
+            .remember(remember_request("a\0", "b"))
+            .unwrap()
+            .memory_ids[0];
+        let second = engine
+            .remember(remember_request("a", "\0b"))
+            .unwrap()
+            .memory_ids[0];
+        let connection = engine.lock().unwrap();
+        let load_hash = |memory_id: MemoryId| {
+            connection
+                .query_row(
+                    "SELECT content_hash FROM memory_revisions WHERE memory_id=?1 AND revision=1",
+                    [memory_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+        };
+        assert_ne!(load_hash(first), load_hash(second));
+    }
+
+    #[test]
+    fn streaming_request_fingerprint_matches_canonical_json_bytes() {
+        let value = serde_json::json!({
+            "nested": [1, true, "unchanged"],
+            "scope": { "namespace": "bench" }
+        });
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert_eq!(
+            request_fingerprint(&value).unwrap(),
+            blake3::hash(&encoded).to_hex().to_string()
+        );
+    }
+
+    #[test]
     fn canonical_identity_revises_across_sessions() {
         let engine = engine();
         let mut first = remember_request("Policy", "first");
@@ -3063,10 +3547,42 @@ mod tests {
     }
 
     #[test]
+    fn workspace_partitions_canonical_identity_and_idempotency_within_a_repo() {
+        let engine = engine();
+        let scope_a = repo_workspace_scope("shared-repo", "workspace-a", "session-a");
+        let scope_b = repo_workspace_scope("shared-repo", "workspace-b", "session-b");
+
+        let mut canonical_a = remember_request("Policy", "workspace A policy");
+        canonical_a.scope = scope_a.clone();
+        canonical_a.canonical_key = Some("shared-policy-key".into());
+        let id_a = engine.remember(canonical_a).unwrap().memory_ids[0];
+
+        let mut canonical_b = remember_request("Policy", "workspace B policy");
+        canonical_b.scope = scope_b.clone();
+        canonical_b.canonical_key = Some("shared-policy-key".into());
+        let id_b = engine.remember(canonical_b).unwrap().memory_ids[0];
+        assert_ne!(id_a, id_b);
+        assert_eq!(engine.get(id_a).unwrap().body, "workspace A policy");
+        assert_eq!(engine.get(id_b).unwrap().body, "workspace B policy");
+
+        let mut retry_a = remember_request("Idempotent", "identical payload");
+        retry_a.scope = scope_a;
+        retry_a.idempotency_key = Some("same-caller-key".into());
+        let receipt_a = engine.remember(retry_a).unwrap();
+        let mut retry_b = remember_request("Idempotent", "identical payload");
+        retry_b.scope = scope_b;
+        retry_b.idempotency_key = Some("same-caller-key".into());
+        let receipt_b = engine.remember(retry_b).unwrap();
+        assert!(!receipt_a.deduplicated);
+        assert!(!receipt_b.deduplicated);
+        assert_ne!(receipt_a.memory_ids, receipt_b.memory_ids);
+    }
+
+    #[test]
     fn explicit_revisions_links_and_evidence_cannot_cross_scope() {
         let engine = engine();
-        let scope_a = repo_scope("repo-a", "one");
-        let scope_b = repo_scope("repo-b", "one");
+        let scope_a = repo_workspace_scope("shared-repo", "workspace-a", "one");
+        let scope_b = repo_workspace_scope("shared-repo", "workspace-b", "one");
         let evidence = engine
             .observe(ObserveRequest {
                 scope: scope_a.clone(),
@@ -3087,10 +3603,11 @@ mod tests {
         linked.scope = scope_b.clone();
         linked.links = vec![crate::LinkInput {
             target: memory_id,
-            relation: "relates_to".into(),
+            relation: "supersedes".into(),
             weight: 500,
         }];
         assert!(matches!(engine.remember(linked), Err(Error::Conflict(_))));
+        assert_eq!(engine.get(memory_id).unwrap().state, MemoryState::Active);
 
         let mut unsupported = remember_request("Evidence", "illegal evidence");
         unsupported.scope = scope_b;
@@ -3104,6 +3621,95 @@ mod tests {
             engine.remember(unsupported),
             Err(Error::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn attachment_metadata_is_immutable_and_partitioned_by_durable_scope() {
+        let engine = engine();
+        let scope_a = repo_workspace_scope("shared-repo", "workspace-a", "one");
+        let scope_b = repo_workspace_scope("shared-repo", "workspace-b", "two");
+
+        let mut first = remember_request("Workspace A", "attachment owner A");
+        first.scope = scope_a.clone();
+        first.entities = vec![EntityRef {
+            kind: "component".into(),
+            canonical: "shared-component".into(),
+            display: "A private display".into(),
+        }];
+        first.artifacts = vec![ArtifactRef {
+            repo_id: "shared-repo".into(),
+            path: "src/shared.ext".into(),
+            symbol: Some("shared_symbol".into()),
+            content_hash: Some("same-content".into()),
+            git_oid: Some("aaaaaaa".into()),
+            language: Some("Rust".into()),
+        }];
+        let id_a = engine.remember(first).unwrap().memory_ids[0];
+
+        let before = engine.get(id_a).unwrap();
+        assert_eq!(before.entities[0].display, "A private display");
+        assert_eq!(before.artifacts[0].language.as_deref(), Some("Rust"));
+
+        let mut second = remember_request("Workspace B", "attachment owner B");
+        second.scope = scope_b;
+        second.entities = vec![EntityRef {
+            kind: "component".into(),
+            canonical: "shared-component".into(),
+            display: "B private display".into(),
+        }];
+        second.artifacts = vec![ArtifactRef {
+            repo_id: "shared-repo".into(),
+            path: "src/shared.ext".into(),
+            symbol: Some("shared_symbol".into()),
+            content_hash: Some("same-content".into()),
+            git_oid: Some("aaaaaaa".into()),
+            language: Some("Zig".into()),
+        }];
+        let id_b = engine.remember(second).unwrap().memory_ids[0];
+
+        let mut same_scope_variant = remember_request("Workspace A variant", "same scope");
+        same_scope_variant.scope = scope_a;
+        same_scope_variant.entities = vec![EntityRef {
+            kind: "component".into(),
+            canonical: "shared-component".into(),
+            display: "A second display".into(),
+        }];
+        same_scope_variant.artifacts = vec![ArtifactRef {
+            repo_id: "shared-repo".into(),
+            path: "src/shared.ext".into(),
+            symbol: Some("shared_symbol".into()),
+            content_hash: Some("same-content".into()),
+            git_oid: Some("aaaaaaa".into()),
+            language: Some("C".into()),
+        }];
+        let variant_id = engine.remember(same_scope_variant).unwrap().memory_ids[0];
+
+        let after_a = engine.get(id_a).unwrap();
+        let after_b = engine.get(id_b).unwrap();
+        let variant = engine.get(variant_id).unwrap();
+        assert_eq!(after_a.entities[0].display, "A private display");
+        assert_eq!(after_a.artifacts[0].language.as_deref(), Some("Rust"));
+        assert_eq!(after_b.entities[0].display, "B private display");
+        assert_eq!(after_b.artifacts[0].language.as_deref(), Some("Zig"));
+        assert_eq!(variant.entities[0].display, "A second display");
+        assert_eq!(variant.artifacts[0].language.as_deref(), Some("C"));
+
+        let snapshot = engine.export_jsonl().unwrap();
+        let mut restored = MemoryEngine::open_in_memory(EngineOptions::default()).unwrap();
+        restored.import_jsonl(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::to_value(restored.get(id_a).unwrap()).unwrap(),
+            serde_json::to_value(after_a).unwrap()
+        );
+        assert_eq!(
+            snapshot.lines().skip(1).collect::<Vec<_>>(),
+            restored
+                .export_jsonl()
+                .unwrap()
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3314,11 +3920,160 @@ mod tests {
     }
 
     #[test]
+    fn fts_candidate_plan_drives_from_the_virtual_index() {
+        let engine = engine();
+        let connection = engine.lock().unwrap();
+        let mut statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {FTS_CANDIDATE_SQL}"))
+            .unwrap();
+        let details = statement
+            .query_map(
+                named_params! {
+                    ":namespace": "default",
+                    ":workspace": Option::<String>::None,
+                    ":repo": Option::<String>::None,
+                    ":query": "\"needle\"",
+                    ":include_superseded": false,
+                    ":all_kinds": true,
+                    ":kinds": "[]",
+                    ":as_of": to_ms(Utc::now()),
+                },
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .first()
+                .is_some_and(|detail| detail.contains("SCAN memory_fts VIRTUAL TABLE")),
+            "unexpected FTS plan: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("INTEGER PRIMARY KEY")),
+            "memory heads should be point-looked-up by FTS rowid: {details:?}"
+        );
+    }
+
+    #[test]
+    fn tied_recall_order_and_signals_are_repeatable() {
+        let engine = engine();
+        let scope = repo_scope("deterministic-repo", "writer");
+        for index in 0..180 {
+            let mut request = remember_request(
+                &format!("Tied procedure {index}"),
+                &format!("needle deterministic procedure payload {index}"),
+            );
+            request.kind = MemoryKind::Procedure;
+            request.scope.clone_from(&scope);
+            engine.remember(request).unwrap();
+        }
+        let as_of = Utc::now();
+        let recall = || {
+            engine
+                .recall(RecallRequest {
+                    // FTS OR semantics match `needle`; the full phrase is not
+                    // an exact substring, leaving a large tied BM25 channel.
+                    query: "needle absentterm".into(),
+                    scope: scope.clone(),
+                    as_of: Some(as_of),
+                    limit: Some(100),
+                    token_budget: Some(100_000),
+                    ..RecallRequest::default()
+                })
+                .unwrap()
+                .hits
+                .into_iter()
+                .map(|hit| (hit.memory.memory_id, hit.signals))
+                .collect::<Vec<_>>()
+        };
+        let expected = recall();
+        assert_eq!(expected.len(), 100);
+        for _ in 0..4 {
+            assert_eq!(recall(), expected);
+        }
+    }
+
+    #[test]
+    fn ineligible_heads_cannot_crowd_valid_requested_kind_out_of_channels() {
+        for scenario in ["retracted", "expired", "wrong_kind"] {
+            let engine = engine();
+            let mut target = remember_request("Eligible target", "eligibility-crowdout needle");
+            target.kind = MemoryKind::Fact;
+            let target_id = engine.remember(target).unwrap().memory_ids[0];
+            for index in 0..125 {
+                let mut ineligible = remember_request(
+                    &format!("Ineligible {scenario} {index}"),
+                    "eligibility-crowdout needle",
+                );
+                ineligible.kind = if scenario == "wrong_kind" {
+                    MemoryKind::Procedure
+                } else {
+                    MemoryKind::Fact
+                };
+                if scenario == "expired" {
+                    ineligible.valid_until = Some(Utc::now() - chrono::Duration::days(1));
+                }
+                let id = engine.remember(ineligible).unwrap().memory_ids[0];
+                if scenario == "retracted" {
+                    engine
+                        .retract(RetractRequest {
+                            memory_id: id,
+                            reason: "benchmark lifecycle exclusion".into(),
+                            idempotency_key: None,
+                        })
+                        .unwrap();
+                }
+            }
+            let pack = engine
+                .recall(RecallRequest {
+                    query: "eligibility-crowdout needle".into(),
+                    kinds: vec![MemoryKind::Fact],
+                    token_budget: Some(100_000),
+                    ..RecallRequest::default()
+                })
+                .unwrap();
+            assert!(
+                pack.hits
+                    .iter()
+                    .any(|hit| hit.memory.memory_id == target_id),
+                "eligible target was crowded out by {scenario} heads"
+            );
+            assert!(
+                pack.hits
+                    .iter()
+                    .all(|hit| hit.memory.kind == MemoryKind::Fact)
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_channel_prefers_recent_matches_before_its_limit() {
+        let engine = engine();
+        let mut newest = None;
+        for index in 0..45 {
+            let mut request = remember_request(&format!("Sparse {index}"), "unrelated body");
+            request.tags = vec!["symbol_key".into()];
+            newest = Some(engine.remember(request).unwrap().memory_ids[0]);
+        }
+        let request = RecallRequest {
+            query: "symbol_key".into(),
+            as_of: Some(Utc::now()),
+            ..RecallRequest::default()
+        };
+        let eligibility = CandidateEligibility::new(&request).unwrap();
+        let terms = identifier_terms(&request.query);
+        let connection = engine.lock().unwrap();
+        let mut candidates = HashMap::new();
+        collect_sparse(&connection, &request, &eligibility, &terms, &mut candidates).unwrap();
+        assert_eq!(candidates.len(), 40);
+        assert!(candidates.contains_key(&newest.unwrap()));
+    }
+
+    #[test]
     fn git_relation_resolution_is_cached_per_recall_key() {
-        let memory = repo_scope("repo", "old");
-        let mut current = repo_scope("repo", "new");
-        current.repository.as_mut().unwrap().head_oid =
-            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
         let mut cache = HashMap::new();
         let mut calls = 0;
         let mut resolver = |_root: &str, _stored: &str, _current: &str| {
@@ -3326,12 +4081,24 @@ mod tests {
             GitRelation::Ancestor { behind: 1 }
         };
         assert_eq!(
-            cached_git_relation(&memory, &current, &mut cache, &mut resolver),
-            Some(GitRelation::Ancestor { behind: 1 })
+            cached_git_relation(
+                "/work/repo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &mut cache,
+                &mut resolver
+            ),
+            GitRelation::Ancestor { behind: 1 }
         );
         assert_eq!(
-            cached_git_relation(&memory, &current, &mut cache, &mut resolver),
-            Some(GitRelation::Ancestor { behind: 1 })
+            cached_git_relation(
+                "/work/repo",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                &mut cache,
+                &mut resolver
+            ),
+            GitRelation::Ancestor { behind: 1 }
         );
         assert_eq!(calls, 1);
     }
@@ -3463,6 +4230,8 @@ mod tests {
         let memory_id = source.remember(first).unwrap().memory_ids[0];
         let mut second = remember_request("Round trip", "revision two searchable-needle");
         second.canonical_key = Some("round-trip".into());
+        second.importance = 0.49;
+        second.confidence = 0.91;
         source.remember(second).unwrap();
         source
             .feedback(FeedbackRequest {
@@ -3474,13 +4243,25 @@ mod tests {
             .unwrap();
         let snapshot = source.export_jsonl().unwrap();
         assert!(snapshot.contains("super_mem_export_end"));
+        let header: Value = serde_json::from_str(snapshot.lines().next().unwrap()).unwrap();
+        assert_eq!(header["schema_version"], SNAPSHOT_SCHEMA_VERSION);
+        assert_eq!(source.status().unwrap().schema_version, SCHEMA_VERSION);
 
         let mut restored = engine();
         let receipt = restored.import_jsonl(&snapshot).unwrap();
         assert_eq!(receipt.events_imported, 2);
         assert_eq!(receipt.memories_imported, 1);
         assert_eq!(receipt.feedback_imported, 1);
-        assert_eq!(restored.get(memory_id).unwrap().revision, 2);
+        let restored_memory = restored.get(memory_id).unwrap();
+        assert_eq!(restored_memory.revision, 2);
+        assert_eq!(restored_memory.importance.to_bits(), 0.49_f32.to_bits());
+        assert_eq!(restored_memory.confidence.to_bits(), 0.91_f32.to_bits());
+        let reexported = restored.export_jsonl().unwrap();
+        assert_eq!(
+            snapshot.lines().skip(1).collect::<Vec<_>>(),
+            reexported.lines().skip(1).collect::<Vec<_>>(),
+            "canonical rows and footer must survive a restore byte-for-byte"
+        );
         assert!(
             restored
                 .recall(RecallRequest {
@@ -3520,6 +4301,38 @@ mod tests {
             nonempty.import_jsonl(&snapshot),
             Err(Error::Conflict(_))
         ));
+    }
+
+    #[test]
+    fn v1_snapshot_accepts_legacy_duplicate_canonical_heads_losslessly() {
+        let source = engine();
+        let mut first = remember_request("Legacy duplicate A", "first explicit head");
+        first.memory_id = Some(MemoryId::new());
+        first.canonical_key = Some("legacy-duplicate".into());
+        let first_id = source.remember(first).unwrap().memory_ids[0];
+
+        let mut second = remember_request("Legacy duplicate B", "second explicit head");
+        second.memory_id = Some(MemoryId::new());
+        second.canonical_key = Some("legacy-duplicate".into());
+        let second_id = source.remember(second).unwrap().memory_ids[0];
+        assert_ne!(first_id, second_id);
+
+        let snapshot = source.export_jsonl().unwrap();
+        let header: Value = serde_json::from_str(snapshot.lines().next().unwrap()).unwrap();
+        assert_eq!(header["schema_version"], SNAPSHOT_SCHEMA_VERSION);
+
+        let mut restored = engine();
+        restored.import_jsonl(&snapshot).unwrap();
+        assert_eq!(restored.get(first_id).unwrap().body, "first explicit head");
+        assert_eq!(
+            restored.get(second_id).unwrap().body,
+            "second explicit head"
+        );
+        let reexported = restored.export_jsonl().unwrap();
+        assert_eq!(
+            snapshot.lines().skip(1).collect::<Vec<_>>(),
+            reexported.lines().skip(1).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -3594,5 +4407,275 @@ mod tests {
                 entry.path().display()
             );
         }
+    }
+
+    #[test]
+    #[ignore = "manual reproducible performance probe"]
+    fn performance_probe() {
+        const MEMORIES: usize = 800;
+        const RECALLS: usize = 120;
+        const WIDE_RECALLS: usize = 30;
+        const CONTEXT_COMPILES: usize = 2_000;
+        const CHECKPOINTS: usize = 30;
+        const GIT_DISCOVERIES: usize = 30;
+        const REDACTIONS: usize = 16;
+
+        let engine = engine();
+        let started = Instant::now();
+        for index in 0..MEMORIES {
+            let group = index % 20;
+            let mut request = remember_request(
+                &format!("Procedure {index} for group {group}"),
+                &format!(
+                    "needle group_{group} deterministic procedure body {index} with reusable evidence"
+                ),
+            );
+            request.kind = MemoryKind::Procedure;
+            request.tags = vec!["benchmark".into(), format!("group-{group}")];
+            request.entities = vec![EntityRef {
+                kind: "component".into(),
+                canonical: format!("component-{group}"),
+                display: format!("Component {group}"),
+            }];
+            request.artifacts = vec![ArtifactRef {
+                repo_id: "benchmark-repo".into(),
+                path: format!("src/group_{group}/file_{index}.rs"),
+                symbol: Some(format!("symbol_{index}")),
+                content_hash: Some(format!("{index:064x}")),
+                language: Some("rust".into()),
+                ..ArtifactRef::default()
+            }];
+            black_box(engine.remember(request).unwrap());
+        }
+        let remember = started.elapsed();
+
+        let profile_request = RecallRequest {
+            query: "needle group_3".into(),
+            limit: Some(12),
+            token_budget: Some(1_500),
+            as_of: Some(Utc::now()),
+            ..RecallRequest::default()
+        };
+        let profile_eligibility = CandidateEligibility::new(&profile_request).unwrap();
+        let profile_terms = identifier_terms(&profile_request.query);
+        let connection = engine.lock().unwrap();
+        let mut profile_candidates = HashMap::new();
+        let candidate_started = Instant::now();
+        let phase_started = Instant::now();
+        collect_exact(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let exact_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
+        collect_fts(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let fts_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
+        collect_sparse(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &profile_terms,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let sparse_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
+        collect_entities(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &profile_terms,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let entity_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
+        collect_error_fingerprint(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let error_elapsed = phase_started.elapsed();
+        let phase_started = Instant::now();
+        collect_recent(
+            &connection,
+            &profile_request,
+            &profile_eligibility,
+            &mut profile_candidates,
+        )
+        .unwrap();
+        let recent_elapsed = phase_started.elapsed();
+        prune_candidates(&mut profile_candidates, 256);
+        let candidate_elapsed = candidate_started.elapsed();
+        let profile_ids = profile_candidates.keys().copied().collect::<Vec<_>>();
+        let materialize_started = Instant::now();
+        black_box(load_memories(&connection, &profile_ids).unwrap());
+        let materialize_elapsed = materialize_started.elapsed();
+        let feedback_started = Instant::now();
+        black_box(feedback_utilities(&connection, &profile_ids).unwrap());
+        let feedback_elapsed = feedback_started.elapsed();
+        let mut plan_statement = connection
+            .prepare(&format!("EXPLAIN QUERY PLAN {FTS_CANDIDATE_SQL}"))
+            .unwrap();
+        let plan = plan_statement
+            .query_map(
+                named_params! {
+                    ":namespace": profile_request.scope.namespace,
+                    ":workspace": profile_request.scope.workspace_id,
+                    ":repo": profile_request.scope.repo_id(),
+                    ":query": safe_fts_query(&profile_request.query).unwrap(),
+                    ":include_superseded": profile_eligibility.include_superseded,
+                    ":all_kinds": profile_eligibility.all_kinds,
+                    ":kinds": profile_eligibility.kinds_json,
+                    ":as_of": profile_eligibility.as_of_ms,
+                },
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        drop(plan_statement);
+        drop(connection);
+
+        let started = Instant::now();
+        for index in 0..RECALLS {
+            black_box(
+                engine
+                    .recall(RecallRequest {
+                        query: format!("needle group_{}", index % 20),
+                        limit: Some(12),
+                        token_budget: Some(1_500),
+                        ..RecallRequest::default()
+                    })
+                    .unwrap(),
+            );
+        }
+        let recall = started.elapsed();
+
+        let started = Instant::now();
+        for index in 0..WIDE_RECALLS {
+            black_box(
+                engine
+                    .recall(RecallRequest {
+                        query: format!("needle group_{}", index % 20),
+                        limit: Some(100),
+                        token_budget: Some(100_000),
+                        ..RecallRequest::default()
+                    })
+                    .unwrap(),
+            );
+        }
+        let wide_recall = started.elapsed();
+
+        let template = engine
+            .recall(RecallRequest {
+                query: "needle group_3".into(),
+                limit: Some(12),
+                token_budget: Some(1_500),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        let started = Instant::now();
+        for _ in 0..CONTEXT_COMPILES {
+            black_box(compile_context(
+                QueryId::new(),
+                template.database_seq,
+                1_500,
+                template.hits.clone(),
+            ));
+        }
+        let context = started.elapsed();
+
+        let started = Instant::now();
+        for index in 0..CHECKPOINTS {
+            black_box(
+                engine
+                    .checkpoint(CheckpointRequest {
+                        goal: format!("Checkpoint benchmark {index}"),
+                        summary: "Preserve decisions, attempts, and open work".into(),
+                        decisions: vec![CheckpointDecision {
+                            summary: format!("Decision {index}"),
+                            rationale: Some("Deterministic benchmark rationale".into()),
+                            canonical_key: Some(format!("benchmark-decision-{index}")),
+                        }],
+                        attempts: vec![CheckpointAttempt {
+                            action: format!("Attempt {index}"),
+                            result: "Successful benchmark outcome".into(),
+                            succeeded: true,
+                            fingerprint: Some(format!("benchmark-{index}")),
+                        }],
+                        open_tasks: vec![format!("Follow-up {index}")],
+                        ..CheckpointRequest::default()
+                    })
+                    .unwrap(),
+            );
+        }
+        let checkpoint = started.elapsed();
+
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--initial-branch=main"])
+                .current_dir(directory.path())
+                .output()
+                .is_ok_and(|output| output.status.success())
+        );
+        let started = Instant::now();
+        for _ in 0..GIT_DISCOVERIES {
+            black_box(crate::discover_repository(directory.path()).unwrap());
+        }
+        let git = started.elapsed();
+
+        let redactor = Redactor::default();
+        let clean_text = "ordinary source text without credentials\n".repeat(26_000);
+        let started = Instant::now();
+        for _ in 0..REDACTIONS {
+            black_box(redactor.redact(&clean_text));
+        }
+        let redaction = started.elapsed();
+
+        println!(
+            "PERF memories={MEMORIES} remember_total_us={} remember_us_per={:.2} recalls={RECALLS} recall_total_us={} recall_us_per={:.2} wide_recalls={WIDE_RECALLS} wide_recall_total_us={} wide_recall_us_per={:.2} context_compiles={CONTEXT_COMPILES} context_total_us={} context_us_per={:.2} checkpoints={CHECKPOINTS} checkpoint_total_us={} checkpoint_us_per={:.2} git_discoveries={GIT_DISCOVERIES} git_total_us={} git_us_per={:.2} clean_redactions={REDACTIONS} redaction_total_us={} redaction_us_per={:.2}",
+            remember.as_micros(),
+            remember.as_secs_f64() * 1_000_000.0 / MEMORIES as f64,
+            recall.as_micros(),
+            recall.as_secs_f64() * 1_000_000.0 / RECALLS as f64,
+            wide_recall.as_micros(),
+            wide_recall.as_secs_f64() * 1_000_000.0 / WIDE_RECALLS as f64,
+            context.as_micros(),
+            context.as_secs_f64() * 1_000_000.0 / CONTEXT_COMPILES as f64,
+            checkpoint.as_micros(),
+            checkpoint.as_secs_f64() * 1_000_000.0 / CHECKPOINTS as f64,
+            git.as_micros(),
+            git.as_secs_f64() * 1_000_000.0 / GIT_DISCOVERIES as f64,
+            redaction.as_micros(),
+            redaction.as_secs_f64() * 1_000_000.0 / REDACTIONS as f64,
+        );
+        println!(
+            "PERF_PHASE candidates={} candidate_us={} exact_us={} fts_us={} sparse_us={} entity_us={} error_us={} recent_us={} materialize_us={} feedback_us={}",
+            profile_ids.len(),
+            candidate_elapsed.as_micros(),
+            exact_elapsed.as_micros(),
+            fts_elapsed.as_micros(),
+            sparse_elapsed.as_micros(),
+            entity_elapsed.as_micros(),
+            error_elapsed.as_micros(),
+            recent_elapsed.as_micros(),
+            materialize_elapsed.as_micros(),
+            feedback_elapsed.as_micros(),
+        );
+        println!("PERF_PLAN {plan:?}");
     }
 }

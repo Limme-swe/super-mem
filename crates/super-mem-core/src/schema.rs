@@ -6,7 +6,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::{Durability, EngineOptions, Error, Result};
 
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
@@ -77,6 +77,12 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
 
     if current == 0 {
         migrate_v1(connection)?;
+    }
+    if current < 2 {
+        migrate_v2(connection)?;
+    }
+    if current < 3 {
+        migrate_v3(connection)?;
     }
     Ok(())
 }
@@ -268,4 +274,194 @@ fn migrate_v1(connection: &Connection) -> Result<()> {
         )
         .map_err(|error| Error::Migration(error.to_string()))?;
     Ok(())
+}
+
+fn migrate_v2(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            BEGIN IMMEDIATE;
+            CREATE INDEX memory_entities_lookup
+                ON memory_entities(entity_id,memory_id,revision);
+            CREATE INDEX memory_artifacts_memory_lookup
+                ON memory_artifacts(artifact_id,memory_id,revision);
+            DROP TABLE memory_fts;
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                title,
+                body,
+                tags,
+                entities,
+                paths,
+                tokenize = 'unicode61 remove_diacritics 2',
+                content = '',
+                contentless_delete = 1
+            );
+            INSERT INTO memory_fts(rowid,title,body,tags,entities,paths)
+            SELECT h.docid,
+                   r.title,
+                   r.body,
+                   coalesce((SELECT group_concat(t.tag, ' ') FROM memory_tags t
+                             WHERE t.memory_id=h.memory_id AND t.revision=h.head_revision), ''),
+                   coalesce((SELECT group_concat(e.canonical || ' ' || e.display, ' ')
+                             FROM memory_entities me JOIN entities e ON e.entity_id=me.entity_id
+                             WHERE me.memory_id=h.memory_id AND me.revision=h.head_revision), ''),
+                   coalesce((SELECT group_concat(a.path || ' ' || a.symbol, ' ')
+                             FROM memory_artifacts ma JOIN artifacts a ON a.artifact_id=ma.artifact_id
+                             WHERE ma.memory_id=h.memory_id AND ma.revision=h.head_revision), '')
+            FROM memory_heads h
+            JOIN memory_revisions r
+              ON r.memory_id=h.memory_id AND r.revision=h.head_revision;
+            PRAGMA user_version=2;
+            COMMIT;
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
+fn migrate_v3(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            BEGIN IMMEDIATE;
+
+            -- Workspace is an independent isolation boundary even for two
+            -- workspaces sharing a repository/branch scope key. This remains
+            -- non-unique so every database/snapshot valid under v1/v2,
+            -- including explicit-ID canonical duplicates, still migrates.
+            DROP INDEX memory_heads_canonical;
+            CREATE INDEX memory_heads_canonical
+                ON memory_heads(
+                    namespace,
+                    scope_key,
+                    workspace_id,
+                    kind,
+                    canonical_key,
+                    updated_seq DESC,
+                    memory_id
+                )
+                WHERE canonical_key IS NOT NULL;
+
+            -- New attachment rows use an opaque, stable scope partition in
+            -- `namespace`; retrieval authorization comes from the joined
+            -- memory head. Keep legacy plain-namespace rows searchable too.
+            DROP INDEX entities_canonical;
+            CREATE INDEX entities_canonical
+                ON entities(canonical,entity_id);
+            CREATE INDEX entities_display_folded
+                ON entities(lower(display),entity_id);
+
+            PRAGMA user_version=3;
+            COMMIT;
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_migration_rebuilds_search_as_contentless_without_losing_matches() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&connection).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO events(seq,event_id,namespace,kind,scope_json,content,attributes_json,trust,occurred_at_ms,ingested_at_ms,content_hash,redaction_count)
+                VALUES(1,'018f0000-0000-7000-8000-000000000001','default','explicit_memory','{"namespace":"default"}','source','{}','explicit',1,1,'hash',0);
+                INSERT INTO memory_heads(docid,memory_id,namespace,scope_key,kind,state,head_revision,importance,confidence,trust,created_at_ms,updated_at_ms,created_seq,updated_seq)
+                VALUES(1,'018f0000-0000-7000-8000-000000000002','default','scope','procedure','active',1,0.5,0.5,'explicit',1,1,1,1);
+                INSERT INTO memory_revisions(memory_id,revision,title,body,attributes_json,scope_json,content_hash,recorded_at_ms,recorded_seq)
+                VALUES('018f0000-0000-7000-8000-000000000002',1,'Migration test','contentless searchable needle','{}','{"namespace":"default"}','hash',1,1);
+                INSERT INTO memory_fts(rowid,title,body,tags,entities,paths)
+                VALUES(1,'Migration test','contentless searchable needle','','','');
+                "#,
+            )
+            .unwrap();
+
+        initialize(&connection, &EngineOptions::default()).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'needle'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            connection
+                .query_row("SELECT body FROM memory_fts WHERE rowid=1", [], |row| {
+                    row.get::<_, Option<String>>(0)
+                })
+                .unwrap()
+                .is_none(),
+            "contentless FTS must not duplicate canonical memory bodies"
+        );
+        connection
+            .execute("DELETE FROM memory_fts WHERE rowid=1", [])
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths) VALUES(1,'Migration test','contentless searchable needle','','','')",
+                [],
+            )
+            .unwrap();
+
+        for (sql, expected_index) in [
+            (
+                "EXPLAIN QUERY PLAN SELECT me.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id WHERE e.canonical='component'",
+                "entities_canonical",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT me.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id WHERE lower(e.display)='component'",
+                "entities_display_folded",
+            ),
+            (
+                "EXPLAIN QUERY PLAN SELECT ma.memory_id FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id=a.artifact_id WHERE a.namespace='default' AND a.repo_id='repo' AND a.path='src/lib.rs'",
+                "memory_artifacts_memory_lookup",
+            ),
+        ] {
+            let mut statement = connection.prepare(sql).unwrap();
+            let plan = statement
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(
+                plan.iter().any(|detail| detail.contains(expected_index)),
+                "expected {expected_index} in query plan: {plan:?}"
+            );
+        }
+
+        let canonical_columns = connection
+            .prepare("PRAGMA index_info(memory_heads_canonical)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(2))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            canonical_columns,
+            [
+                "namespace",
+                "scope_key",
+                "workspace_id",
+                "kind",
+                "canonical_key",
+                "updated_seq",
+                "memory_id"
+            ]
+        );
+    }
 }

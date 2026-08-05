@@ -6,7 +6,7 @@ mod hook;
 mod mcp;
 mod scope;
 
-pub use app::run;
+pub use app::{run, run_sync};
 pub use cli::Cli;
 
 /// Runs the parsed command-line application.

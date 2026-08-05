@@ -31,12 +31,21 @@ pub fn discover_repository(path: impl AsRef<Path>) -> std::io::Result<Option<Rep
     });
     let common_dir = common_dir_path.as_deref().map(normalize_path);
 
-    let branch = git_text(&root_path, &["symbolic-ref", "--quiet", "--short", "HEAD"])?
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-    let head_oid = git_text(&root_path, &["rev-parse", "--verify", "HEAD"])?
-        .map(|value| value.trim().to_ascii_lowercase())
-        .filter(|value| valid_oid(value));
+    let status_output = git_stdout_bounded(
+        &root_path,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=normal",
+        ],
+        STATUS_LIMIT + STATUS_METADATA_ALLOWANCE,
+    )?;
+    let (branch, head_oid, status, status_truncated) = status_output.map_or_else(
+        || (None, None, Vec::new(), false),
+        |(output, truncated)| parse_status_metadata(&output, truncated),
+    );
     let remote_raw = git_text(&root_path, &["config", "--get", "remote.origin.url"])?
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
@@ -46,7 +55,7 @@ pub fn discover_repository(path: impl AsRef<Path>) -> std::io::Result<Option<Rep
     let remote = remote_raw
         .as_deref()
         .and_then(|value| normalize_discovered_remote(value, &root_path));
-    let dirty_hash = dirty_worktree_hash(&root_path)?;
+    let dirty_hash = dirty_worktree_hash(&root_path, &status, status_truncated);
     // Linked worktrees have distinct roots but share a common Git directory.
     // Prefer it for local repositories so they resolve to one repository ID.
     let repo_id = if local_remote {
@@ -239,7 +248,14 @@ fn git_path(path: &Path, arguments: &[&str]) -> std::io::Result<Option<PathBuf>>
         Err(error) => return Err(error),
     };
     let mut bytes = output.stdout;
-    while matches!(bytes.last(), Some(b'\n' | b'\r')) {
+    // `rev-parse` appends exactly one record terminator. On Unix, additional
+    // LF/CR bytes immediately before it are legal path bytes and must remain
+    // part of the repository identity.
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    #[cfg(not(unix))]
+    if bytes.last() == Some(&b'\r') {
         bytes.pop();
     }
     if bytes.is_empty() {
@@ -272,21 +288,53 @@ fn output_text(output: Output) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-fn dirty_worktree_hash(root: &Path) -> std::io::Result<Option<String>> {
-    let Some((status, status_truncated)) = git_stdout_bounded(
-        root,
-        &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
-        8 * 1_048_576,
-    )?
-    else {
-        return Ok(None);
-    };
-    if status.is_empty() {
-        return Ok(None);
+const STATUS_LIMIT: u64 = 8 * 1_048_576;
+const STATUS_METADATA_ALLOWANCE: u64 = 64 * 1_024;
+
+fn parse_status_metadata(
+    output: &[u8],
+    command_truncated: bool,
+) -> (Option<String>, Option<String>, Vec<u8>, bool) {
+    let mut branch = None;
+    let mut head_oid = None;
+    let mut status = Vec::with_capacity(output.len().min(64 * 1024));
+    for record in output.split_inclusive(|byte| *byte == 0) {
+        if let Some(value) = status_header(record, b"# branch.head ") {
+            branch = std::str::from_utf8(value)
+                .ok()
+                .map(str::to_owned)
+                .filter(|value| value != "(detached)" && !value.is_empty());
+        } else if let Some(value) = status_header(record, b"# branch.oid ") {
+            head_oid = std::str::from_utf8(value)
+                .ok()
+                .map(str::to_ascii_lowercase)
+                .filter(|value| valid_oid(value));
+        } else if record.starts_with(b"# branch.") {
+            // Upstream and ahead/behind headers are metadata, not worktree
+            // changes. Keeping them would falsely mark a clean tracking
+            // branch dirty.
+        } else {
+            status.extend_from_slice(record);
+        }
+    }
+    let status_truncated = command_truncated || status.len() as u64 > STATUS_LIMIT;
+    status.truncate(usize::try_from(STATUS_LIMIT).unwrap_or(usize::MAX));
+    (branch, head_oid, status, status_truncated)
+}
+
+fn status_header<'a>(record: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    record
+        .strip_prefix(prefix)
+        .map(|value| value.strip_suffix(&[0]).unwrap_or(value))
+}
+
+fn dirty_worktree_hash(root: &Path, status: &[u8], status_truncated: bool) -> Option<String> {
+    if status.is_empty() && !status_truncated {
+        return None;
     }
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&status);
+    hasher.update(status);
     if status_truncated {
         hasher.update(b"[status-truncated]");
     }
@@ -298,7 +346,7 @@ fn dirty_worktree_hash(root: &Path) -> std::io::Result<Option<String>> {
         8 * 1_048_576,
     );
     hash_untracked_files(root, &mut hasher);
-    Ok(Some(hasher.finalize().to_hex().to_string()))
+    Some(hasher.finalize().to_hex().to_string())
 }
 
 fn hash_git_stdout_bounded(
@@ -533,6 +581,86 @@ mod tests {
     }
 
     #[test]
+    fn porcelain_metadata_is_removed_without_changing_status_bytes() {
+        let input = b"# branch.oid AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\0# branch.head main\0# branch.upstream origin/main\0# branch.ab +0 -0\0? untracked file\0second-path-of-rename\0";
+        let (branch, head, status, truncated) = parse_status_metadata(input, false);
+        assert_eq!(branch.as_deref(), Some("main"));
+        assert_eq!(
+            head.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(status, b"? untracked file\0second-path-of-rename\0");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn discovery_gets_branch_head_and_dirty_state_from_one_status_snapshot() {
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert!(run_git(
+            directory.path(),
+            &["init", "--initial-branch=main"]
+        ));
+        assert!(run_git(
+            directory.path(),
+            &["config", "user.email", "tests@example.test"]
+        ));
+        assert!(run_git(
+            directory.path(),
+            &["config", "user.name", "Super Mem Tests"]
+        ));
+        std::fs::write(directory.path().join("tracked.txt"), "initial\n").unwrap();
+        assert!(run_git(directory.path(), &["add", "tracked.txt"]));
+        assert!(run_git(directory.path(), &["commit", "-m", "initial"]));
+        assert!(run_git(
+            directory.path(),
+            &["config", "branch.main.remote", "."]
+        ));
+        assert!(run_git(
+            directory.path(),
+            &["config", "branch.main.merge", "refs/heads/main"]
+        ));
+
+        let clean = discover_repository(directory.path()).unwrap().unwrap();
+        assert_eq!(clean.branch.as_deref(), Some("main"));
+        assert!(clean.head_oid.as_deref().is_some_and(valid_oid));
+        assert!(clean.dirty_hash.is_none());
+
+        std::fs::write(directory.path().join("tracked.txt"), "changed\n").unwrap();
+        let (legacy_status, legacy_truncated) = git_stdout_bounded(
+            directory.path(),
+            &["status", "--porcelain=v2", "-z", "--untracked-files=normal"],
+            STATUS_LIMIT,
+        )
+        .unwrap()
+        .unwrap();
+        let (metadata_status, metadata_truncated) = git_stdout_bounded(
+            directory.path(),
+            &[
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=normal",
+            ],
+            STATUS_LIMIT + STATUS_METADATA_ALLOWANCE,
+        )
+        .unwrap()
+        .unwrap();
+        let (_, _, filtered_status, filtered_truncated) =
+            parse_status_metadata(&metadata_status, metadata_truncated);
+        assert_eq!(filtered_status, legacy_status);
+        assert_eq!(filtered_truncated, legacy_truncated);
+
+        let dirty = discover_repository(directory.path()).unwrap().unwrap();
+        assert_eq!(dirty.branch, clean.branch);
+        assert_eq!(dirty.head_oid, clean.head_oid);
+        assert!(dirty.dirty_hash.is_some());
+    }
+
+    #[test]
     fn identical_relative_remotes_do_not_collide_across_local_repositories() {
         if Command::new("git").arg("--version").output().is_err() {
             return;
@@ -630,5 +758,30 @@ mod tests {
         let first_context = discover_repository(&first).unwrap().unwrap();
         let second_context = discover_repository(&second).unwrap().unwrap();
         assert_ne!(first_context.repo_id, second_context.repo_id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trailing_newline_is_preserved_in_git_root_identity() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        if Command::new("git").arg("--version").output().is_err() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let plain = directory.path().join("repo");
+        let newline = directory
+            .path()
+            .join(OsString::from_vec(b"repo\n".to_vec()));
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(&newline).unwrap();
+        assert!(run_git(&plain, &["init", "--initial-branch=main"]));
+        assert!(run_git(&newline, &["init", "--initial-branch=main"]));
+
+        let plain_context = discover_repository(&plain).unwrap().unwrap();
+        let newline_context = discover_repository(&newline).unwrap().unwrap();
+        assert_ne!(plain_context.repo_id, newline_context.repo_id);
+        assert_ne!(plain_context.root, newline_context.root);
+        assert_ne!(plain_context.common_dir, newline_context.common_dir);
     }
 }

@@ -64,17 +64,17 @@ impl Redactor {
         for (kind, pattern) in &self.patterns {
             let local_kind = kind.clone();
             let mut local_count = 0;
-            text = pattern
-                .replace_all(&text, |captures: &Captures<'_>| {
-                    local_count += 1;
-                    let _ = captures;
-                    format!("[REDACTED:{local_kind}]")
-                })
-                .into_owned();
-            if local_count > 0 {
-                count += local_count;
-                kinds.push(kind.clone());
+            let replacement = pattern.replace_all(&text, |captures: &Captures<'_>| {
+                local_count += 1;
+                let _ = captures;
+                format!("[REDACTED:{local_kind}]")
+            });
+            if local_count == 0 {
+                continue;
             }
+            text = replacement.into_owned();
+            count += local_count;
+            kinds.push(kind.clone());
         }
 
         Redaction { text, count, kinds }
@@ -208,6 +208,16 @@ mod tests {
             redactor.redact("password=abcdefgh").text,
             "[REDACTED:credential_assignment]"
         );
+    }
+
+    #[test]
+    fn large_secret_free_input_is_returned_exactly() {
+        let redactor = Redactor::default();
+        let source = "ordinary source text without credentials\n".repeat(26_000);
+        let result = redactor.redact(&source);
+        assert_eq!(result.count, 0);
+        assert!(result.kinds.is_empty());
+        assert_eq!(result.text, source);
     }
 
     #[test]

@@ -128,6 +128,17 @@ Required controls:
 - Treat nested repositories and worktrees as separate resolved identities.
 - Never recursively delete a path derived only from an event.
 
+The memory database can itself affect repository truth when placed inside a
+worktree. Before a scope-sensitive command, hook, or MCP operation opens
+SQLite, the Unix CLI therefore requires all four possible paths (the main file
+plus `-wal`, `-shm`, and `-journal`) to be untracked and Git-ignored, and
+rejects symbolic links, symlinked ancestors, multiple hard links, tracked
+aliases, and `..` components. Non-Unix v0.1 builds reject repository-local
+database paths on these operations. An external canonical database path is the
+portable default. The CLI's non-scoped `init`, `inspect`, `feedback`, `retract`,
+`status`, `doctor`, `export`, `import`, and `purge` commands intentionally do
+not apply this Git-applicability guard.
+
 ### Denial of service
 
 Large outputs, repeated hooks, malformed MCP payloads, and many parallel subagents can exhaust disk, memory, or CPU.

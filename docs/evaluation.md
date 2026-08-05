@@ -24,10 +24,23 @@ Test durable and derived-state invariants:
 - Event append is idempotent for a stable source ID.
 - A derived record cannot reference missing evidence.
 - Supersession preserves history while changing the current view.
-- On supported Unix hosts, full-store purge removes the database and SQLite sidecars; tests also verify that unrelated, symbolic-link, and multiply hard-linked paths are untouched. V0.1 refuses purge on Windows.
+- On supported Unix hosts, full-store purge removes the database plus its WAL and shared-memory sidecars; tests also verify that unrelated, symbolic-link, and multiply hard-linked paths are untouched. V0.1 refuses purge on Windows.
 - Scope filters apply before result ranking.
 - Projection rebuild produces the same logical results.
 - Crash recovery never acknowledges a missing event.
+- Repeated tied-score recall returns identical ordered IDs, signals, and score
+  bit patterns.
+- Export, empty-target import, and re-export preserve canonical rows, SQLite
+  REAL bit patterns, and the snapshot row-integrity footer.
+- Batched hydration preserves the full deterministic order of evidence,
+  artifacts, entities, and tags.
+- Scope-sensitive opening rejects a repository-local main file or sidecar that
+  could mutate tracked Git state through tracking, missing ignore rules, a
+  symbolic link or symlinked ancestor, or a hard-link alias.
+- Workspaces sharing a repository cannot coalesce canonical identities or
+  idempotency keys, revise each other's explicit IDs, attach each other's
+  evidence or memory links, or overwrite each other's entity displays or
+  artifact language metadata.
 
 ### 2. Retrieval fixtures
 
@@ -134,6 +147,11 @@ Report:
 - Single-client and concurrent-agent behavior.
 
 Do not mix optional model/embedding network latency into local database latency. Report synchronous and background work separately.
+
+The repository includes ignored, fixed-workload development probes for the
+core recall pipeline and the diversity selector. Run them in release mode and
+with one test thread; they are profiling aids rather than cross-machine product
+claims. See [benchmark notes](../benches/README.md) for exact commands.
 
 ## Reproducibility record
 

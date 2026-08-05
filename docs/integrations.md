@@ -40,6 +40,15 @@ current [MCP specification](https://modelcontextprotocol.io/specification/2026-0
 removed protocol-level sessions, so the optional session value is provenance,
 not an authentication or repository boundary.
 
+Use the default external database location, or pass an external canonical
+`--db` path. On Unix only, a repository-local database is accepted when all
+four possible paths (the main file plus `-wal`, `-shm`, and `-journal`) are
+untracked and Git-ignored, the path has no `..` or symbolic-link component,
+and existing files have a single hard link. Non-Unix v0.1 builds require the
+database outside the worktree. MCP validates this policy before opening SQLite
+or starting the stdio transport; command hooks fail open if validation rejects
+their configured store.
+
 ## Lifecycle contract
 
 Adapters translate native events into a stable envelope. The table below is the target lifecycle contract; the reference adapters currently implement the subsets called out in their sections.

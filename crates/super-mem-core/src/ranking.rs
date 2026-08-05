@@ -1,31 +1,53 @@
 //! Deterministic candidate fusion, scoring, and diversity selection.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use chrono::{DateTime, Utc};
 
 use crate::{Applicability, Memory, MemoryKind, MemoryState, RecallHit, RetrievalSignal};
 
 const RRF_K: f64 = 60.0;
+const SIGNAL_COUNT: usize = 7;
+const SIGNALS: [RetrievalSignal; SIGNAL_COUNT] = [
+    RetrievalSignal::Exact,
+    RetrievalSignal::ErrorFingerprint,
+    RetrievalSignal::ArtifactVerified,
+    RetrievalSignal::Lexical,
+    RetrievalSignal::Sparse,
+    RetrievalSignal::Entity,
+    RetrievalSignal::Recency,
+];
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct Candidate {
-    pub(crate) ranks: HashMap<RetrievalSignal, usize>,
+    ranks: [usize; SIGNAL_COUNT],
+}
+
+impl Default for Candidate {
+    fn default() -> Self {
+        Self {
+            ranks: [usize::MAX; SIGNAL_COUNT],
+        }
+    }
 }
 
 impl Candidate {
     pub(crate) fn record(&mut self, signal: RetrievalSignal, rank: usize) {
-        self.ranks
-            .entry(signal)
-            .and_modify(|existing| *existing = (*existing).min(rank))
-            .or_insert(rank);
+        let stored = &mut self.ranks[signal_order(signal) as usize];
+        *stored = (*stored).min(rank);
     }
 
     pub(crate) fn preliminary_score(&self) -> f64 {
-        self.ranks
-            .iter()
-            .map(|(signal, rank)| source_weight(*signal) / (RRF_K + *rank as f64))
+        self.ranked_signals()
+            .map(|(signal, rank)| source_weight(signal) / (RRF_K + rank as f64))
             .sum()
+    }
+
+    fn ranked_signals(&self) -> impl Iterator<Item = (RetrievalSignal, usize)> + '_ {
+        SIGNALS
+            .into_iter()
+            .zip(self.ranks.iter().copied())
+            .filter(|(_, rank)| *rank != usize::MAX)
     }
 }
 
@@ -77,12 +99,11 @@ pub(crate) fn score_candidate(
     feedback_utility: f64,
     now: DateTime<Utc>,
 ) -> RecallHit {
-    let mut signals = candidate.ranks.keys().copied().collect::<Vec<_>>();
-    signals.sort_by_key(|signal| signal_order(*signal));
-    let mut base = 0.0;
-    for (signal, rank) in &candidate.ranks {
-        base += source_weight(*signal) / (RRF_K + *rank as f64);
-    }
+    let signals = candidate
+        .ranked_signals()
+        .map(|(signal, _)| signal)
+        .collect::<Vec<_>>();
+    let base = candidate.preliminary_score();
 
     let quality = 0.75 + f64::from(memory.importance) * 0.15 + f64::from(memory.confidence) * 0.10;
     let state = match memory.state {
@@ -180,7 +201,12 @@ pub(crate) fn select_mmr(mut hits: Vec<RecallHit>, limit: usize, lambda: f64) ->
         hits.truncate(limit);
         return hits;
     }
-    hits.sort_by(|left, right| right.score.total_cmp(&left.score));
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+    });
     let max_score = hits.first().map_or(1.0, |hit| hit.score.max(f64::EPSILON));
     let token_sets = hits
         .iter()
@@ -189,22 +215,28 @@ pub(crate) fn select_mmr(mut hits: Vec<RecallHit>, limit: usize, lambda: f64) ->
 
     let mut selected_indices = Vec::with_capacity(limit.min(hits.len()));
     let mut available = (0..hits.len()).collect::<Vec<_>>();
+    let mut max_redundancy = vec![0.0_f64; hits.len()];
     while selected_indices.len() < limit && !available.is_empty() {
         let mut best_position = 0;
         let mut best_score = f64::NEG_INFINITY;
         for (position, &candidate_index) in available.iter().enumerate() {
-            let redundancy = selected_indices
-                .iter()
-                .map(|selected| jaccard(&token_sets[candidate_index], &token_sets[*selected]))
-                .fold(0.0, f64::max);
             let relevance = hits[candidate_index].score / max_score;
-            let mmr = lambda * relevance - (1.0 - lambda) * redundancy;
-            if mmr > best_score {
+            let mmr = lambda * relevance - (1.0 - lambda) * max_redundancy[candidate_index];
+            let best_id = hits[available[best_position]].memory.memory_id;
+            if mmr.total_cmp(&best_score).is_gt()
+                || (mmr.total_cmp(&best_score).is_eq()
+                    && hits[candidate_index].memory.memory_id < best_id)
+            {
                 best_score = mmr;
                 best_position = position;
             }
         }
-        selected_indices.push(available.swap_remove(best_position));
+        let selected = available.swap_remove(best_position);
+        selected_indices.push(selected);
+        for &candidate in &available {
+            max_redundancy[candidate] = max_redundancy[candidate]
+                .max(jaccard(&token_sets[candidate], &token_sets[selected]));
+        }
     }
 
     selected_indices
@@ -232,6 +264,101 @@ fn jaccard(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MemoryId, Scope, TrustLevel};
+    use std::collections::BTreeMap;
+    use std::{hint::black_box, time::Instant};
+    use uuid::Uuid;
+
+    fn reference_select_mmr(mut hits: Vec<RecallHit>, limit: usize, lambda: f64) -> Vec<RecallHit> {
+        if hits.len() <= 1 || limit == 0 {
+            hits.truncate(limit);
+            return hits;
+        }
+        hits.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+        });
+        let max_score = hits.first().map_or(1.0, |hit| hit.score.max(f64::EPSILON));
+        let token_sets = hits
+            .iter()
+            .map(|hit| token_set(&format!("{} {}", hit.memory.title, hit.memory.body)))
+            .collect::<Vec<_>>();
+        let mut selected_indices = Vec::with_capacity(limit.min(hits.len()));
+        let mut available = (0..hits.len()).collect::<Vec<_>>();
+        while selected_indices.len() < limit && !available.is_empty() {
+            let mut best_position = 0;
+            let mut best_score = f64::NEG_INFINITY;
+            for (position, &candidate_index) in available.iter().enumerate() {
+                let redundancy = selected_indices
+                    .iter()
+                    .map(|selected| jaccard(&token_sets[candidate_index], &token_sets[*selected]))
+                    .fold(0.0, f64::max);
+                let relevance = hits[candidate_index].score / max_score;
+                let mmr = lambda * relevance - (1.0 - lambda) * redundancy;
+                let best_id = hits[available[best_position]].memory.memory_id;
+                if mmr.total_cmp(&best_score).is_gt()
+                    || (mmr.total_cmp(&best_score).is_eq()
+                        && hits[candidate_index].memory.memory_id < best_id)
+                {
+                    best_score = mmr;
+                    best_position = position;
+                }
+            }
+            selected_indices.push(available.swap_remove(best_position));
+        }
+        selected_indices
+            .into_iter()
+            .map(|index| hits[index].clone())
+            .collect()
+    }
+
+    fn pseudo_random_hits(mut seed: u64, count: usize) -> Vec<RecallHit> {
+        let now = Utc::now();
+        (0..count)
+            .map(|index| {
+                let mut tokens = Vec::new();
+                for _ in 0..8 {
+                    seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    tokens.push(format!("token_{}", seed % 17));
+                }
+                let memory_id = MemoryId(Uuid::from_u128(index as u128 + 1));
+                RecallHit {
+                    memory: Memory {
+                        memory_id,
+                        revision: 1,
+                        kind: MemoryKind::Procedure,
+                        state: MemoryState::Active,
+                        scope: Scope::default(),
+                        canonical_key: None,
+                        title: format!("Procedure {}", index % 11),
+                        body: tokens.join(" "),
+                        importance: 0.5,
+                        confidence: 0.5,
+                        trust: TrustLevel::Agent,
+                        valid_from: None,
+                        valid_until: None,
+                        expires_at: None,
+                        created_at: now,
+                        updated_at: now,
+                        attributes: BTreeMap::new(),
+                        tags: Vec::new(),
+                        entities: Vec::new(),
+                        artifacts: Vec::new(),
+                        evidence: Vec::new(),
+                    },
+                    // Five score buckets deliberately exercise stable ties.
+                    score: (seed % 5) as f64 / 5.0,
+                    applicability: Applicability::Unversioned,
+                    signals: Vec::new(),
+                    reasons: Vec::new(),
+                }
+            })
+            .collect()
+    }
 
     #[test]
     fn fts_builder_never_passes_operators_through() {
@@ -248,5 +375,46 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(safe_fts_query(&query).unwrap().split(" OR ").count(), 24);
+    }
+
+    #[test]
+    fn incremental_mmr_exactly_matches_quadratic_reference() {
+        for seed in [1, 0xdead_beef, u64::MAX - 7] {
+            let hits = pseudo_random_hits(seed, 140);
+            for limit in [0, 1, 12, 100, 200] {
+                let expected = reference_select_mmr(hits.clone(), limit, 0.78)
+                    .into_iter()
+                    .map(|hit| (hit.memory.memory_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>();
+                let actual = select_mmr(hits.clone(), limit, 0.78)
+                    .into_iter()
+                    .map(|hit| (hit.memory.memory_id, hit.score.to_bits()))
+                    .collect::<Vec<_>>();
+                assert_eq!(actual, expected, "seed={seed} limit={limit}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual reproducible MMR performance probe"]
+    fn incremental_mmr_performance_probe() {
+        const ITERATIONS: usize = 10;
+        let hits = pseudo_random_hits(0x5eed, 256);
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(reference_select_mmr(hits.clone(), 100, 0.78));
+        }
+        let reference = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            black_box(select_mmr(hits.clone(), 100, 0.78));
+        }
+        let incremental = started.elapsed();
+        println!(
+            "MMR_PERF candidates=256 limit=100 iterations={ITERATIONS} reference_us_per={:.2} incremental_us_per={:.2} speedup={:.2}",
+            reference.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64,
+            incremental.as_secs_f64() * 1_000_000.0 / ITERATIONS as f64,
+            reference.as_secs_f64() / incremental.as_secs_f64(),
+        );
     }
 }

@@ -108,7 +108,7 @@ Conflict handling is domain-specific:
 
 The resolver may create a `supersedes` edge when authority, scope, and chronology make the relationship unambiguous. Otherwise it marks a contested set. The context assembler should surface an unresolved conflict rather than selecting a convenient winner.
 
-Retraction and supersession differ. Supersession preserves a newer current revision; retraction removes a memory from ordinary retrieval while retaining its audit history. On Unix, the current `purge --yes` CLI operation deletes the entire local database and its SQLite sidecars after refusing symbolic links and paths with multiple hard links. V0.1 refuses purge on Windows because stable Rust does not expose the hard-link count and the workspace forbids unsafe platform FFI. All processes using the database must be stopped first because SQLite cannot portably detect idle open handles. Item-level erasure is not part of the initial interface.
+Retraction and supersession differ. Supersession preserves a newer current revision; retraction removes a memory from ordinary retrieval while retaining its audit history. On Unix, the current `purge --yes` CLI operation deletes the database and its WAL and shared-memory sidecars after refusing symbolic links and paths with multiple hard links. V0.1 refuses purge on Windows because stable Rust does not expose the hard-link count and the workspace forbids unsafe platform FFI. All processes using the database must be stopped first because SQLite cannot portably detect idle open handles. Item-level erasure is not part of the initial interface.
 
 ## Capture pipeline
 
@@ -144,6 +144,13 @@ The initial implementation can combine:
 
 Semantic embeddings and graph expansion can be added as independent candidate channels. The lexical/exact path must remain functional without an embedding model or network access.
 
+All hard scope, lifecycle, kind, and temporal eligibility predicates are part
+of each candidate query before that channel's limit. A high-ranked ineligible
+row therefore cannot crowd out a lower-ranked eligible row. Candidate IDs are
+then hydrated in bounded batches together with tags, entities, artifacts,
+evidence, and feedback; the engine does not issue an attachment query per
+candidate.
+
 ### 3. Rank applicability and utility
 
 Ranking features may include:
@@ -174,9 +181,31 @@ Stale, divergent, and contested records also produce explicit warnings. Structur
 
 Derived entries should include at least one primary evidence reference. When confidence is low, prefer a compact source excerpt over an unsupported summary.
 
+Fusion and diversity selection are total-ordered by score and memory ID.
+Maximum redundancy is updated incrementally after each selected item, which is
+equivalent to recomputing the maximum against the complete selected set but
+reduces broad MMR selection from quadratic-in-output work to linear-in-output
+work per candidate.
+
 ## Persistence and consistency
 
-The initial workspace uses an embedded SQLite store. The implementation should use transactions for accepted events and active-view changes, and make secondary indexes versioned and repairable.
+The initial workspace uses an embedded SQLite store. Accepted events,
+revisions, evidence, links, and feedback are canonical SQLite rows. FTS is a
+contentless, rebuildable projection so searchable text is not duplicated in a
+second durable copy. Static hot-path statements use a bounded prepared cache,
+and related rows are loaded in batches. Database schema v2 adds the derived FTS
+layout and selective entity/artifact indexes. Schema v3 makes canonical-key
+lookup explicitly workspace-aware and adds entity lookup indexes for
+scope-partitioned attachment rows. New writes partition entity display and
+artifact language metadata by durable scope so one workspace cannot overwrite
+another's attachments. Neither migration changes canonical table columns, so
+the lossless snapshot schema remains version 1; derived indexes are never
+snapshot truth.
+
+Repository applicability first performs artifact and dirty-state checks that
+can decide exactness or staleness without Git history traversal. Commit-DAG
+queries are lazy and cached by repository root plus stored/current OID tuple
+for the duration of recall.
 
 Important invariants:
 
@@ -186,8 +215,22 @@ Important invariants:
 - Reprocessing the same stable harness event is idempotent.
 - Concurrent subagents cannot escape their resolved scope.
 - Schema migration is explicit and reversible through export or backup.
+- Export/import preserves canonical SQLite scalar values, including exact
+  floating-point bit patterns, and rebuilds derived FTS after an atomic restore.
 
 The database is not the security boundary. File permissions, identity resolution, encryption choices, host process permissions, and retrieval filtering all matter.
+
+The recommended database location is outside the Git worktree. Before a
+scope-sensitive command, hook, or MCP operation opens SQLite, Unix builds
+permit a repository-local database only when the main file and all three
+possible SQLite sidecars are untracked and ignored. Raw and resolved paths are
+both checked; symbolic-link components, multiple hard links, tracked aliases,
+and `..` components are rejected. Non-Unix v0.1 builds reject repository-local
+databases on these paths because the implementation cannot verify hard-link
+aliases safely. This prevents the store itself from changing the Git state used
+to classify its memories. The CLI's non-scoped `init`, `inspect`, `feedback`,
+`retract`, `status`, `doctor`, `export`, `import`, and `purge` commands
+intentionally do not apply this Git-applicability guard.
 
 ## MCP shape
 

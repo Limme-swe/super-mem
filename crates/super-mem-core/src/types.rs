@@ -170,7 +170,11 @@ impl Default for Scope {
 }
 
 impl Scope {
-    /// Returns a stable digest suitable for equality indexing.
+    /// Returns the legacy stable repository/branch or workspace digest.
+    ///
+    /// For repository scopes, callers must also compare `workspace_id`: it is
+    /// an independent isolation boundary kept outside this digest so existing
+    /// database and snapshot identities remain compatible.
     pub(crate) fn key(&self) -> String {
         // Session, paths, remotes, commit IDs, and dirty-worktree hashes are
         // provenance/freshness metadata rather than durable identity.

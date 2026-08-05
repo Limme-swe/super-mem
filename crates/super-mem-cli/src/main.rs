@@ -2,8 +2,7 @@
 
 use clap::Parser;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let cli = super_mem::Cli::parse();
-    super_mem::run(cli).await
+    super_mem::run_sync(cli)
 }

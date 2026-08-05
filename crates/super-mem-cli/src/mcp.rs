@@ -2,7 +2,7 @@
 
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use anyhow::{Context, bail};
@@ -24,7 +24,10 @@ use super_mem_core::{
 };
 
 use crate::{
-    app::{context_envelope, parse_memory_id, parse_query_id, title_from_body},
+    app::{
+        context_envelope, parse_memory_id, parse_query_id, title_from_body,
+        validate_database_for_scope,
+    },
     cli::ScopeArgs,
     scope::build_scope,
 };
@@ -39,16 +42,16 @@ pub const TOOL_NAMES: [&str; 4] = [
 
 #[derive(Clone)]
 pub struct MemoryServer {
-    engine: Arc<Mutex<MemoryEngine>>,
-    policy: McpPolicy,
+    engine: Arc<MemoryEngine>,
+    policy: Arc<McpPolicy>,
     tool_router: ToolRouter<Self>,
 }
 
 impl MemoryServer {
     fn new(engine: MemoryEngine, policy: McpPolicy) -> Self {
         Self {
-            engine: Arc::new(Mutex::new(engine)),
-            policy,
+            engine: Arc::new(engine),
+            policy: Arc::new(policy),
             tool_router: Self::tool_router(),
         }
     }
@@ -58,15 +61,18 @@ impl MemoryServer {
         self.tool_router.list_all()
     }
 
-    fn with_engine<T>(
+    async fn run_blocking<T>(
         &self,
-        operation: impl FnOnce(&MemoryEngine) -> super_mem_core::Result<T>,
-    ) -> Result<T, String> {
-        let engine = self
-            .engine
-            .lock()
-            .map_err(|_| "memory engine lock was poisoned".to_owned())?;
-        operation(&engine).map_err(|error| error.to_string())
+        operation: impl FnOnce(Arc<MemoryEngine>, Arc<McpPolicy>) -> Result<T, String> + Send + 'static,
+    ) -> Result<T, String>
+    where
+        T: Send + 'static,
+    {
+        let engine = Arc::clone(&self.engine);
+        let policy = self.policy.clone();
+        tokio::task::spawn_blocking(move || operation(engine, policy))
+            .await
+            .map_err(|error| format!("memory worker failed: {error}"))?
     }
 }
 
@@ -82,15 +88,21 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_context(
+    async fn memory_context(
         &self,
         Parameters(arguments): Parameters<MemoryContextArgs>,
     ) -> CallToolResult {
         if arguments.query.trim().is_empty() {
             return tool_error("query must not be empty");
         }
-        let scope = self.policy.current_scope(arguments.session_id.clone());
-        let result = self.with_engine(|engine| engine.recall(arguments.into_recall_request(scope)));
+        let result = self
+            .run_blocking(move |engine, policy| {
+                let scope = policy.current_scope(arguments.session_id.clone());
+                engine
+                    .recall(arguments.into_recall_request(scope))
+                    .map_err(|error| error.to_string())
+            })
+            .await;
         match result {
             Ok(pack) => tool_text(context_envelope(&pack.rendered)),
             Err(error) => tool_error(error),
@@ -107,70 +119,74 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_record(&self, Parameters(arguments): Parameters<MemoryRecordArgs>) -> CallToolResult {
+    async fn memory_record(
+        &self,
+        Parameters(arguments): Parameters<MemoryRecordArgs>,
+    ) -> CallToolResult {
         if arguments.content.trim().is_empty() {
             return tool_error("content must not be empty");
         }
-        let scope = self.policy.current_scope(arguments.session_id.clone());
-        let result = match arguments.mode {
-            RecordMode::Record => self
-                .with_engine(|engine| {
-                    engine.remember(RememberRequest {
-                        idempotency_key: arguments.idempotency_key.clone(),
-                        kind: arguments.kind.into(),
-                        scope,
-                        canonical_key: arguments.canonical_key.clone(),
-                        title: arguments
-                            .title
-                            .clone()
-                            .unwrap_or_else(|| title_from_body(&arguments.content)),
-                        body: arguments.content.clone(),
-                        importance: arguments.importance.unwrap_or(0.5),
-                        confidence: arguments.confidence.unwrap_or(0.7),
-                        trust: TrustLevel::Agent,
-                        tags: arguments.tags.clone(),
-                        ..RememberRequest::default()
-                    })
-                })
-                .and_then(to_json),
-            RecordMode::Checkpoint => self
-                .with_engine(|engine| {
-                    engine.checkpoint(CheckpointRequest {
-                        idempotency_key: arguments.idempotency_key.clone(),
-                        scope,
-                        goal: arguments
-                            .goal
-                            .clone()
-                            .unwrap_or_else(|| "coding task".into()),
-                        summary: arguments.content.clone(),
-                        outcome: arguments.outcome.into(),
-                        open_tasks: arguments.open_tasks.clone(),
-                        verification: arguments.verification.clone(),
-                        decisions: arguments.decisions.clone(),
-                        attempts: arguments.attempts.clone(),
-                        trust: TrustLevel::Agent,
-                        tags: arguments.tags.clone(),
-                        ..CheckpointRequest::default()
-                    })
-                })
-                .and_then(to_json),
-            RecordMode::Observation => self
-                .with_engine(|engine| {
-                    engine.observe(ObserveRequest {
-                        idempotency_key: arguments.idempotency_key.clone(),
-                        kind: arguments.event_kind.into(),
-                        scope,
-                        content: arguments.content.clone(),
-                        attributes: std::collections::BTreeMap::from([(
-                            "source".into(),
-                            json!("mcp"),
-                        )]),
-                        trust: TrustLevel::Agent,
-                        ..ObserveRequest::default()
-                    })
-                })
-                .and_then(to_json),
-        };
+        let result = self
+            .run_blocking(move |engine, policy| {
+                let scope = policy.current_scope(arguments.session_id.clone());
+                match arguments.mode {
+                    RecordMode::Record => engine
+                        .remember(RememberRequest {
+                            idempotency_key: arguments.idempotency_key.clone(),
+                            kind: arguments.kind.into(),
+                            scope,
+                            canonical_key: arguments.canonical_key.clone(),
+                            title: arguments
+                                .title
+                                .clone()
+                                .unwrap_or_else(|| title_from_body(&arguments.content)),
+                            body: arguments.content.clone(),
+                            importance: arguments.importance.unwrap_or(0.5),
+                            confidence: arguments.confidence.unwrap_or(0.7),
+                            trust: TrustLevel::Agent,
+                            tags: arguments.tags.clone(),
+                            ..RememberRequest::default()
+                        })
+                        .map_err(|error| error.to_string())
+                        .and_then(to_json),
+                    RecordMode::Checkpoint => engine
+                        .checkpoint(CheckpointRequest {
+                            idempotency_key: arguments.idempotency_key.clone(),
+                            scope,
+                            goal: arguments
+                                .goal
+                                .clone()
+                                .unwrap_or_else(|| "coding task".into()),
+                            summary: arguments.content.clone(),
+                            outcome: arguments.outcome.into(),
+                            open_tasks: arguments.open_tasks.clone(),
+                            verification: arguments.verification.clone(),
+                            decisions: arguments.decisions.clone(),
+                            attempts: arguments.attempts.clone(),
+                            trust: TrustLevel::Agent,
+                            tags: arguments.tags.clone(),
+                            ..CheckpointRequest::default()
+                        })
+                        .map_err(|error| error.to_string())
+                        .and_then(to_json),
+                    RecordMode::Observation => engine
+                        .observe(ObserveRequest {
+                            idempotency_key: arguments.idempotency_key.clone(),
+                            kind: arguments.event_kind.into(),
+                            scope,
+                            content: arguments.content.clone(),
+                            attributes: std::collections::BTreeMap::from([(
+                                "source".into(),
+                                json!("mcp"),
+                            )]),
+                            trust: TrustLevel::Agent,
+                            ..ObserveRequest::default()
+                        })
+                        .map_err(|error| error.to_string())
+                        .and_then(to_json),
+                }
+            })
+            .await;
         match result {
             Ok(value) => tool_text(value),
             Err(error) => tool_error(error),
@@ -187,11 +203,10 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_feedback(
+    async fn memory_feedback(
         &self,
         Parameters(arguments): Parameters<MemoryFeedbackArgs>,
     ) -> CallToolResult {
-        let requested_scope = self.policy.current_scope(arguments.session_id.clone());
         let memory_id = match parse_memory_id(&arguments.memory_id) {
             Ok(value) => value,
             Err(error) => return tool_error(error.to_string()),
@@ -205,20 +220,22 @@ impl MemoryServer {
             Ok(value) => value,
             Err(error) => return tool_error(error.to_string()),
         };
-        if let Err(error) = self
-            .with_engine(|engine| engine.get(memory_id))
-            .and_then(|memory| ensure_memory_in_scope(&memory, &requested_scope))
-        {
-            return tool_error(error);
-        }
-        match self.with_engine(|engine| {
-            engine.feedback(FeedbackRequest {
-                query_id,
-                memory_id,
-                signal: arguments.signal.into(),
-                note: arguments.note,
+        let result = self
+            .run_blocking(move |engine, policy| {
+                let requested_scope = policy.current_scope(arguments.session_id);
+                let memory = engine.get(memory_id).map_err(|error| error.to_string())?;
+                ensure_memory_in_scope(&memory, &requested_scope)?;
+                engine
+                    .feedback(FeedbackRequest {
+                        query_id,
+                        memory_id,
+                        signal: arguments.signal.into(),
+                        note: arguments.note,
+                    })
+                    .map_err(|error| error.to_string())
             })
-        }) {
+            .await;
+        match result {
             Ok(()) => tool_text("{\"recorded\":true}"),
             Err(error) => tool_error(error),
         }
@@ -234,50 +251,49 @@ impl MemoryServer {
             open_world_hint = false
         )
     )]
-    fn memory_manage(&self, Parameters(arguments): Parameters<MemoryManageArgs>) -> CallToolResult {
-        let requested_scope = self.policy.current_scope(arguments.session_id.clone());
-        let result = match arguments.action {
-            ManageAction::Inspect => {
-                let Some(value) = arguments.memory_id.as_deref() else {
-                    return tool_error("memory_id is required for inspect");
-                };
-                let memory_id = match parse_memory_id(value) {
-                    Ok(value) => value,
-                    Err(error) => return tool_error(error.to_string()),
-                };
-                self.with_engine(|engine| engine.get(memory_id))
-                    .and_then(|memory| {
+    async fn memory_manage(
+        &self,
+        Parameters(arguments): Parameters<MemoryManageArgs>,
+    ) -> CallToolResult {
+        let result = self
+            .run_blocking(move |engine, policy| {
+                let requested_scope = policy.current_scope(arguments.session_id);
+                match arguments.action {
+                    ManageAction::Inspect => {
+                        let Some(value) = arguments.memory_id.as_deref() else {
+                            return Err("memory_id is required for inspect".into());
+                        };
+                        let memory_id =
+                            parse_memory_id(value).map_err(|error| error.to_string())?;
+                        let memory = engine.get(memory_id).map_err(|error| error.to_string())?;
                         ensure_memory_in_scope(&memory, &requested_scope)?;
                         to_json(memory)
-                    })
-            }
-            ManageAction::Retract => {
-                let Some(value) = arguments.memory_id.as_deref() else {
-                    return tool_error("memory_id is required for retract");
-                };
-                let memory_id = match parse_memory_id(value) {
-                    Ok(value) => value,
-                    Err(error) => return tool_error(error.to_string()),
-                };
-                let Some(reason) = arguments.reason.filter(|value| !value.trim().is_empty()) else {
-                    return tool_error("reason is required for retract");
-                };
-                if let Err(error) = self
-                    .with_engine(|engine| engine.get(memory_id))
-                    .and_then(|memory| ensure_memory_in_scope(&memory, &requested_scope))
-                {
-                    return tool_error(error);
+                    }
+                    ManageAction::Retract => {
+                        let Some(value) = arguments.memory_id.as_deref() else {
+                            return Err("memory_id is required for retract".into());
+                        };
+                        let memory_id =
+                            parse_memory_id(value).map_err(|error| error.to_string())?;
+                        let Some(reason) =
+                            arguments.reason.filter(|value| !value.trim().is_empty())
+                        else {
+                            return Err("reason is required for retract".into());
+                        };
+                        let memory = engine.get(memory_id).map_err(|error| error.to_string())?;
+                        ensure_memory_in_scope(&memory, &requested_scope)?;
+                        engine
+                            .retract(RetractRequest {
+                                memory_id,
+                                reason,
+                                idempotency_key: arguments.idempotency_key,
+                            })
+                            .map_err(|error| error.to_string())
+                            .and_then(to_json)
+                    }
                 }
-                self.with_engine(|engine| {
-                    engine.retract(RetractRequest {
-                        memory_id,
-                        reason,
-                        idempotency_key: arguments.idempotency_key,
-                    })
-                })
-                .and_then(to_json)
-            }
-        };
+            })
+            .await;
         match result {
             Ok(value) => tool_text(value),
             Err(error) => tool_error(error),
@@ -301,6 +317,7 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     // Never install a stdout tracing writer: stdio is the MCP transport.
     let policy = McpPolicy::new(root, namespace, workspace_id)?;
+    validate_database_for_scope(database, &policy.root)?;
     let engine = crate::app::open_engine(database)?;
     let service = MemoryServer::new(engine, policy).serve(stdio()).await?;
     service.waiting().await?;
@@ -776,8 +793,8 @@ mod tests {
         assert!(ensure_memory_in_scope(&memory, &other_workspace).is_err());
     }
 
-    #[test]
-    fn pinned_policy_rejects_cross_repository_argument_bypass() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn pinned_policy_rejects_cross_repository_argument_bypass() {
         let engine = MemoryEngine::open_in_memory(EngineOptions::default()).unwrap();
         let memory_id = engine
             .remember(RememberRequest {
@@ -795,13 +812,15 @@ mod tests {
             .unwrap()
             .memory_ids[0];
         let server = MemoryServer::new(engine, policy());
-        let result = server.memory_manage(Parameters(MemoryManageArgs {
-            action: ManageAction::Inspect,
-            memory_id: Some(memory_id.to_string()),
-            reason: None,
-            idempotency_key: None,
-            session_id: None,
-        }));
+        let result = server
+            .memory_manage(Parameters(MemoryManageArgs {
+                action: ManageAction::Inspect,
+                memory_id: Some(memory_id.to_string()),
+                reason: None,
+                idempotency_key: None,
+                session_id: None,
+            }))
+            .await;
         assert_eq!(result.is_error, Some(true));
 
         let spoof = json!({
@@ -810,6 +829,67 @@ mod tests {
             "repo_id": "attacker-controlled-other-repo"
         });
         assert!(serde_json::from_value::<MemoryManageArgs>(spoof).is_err());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_record_and_context_preserve_the_tool_result() {
+        let server = MemoryServer::new(
+            MemoryEngine::open_in_memory(EngineOptions::default()).unwrap(),
+            policy(),
+        );
+        let recorded = server
+            .memory_record(Parameters(MemoryRecordArgs {
+                content: "The async MCP sentinel is silver-lantern.".into(),
+                ..MemoryRecordArgs::default()
+            }))
+            .await;
+        assert_ne!(recorded.is_error, Some(true));
+
+        let recalled = server
+            .memory_context(Parameters(MemoryContextArgs {
+                query: "async MCP sentinel".into(),
+                limit: None,
+                token_budget: None,
+                include_stale: false,
+                include_superseded: false,
+                error_fingerprint: None,
+                entities: Vec::new(),
+                session_id: None,
+            }))
+            .await;
+        assert_ne!(recalled.is_error, Some(true));
+        let result = serde_json::to_string(&recalled).unwrap();
+        assert!(result.contains("silver-lantern"));
+        assert_eq!(result.matches("<super-mem-context>").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_memory_work_yields_the_transport_runtime() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = MemoryServer::new(
+            MemoryEngine::open_in_memory(EngineOptions::default()).unwrap(),
+            policy(),
+        );
+        let worker = tokio::spawn(async move {
+            server
+                .run_blocking(|_, _| {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    Ok(())
+                })
+                .await
+        });
+        let quick_task_ran = Arc::new(AtomicBool::new(false));
+        let quick_task_result = Arc::clone(&quick_task_ran);
+        tokio::spawn(async move {
+            quick_task_result.store(true, Ordering::SeqCst);
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            quick_task_ran.load(Ordering::SeqCst),
+            "blocking memory work stalled the MCP transport runtime"
+        );
+        worker.await.unwrap().unwrap();
     }
 
     fn schema_has_enum_value(value: &serde_json::Value, expected: &str) -> bool {

@@ -1,9 +1,11 @@
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::{
+    ffi::OsString,
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
+    process::{Command as ProcessCommand, Stdio},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -14,7 +16,7 @@ use super_mem_core::is_super_mem_database;
 use super_mem_core::{
     CheckpointOutcome, CheckpointRequest, EngineOptions, EventKind, FeedbackRequest,
     FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest, QueryId, RecallRequest,
-    RememberRequest, RetractRequest, TrustLevel, discover_repository,
+    RememberRequest, RetractRequest, Scope, TrustLevel, discover_repository,
 };
 use uuid::Uuid;
 
@@ -27,14 +29,15 @@ use crate::{
     scope::build_scope,
 };
 
-/// Runs one parsed Super Mem command.
+/// Runs one parsed Super Mem command without constructing an async runtime for
+/// one-shot CLI and hook operations.
 ///
 /// # Errors
 ///
 /// Returns an error when command input is invalid or the requested database,
 /// filesystem, hook, or MCP operation fails.
 #[allow(clippy::too_many_lines)]
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
     let database = match resolve_database(cli.db.as_deref()) {
         Ok(database) => database,
         Err(error) if matches!(&cli.command, Command::Hook(_)) => {
@@ -59,7 +62,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Command::Remember(arguments) => {
-            let engine = open_engine(&database)?;
             let body = if arguments.body_stdin {
                 read_stdin()?
             } else {
@@ -70,10 +72,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 bail!("memory body must not be empty");
             }
             let title = arguments.title.unwrap_or_else(|| title_from_body(&body));
+            let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
             let receipt = engine.remember(RememberRequest {
                 idempotency_key: arguments.idempotency_key,
                 kind: memory_kind(arguments.kind),
-                scope: build_scope(&arguments.scope),
+                scope,
                 canonical_key: arguments.canonical_key,
                 title,
                 body,
@@ -90,7 +93,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Command::Observe(arguments) => {
-            let engine = open_engine(&database)?;
             let content = if arguments.content_stdin {
                 read_stdin()?
             } else {
@@ -106,17 +108,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             }
             attributes.insert("adapter_kind".into(), json!(observe_name(arguments.kind)));
             let idempotency_key = arguments.idempotency_key.or_else(|| {
-                arguments.event_id.as_ref().map(|event| {
-                    format!(
-                        "{}:{event}",
-                        arguments.scope.harness.as_deref().unwrap_or("cli")
+                arguments.event_id.as_deref().map(|event_id| {
+                    observe_event_idempotency_key(
+                        &arguments.scope,
+                        arguments.kind,
+                        event_id,
+                        &content,
                     )
                 })
             });
+            let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
             let receipt = engine.observe(ObserveRequest {
                 idempotency_key,
                 kind: event_kind(arguments.kind),
-                scope: build_scope(&arguments.scope),
+                scope,
                 content,
                 attributes,
                 trust: arguments.trust.map_or(role_trust, trust),
@@ -129,15 +134,15 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Command::Checkpoint(arguments) => {
-            let engine = open_engine(&database)?;
             let summary = if arguments.summary_stdin {
                 read_stdin()?
             } else {
                 arguments.summary.unwrap_or_default()
             };
+            let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
             let receipt = engine.checkpoint(CheckpointRequest {
                 idempotency_key: arguments.idempotency_key,
-                scope: build_scope(&arguments.scope),
+                scope,
                 goal: arguments.goal,
                 summary,
                 outcome: outcome(arguments.outcome),
@@ -154,7 +159,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             )?;
         }
         Command::Recall(arguments) => {
-            let engine = open_engine(&database)?;
             let query = if arguments.query_stdin {
                 read_stdin()?
             } else {
@@ -165,22 +169,18 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             } else {
                 query
             };
-            let scope = build_scope(&arguments.scope);
+            let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
             if arguments.observe_prompt {
-                let digest = blake3::hash(query.as_bytes()).to_hex();
-                let source_key = arguments.event_id.map_or_else(
-                    || digest.to_string(),
-                    |event_id| format!("{event_id}:{digest}"),
-                );
                 let harness = arguments.scope.harness.as_deref().unwrap_or("cli");
-                let session = arguments.scope.session.as_deref().unwrap_or("unknown");
                 let attributes = std::collections::BTreeMap::from([
                     ("adapter_kind".into(), json!("user_prompt")),
                     ("harness".into(), json!(harness)),
                 ]);
                 engine.observe(ObserveRequest {
-                    idempotency_key: Some(format!(
-                        "prompt-recall:{harness}:{session}:{source_key}"
+                    idempotency_key: Some(prompt_recall_idempotency_key(
+                        &arguments.scope,
+                        arguments.event_id.as_deref(),
+                        &query,
                     )),
                     kind: EventKind::ConversationTurn,
                     scope: scope.clone(),
@@ -328,20 +328,346 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&response)?);
         }
         Command::Mcp(arguments) => {
-            mcp::serve(
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create MCP runtime")?;
+            runtime.block_on(mcp::serve(
                 &database,
                 &arguments.root,
                 arguments.namespace,
                 arguments.workspace,
-            )
-            .await?;
+            ))?;
         }
     }
     Ok(())
 }
 
+/// Runs one parsed Super Mem command from an existing async runtime.
+///
+/// # Errors
+///
+/// Returns an error when the blocking CLI worker cannot be joined or command
+/// execution fails.
+pub async fn run(cli: Cli) -> anyhow::Result<()> {
+    tokio::task::spawn_blocking(move || run_sync(cli))
+        .await
+        .context("CLI worker failed")?
+}
+
 pub(crate) fn open_engine(path: &Path) -> anyhow::Result<MemoryEngine> {
     MemoryEngine::open(path, EngineOptions::default()).map_err(Into::into)
+}
+
+pub(crate) fn open_engine_and_scope(
+    path: &Path,
+    arguments: &crate::cli::ScopeArgs,
+) -> anyhow::Result<(MemoryEngine, Scope)> {
+    let scope = build_scope(arguments);
+    let cwd = arguments
+        .cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    validate_database_for_scope(path, &cwd)?;
+    // Validation proves that opening SQLite cannot change the Git worktree
+    // represented by `scope`: the database is external or every possible
+    // SQLite file is ignored and untracked.
+    let engine = open_engine(path)?;
+    Ok((engine, scope))
+}
+
+pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow::Result<()> {
+    let Some(repository_root) = native_git_root(cwd)? else {
+        return Ok(());
+    };
+    let repository_root = repository_root
+        .canonicalize()
+        .with_context(|| format!("resolve Git worktree {}", repository_root.display()))?;
+    let database_lexical = absolute_lexical_path(database)?;
+    let database_entry = canonical_entry_path(&database_lexical)?;
+    let mut database_bases = vec![database_lexical];
+    push_unique(&mut database_bases, database_entry.clone());
+    if let Ok(target) = database_entry.canonicalize()
+        && !database_bases.contains(&target)
+    {
+        database_bases.push(target);
+    }
+
+    let mut candidates = Vec::new();
+    for base in database_bases {
+        for candidate in [
+            base.clone(),
+            sidecar(&base, "-wal"),
+            sidecar(&base, "-shm"),
+            sidecar(&base, "-journal"),
+        ] {
+            push_unique(&mut candidates, candidate.clone());
+            if let Ok(target) = candidate.canonicalize() {
+                push_unique(&mut candidates, target);
+            }
+        }
+    }
+
+    for candidate in candidates {
+        let Ok(relative) = candidate.strip_prefix(&repository_root) else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            bail!(
+                "refusing scoped memory operation because database path resolves to Git worktree root {}",
+                repository_root.display()
+            );
+        }
+        validate_repo_local_candidate(&candidate, &repository_root)?;
+        if git_path_matches(&repository_root, "ls-files", &["--error-unmatch"], relative)? {
+            bail!(
+                "refusing scoped memory operation because {} is tracked by Git; move --db outside {}",
+                candidate.display(),
+                repository_root.display()
+            );
+        }
+        if !git_path_matches(
+            &repository_root,
+            "check-ignore",
+            &["--quiet", "--no-index"],
+            relative,
+        )? {
+            bail!(
+                "refusing scoped memory operation because {} is inside Git worktree {} and is not ignored by Git; ignore the database plus its -wal, -shm, and -journal sidecars, or move --db outside the worktree",
+                candidate.display(),
+                repository_root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_repo_local_candidate(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
+    reject_symlink_components(candidate, repository_root)?;
+    let metadata = match fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return validate_repo_local_link_policy(candidate, repository_root, None);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", candidate.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "refusing scoped memory operation because {} is a symbolic link and may redirect writes into tracked worktree data; move --db outside {}",
+            candidate.display(),
+            repository_root.display()
+        );
+    }
+    validate_repo_local_link_policy(candidate, repository_root, Some(&metadata))
+}
+
+fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
+    let relative = candidate.strip_prefix(repository_root).with_context(|| {
+        format!(
+            "verify database path {} is below {}",
+            candidate.display(),
+            repository_root.display()
+        )
+    })?;
+    let mut cursor = repository_root.to_path_buf();
+    for component in relative.components() {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "refusing scoped memory operation because {} contains symbolic-link component {}; move --db outside {}",
+                    candidate.display(),
+                    cursor.display(),
+                    repository_root.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", cursor.display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_repo_local_link_policy(
+    candidate: &Path,
+    repository_root: &Path,
+    metadata: Option<&fs::Metadata>,
+) -> anyhow::Result<()> {
+    if metadata.is_some_and(|metadata| metadata.nlink() > 1) {
+        bail!(
+            "refusing scoped memory operation because {} has multiple hard links and may alias tracked worktree data; move --db outside {}",
+            candidate.display(),
+            repository_root.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_repo_local_link_policy(
+    candidate: &Path,
+    repository_root: &Path,
+    _metadata: Option<&fs::Metadata>,
+) -> anyhow::Result<()> {
+    bail!(
+        "refusing scoped memory operation because repo-local databases are not supported on this platform: hard-link aliases cannot be verified safely; move --db outside {} (candidate {})",
+        repository_root.display(),
+        candidate.display()
+    )
+}
+
+fn native_git_root(cwd: &Path) -> anyhow::Result<Option<PathBuf>> {
+    let output = match ProcessCommand::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(cwd)
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        Ok(_) => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("discover native Git worktree root"),
+    };
+    let mut bytes = output.stdout;
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+    }
+    #[cfg(not(unix))]
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.is_empty() {
+        return Ok(None);
+    }
+    #[cfg(unix)]
+    let root = {
+        use std::os::unix::ffi::OsStringExt;
+        PathBuf::from(OsString::from_vec(bytes))
+    };
+    #[cfg(not(unix))]
+    let root =
+        PathBuf::from(String::from_utf8(bytes).context("Git worktree root was not valid UTF-8")?);
+    Ok(Some(root))
+}
+
+fn canonical_entry_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = absolute_lexical_path(path)?;
+    let name = absolute
+        .file_name()
+        .map(OsString::from)
+        .context("database path must name a file")?;
+    let parent = absolute.parent().context("database path has no parent")?;
+    Ok(canonicalize_allow_missing(parent)?.join(name))
+}
+
+fn absolute_lexical_path(path: &Path) -> anyhow::Result<PathBuf> {
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        bail!(
+            "database path {} must not contain '..' components; pass a canonical path",
+            path.display()
+        );
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for database")?
+            .join(path)
+    };
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if matches!(
+                    normalized.components().next_back(),
+                    Some(std::path::Component::Normal(_))
+                ) {
+                    normalized.pop();
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn canonicalize_allow_missing(path: &Path) -> anyhow::Result<PathBuf> {
+    let mut cursor = path.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match cursor.canonicalize() {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Ok(resolved);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let name = cursor
+                    .file_name()
+                    .map(OsString::from)
+                    .with_context(|| format!("resolve database parent {}", path.display()))?;
+                missing.push(name);
+                cursor = cursor
+                    .parent()
+                    .with_context(|| format!("resolve database parent {}", path.display()))?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("resolve database parent {}", path.display()));
+            }
+        }
+    }
+}
+
+fn git_path_matches(
+    root: &Path,
+    command: &str,
+    arguments: &[&str],
+    relative: &Path,
+) -> anyhow::Result<bool> {
+    let mut process = ProcessCommand::new("git");
+    if command == "ls-files" {
+        process.arg("--literal-pathspecs");
+    }
+    let status = process
+        .arg(command)
+        .args(arguments)
+        .arg("--")
+        .arg(relative)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("verify Git isolation for {}", relative.display()))?;
+    match status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => bail!(
+            "Git isolation check failed for {} in {}",
+            relative.display(),
+            root.display()
+        ),
+    }
+}
+
+fn push_unique(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.contains(&path) {
+        paths.push(path);
+    }
 }
 
 pub(crate) fn context_envelope(rendered: &str) -> String {
@@ -484,7 +810,6 @@ fn export_private_file(engine: &MemoryEngine, path: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
-#[cfg(unix)]
 fn sidecar(database: &Path, suffix: &str) -> PathBuf {
     let mut value = database.as_os_str().to_os_string();
     value.push(suffix);
@@ -518,6 +843,77 @@ fn format_ids(prefix: &str, ids: &[MemoryId]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{prefix} {values}")
+}
+
+/// Builds a bounded, opaque key from an unambiguous tuple of UTF-8 fields.
+///
+/// The derivation context and operation domain keep independently generated
+/// keys separate. A field count plus fixed-width byte lengths prevent host
+/// identifiers containing delimiters from changing tuple boundaries.
+pub(crate) fn automatic_idempotency_key(domain: &str, fields: &[&str]) -> String {
+    fn update_frame(hasher: &mut blake3::Hasher, value: &str) {
+        let length = u64::try_from(value.len()).expect("UTF-8 field length must fit in u64");
+        hasher.update(&length.to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+
+    let mut hasher =
+        blake3::Hasher::new_derive_key("super-mem automatic idempotency key derivation v1");
+    update_frame(&mut hasher, domain);
+    let field_count = u64::try_from(fields.len()).expect("field count must fit in u64");
+    hasher.update(&field_count.to_be_bytes());
+    for field in fields {
+        update_frame(&mut hasher, field);
+    }
+    format!("sm1:{}", hasher.finalize().to_hex())
+}
+
+fn optional_field(value: Option<&str>) -> (&'static str, &str) {
+    value.map_or(("missing", ""), |value| ("present", value))
+}
+
+fn observe_event_idempotency_key(
+    scope: &crate::cli::ScopeArgs,
+    kind: ObserveKindArg,
+    event_id: &str,
+    content: &str,
+) -> String {
+    let (harness_state, harness) = optional_field(scope.harness.as_deref());
+    let (session_state, session) = optional_field(scope.session.as_deref());
+    automatic_idempotency_key(
+        "cli.observe.host-event",
+        &[
+            harness_state,
+            harness,
+            session_state,
+            session,
+            observe_name(kind),
+            event_id,
+            content,
+        ],
+    )
+}
+
+fn prompt_recall_idempotency_key(
+    scope: &crate::cli::ScopeArgs,
+    event_id: Option<&str>,
+    query: &str,
+) -> String {
+    let (harness_state, harness) = optional_field(scope.harness.as_deref());
+    let (session_state, session) = optional_field(scope.session.as_deref());
+    let (event_state, event_id) = optional_field(event_id);
+    automatic_idempotency_key(
+        "cli.recall.observed-prompt",
+        &[
+            harness_state,
+            harness,
+            session_state,
+            session,
+            event_state,
+            event_id,
+            query,
+        ],
+    )
 }
 
 pub(crate) const fn memory_kind(value: MemoryKindArg) -> MemoryKind {
@@ -589,5 +985,178 @@ pub(crate) const fn feedback(value: FeedbackArg) -> FeedbackSignal {
         FeedbackArg::Incorrect => FeedbackSignal::Incorrect,
         FeedbackArg::Outdated => FeedbackSignal::Outdated,
         FeedbackArg::Dismissed => FeedbackSignal::Dismissed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, process::Command};
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn git(repository: &Path, arguments: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(repository)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn init_repository(repository: &Path) {
+        fs::create_dir(repository).unwrap();
+        git(repository, &["init", "--quiet"]);
+        git(
+            repository,
+            &["config", "user.email", "test@example.invalid"],
+        );
+        git(repository, &["config", "user.name", "Test"]);
+        git(
+            repository,
+            &["commit", "--allow-empty", "--quiet", "-m", "initial"],
+        );
+    }
+
+    #[test]
+    fn automatic_idempotency_keys_are_bounded_framed_and_domain_separated() {
+        let first = automatic_idempotency_key("hook.stop", &["session:a", "turn"]);
+        let retry = automatic_idempotency_key("hook.stop", &["session:a", "turn"]);
+        let ambiguous_split = automatic_idempotency_key("hook.stop", &["session", "a:turn"]);
+        let other_domain = automatic_idempotency_key("hook.compact", &["session:a", "turn"]);
+        let changed_content = automatic_idempotency_key("hook.stop", &["session:a", "changed"]);
+        let long = "host:id:".repeat(16_384);
+        let bounded = automatic_idempotency_key("hook.stop", &[&long, &long, &long]);
+
+        assert_eq!(first, retry);
+        assert_ne!(first, ambiguous_split);
+        assert_ne!(first, other_domain);
+        assert_ne!(first, changed_content);
+        assert!(bounded.starts_with("sm1:"));
+        assert_eq!(bounded.len(), 68);
+        assert!(bounded.len() <= 256);
+    }
+
+    #[test]
+    fn generated_event_keys_preserve_optional_and_field_boundaries() {
+        let left = crate::cli::ScopeArgs {
+            harness: Some("host:a".into()),
+            session: Some("session".into()),
+            ..crate::cli::ScopeArgs::default()
+        };
+        let right = crate::cli::ScopeArgs {
+            harness: Some("host".into()),
+            session: Some("a:session".into()),
+            ..crate::cli::ScopeArgs::default()
+        };
+        assert_ne!(
+            prompt_recall_idempotency_key(&left, Some("event"), "content"),
+            prompt_recall_idempotency_key(&right, Some("event"), "content")
+        );
+        assert_ne!(
+            prompt_recall_idempotency_key(&left, None, "event:content"),
+            prompt_recall_idempotency_key(&left, Some("event"), "content")
+        );
+        assert_ne!(
+            observe_event_idempotency_key(
+                &left,
+                ObserveKindArg::AssistantFinal,
+                "event:part",
+                "content"
+            ),
+            observe_event_idempotency_key(
+                &left,
+                ObserveKindArg::AssistantFinal,
+                "event",
+                "part:content"
+            )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_in_repository_database_produces_a_stable_exact_scope() {
+        let temp = TempDir::new().unwrap();
+        let repository = temp.path().join("repository");
+        init_repository(&repository);
+        fs::write(repository.join(".gitignore"), "memory.sqlite3*\n").unwrap();
+        git(&repository, &["add", ".gitignore"]);
+        git(
+            &repository,
+            &["commit", "--quiet", "-m", "ignore memory database"],
+        );
+        let database = repository.join("memory.sqlite3");
+        drop(open_engine(&database).unwrap());
+        let arguments = crate::cli::ScopeArgs {
+            namespace: "in-repo-test".into(),
+            session: Some("session-1".into()),
+            cwd: Some(repository),
+            harness: Some("test".into()),
+            ..crate::cli::ScopeArgs::default()
+        };
+        let mut expected = None;
+        for _ in 0..8 {
+            let (engine, actual) = open_engine_and_scope(&database, &arguments).unwrap();
+            drop(engine);
+            assert_eq!(
+                actual
+                    .repository
+                    .as_ref()
+                    .and_then(|repository| repository.dirty_hash.as_ref()),
+                None
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&actual, expected);
+                assert_eq!(
+                    super_mem_core::classify_applicability(expected, &actual, &[], &[]),
+                    super_mem_core::Applicability::Exact
+                );
+            } else {
+                expected = Some(actual);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_git_root_preserves_a_trailing_newline_path_byte() {
+        let temp = TempDir::new().unwrap();
+        let plain = temp.path().join("repo");
+        let newline = temp.path().join("repo\n");
+        init_repository(&plain);
+        init_repository(&newline);
+
+        assert_eq!(
+            native_git_root(&plain).unwrap().unwrap(),
+            plain.canonicalize().unwrap()
+        );
+        assert_eq!(
+            native_git_root(&newline).unwrap().unwrap(),
+            newline.canonicalize().unwrap()
+        );
+        assert!(
+            validate_database_for_scope(&plain.join("memory.sqlite3"), &plain)
+                .unwrap_err()
+                .to_string()
+                .contains("not ignored by Git")
+        );
+        assert!(
+            validate_database_for_scope(&newline.join("memory.sqlite3"), &newline)
+                .unwrap_err()
+                .to_string()
+                .contains("not ignored by Git")
+        );
+
+        fs::write(newline.join(".gitignore"), "memory.sqlite3*\n").unwrap();
+        git(&newline, &["add", ".gitignore"]);
+        git(
+            &newline,
+            &["commit", "--quiet", "-m", "ignore memory database"],
+        );
+        validate_database_for_scope(&newline.join("memory.sqlite3"), &newline).unwrap();
+        assert!(validate_database_for_scope(&plain.join("memory.sqlite3"), &plain).is_err());
     }
 }

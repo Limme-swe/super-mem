@@ -1,6 +1,29 @@
 # Benchmark notes
 
-This directory is reserved for reproducible Rust microbenchmarks and their documentation. It intentionally contains no performance numbers yet.
+This directory documents reproducible Rust performance work. Development
+probes live beside the private functions they measure and are paired with
+non-ignored invariant or equivalence tests. They are ignored during the
+ordinary test suite.
+
+Run the in-process core pipeline probe with:
+
+```sh
+cargo test --release -p super-mem-core \
+  engine::tests::performance_probe -- --ignored --exact --nocapture --test-threads=1
+```
+
+Run the optimized selector against its retained quadratic reference with:
+
+```sh
+cargo test --release -p super-mem-core \
+  ranking::tests::incremental_mmr_performance_probe \
+  -- --ignored --exact --nocapture --test-threads=1
+```
+
+The selector's non-ignored equivalence test compares the complete selected ID
+and score-bit sequence across tied and pseudo-random inputs. The wider engine
+suite separately checks recall ordering, scope exclusion, snapshot parity,
+and attachment ordering, so a faster timing alone is never sufficient.
 
 ## Required benchmark groups
 

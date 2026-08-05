@@ -18,17 +18,20 @@ pub fn classify_applicability(
         current_scope,
         memory_artifacts,
         current_artifacts,
-        None,
+        |root, stored, current| compare_revisions(root, stored, current),
     )
 }
 
-pub(crate) fn classify_applicability_with_relation(
+pub(crate) fn classify_applicability_with_relation<F>(
     memory_scope: &Scope,
     current_scope: &Scope,
     memory_artifacts: &[ArtifactRef],
     current_artifacts: &[ArtifactRef],
-    git_relation: Option<GitRelation>,
-) -> Applicability {
+    resolve_git_relation: F,
+) -> Applicability
+where
+    F: FnOnce(&str, &str, &str) -> GitRelation,
+{
     if memory_scope.namespace != current_scope.namespace {
         return Applicability::Inapplicable;
     }
@@ -95,7 +98,7 @@ pub(crate) fn classify_applicability_with_relation(
         current_repo.head_oid.as_deref(),
     ) {
         (Some(root), Some(stored), Some(current)) => {
-            match git_relation.unwrap_or_else(|| compare_revisions(root, stored, current)) {
+            match resolve_git_relation(root, stored, current) {
                 GitRelation::Same => Applicability::Exact,
                 GitRelation::Ancestor { .. } => Applicability::Compatible,
                 GitRelation::Descendant { .. } | GitRelation::Diverged { .. } => {
@@ -184,6 +187,78 @@ mod tests {
             classify_applicability(&memory, &current, &[], &[]),
             Applicability::Stale
         );
+    }
+
+    #[test]
+    fn decisive_artifact_and_dirty_checks_do_not_resolve_git() {
+        let mut memory = scope("repo", "main");
+        let mut current = memory.clone();
+        for candidate in [&mut memory, &mut current] {
+            let repository = candidate.repository.as_mut().unwrap();
+            repository.root = Some("/repository".into());
+            repository.head_oid = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        }
+        let historical = ArtifactRef {
+            repo_id: "repo".into(),
+            path: "src/lib.rs".into(),
+            content_hash: Some("old".into()),
+            ..ArtifactRef::default()
+        };
+        let changed = ArtifactRef {
+            content_hash: Some("new".into()),
+            ..historical.clone()
+        };
+
+        let mut calls = 0;
+        assert_eq!(
+            classify_applicability_with_relation(
+                &memory,
+                &current,
+                std::slice::from_ref(&historical),
+                std::slice::from_ref(&changed),
+                |_, _, _| {
+                    calls += 1;
+                    GitRelation::Same
+                },
+            ),
+            Applicability::Stale
+        );
+        assert_eq!(calls, 0);
+
+        current.repository.as_mut().unwrap().dirty_hash = Some("dirty".into());
+        assert_eq!(
+            classify_applicability_with_relation(&memory, &current, &[], &[], |_, _, _| {
+                calls += 1;
+                GitRelation::Same
+            }),
+            Applicability::Stale
+        );
+        assert_eq!(calls, 0);
+
+        current.repository.as_mut().unwrap().dirty_hash = None;
+        assert_eq!(
+            classify_applicability_with_relation(
+                &memory,
+                &current,
+                std::slice::from_ref(&historical),
+                std::slice::from_ref(&historical),
+                |_, _, _| {
+                    calls += 1;
+                    GitRelation::Same
+                },
+            ),
+            Applicability::Exact
+        );
+        assert_eq!(calls, 0);
+
+        assert_eq!(
+            classify_applicability_with_relation(&memory, &current, &[], &[], |_, _, _| {
+                calls += 1;
+                GitRelation::Ancestor { behind: 1 }
+            }),
+            Applicability::Compatible
+        );
+        assert_eq!(calls, 1);
     }
 
     #[test]

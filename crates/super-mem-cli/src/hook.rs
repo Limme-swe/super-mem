@@ -9,9 +9,8 @@ use super_mem_core::{
 };
 
 use crate::{
-    app::{context_envelope, open_engine},
+    app::{automatic_idempotency_key, context_envelope, open_engine_and_scope},
     cli::{HarnessArg, ScopeArgs},
-    scope::build_scope,
 };
 
 const MAX_AUTOMATIC_CAPTURE_BYTES: usize = 64 * 1024;
@@ -49,8 +48,7 @@ fn process_inner(database: &Path, harness: HarnessArg, input: &str) -> anyhow::R
         harness: Some(harness_name(harness).into()),
         ..ScopeArgs::default()
     };
-    let scope = build_scope(&scope_arguments);
-    let engine = open_engine(database)?;
+    let (engine, scope) = open_engine_and_scope(database, &scope_arguments)?;
 
     match event {
         "UserPromptSubmit" => {
@@ -184,15 +182,23 @@ fn hook_idempotency_key(
     event: &str,
     content: &str,
 ) -> String {
-    let session = string(object, "session_id").unwrap_or("unknown");
-    let turn = string(object, "turn_id")
-        .or_else(|| string(object, "prompt_id"))
-        .or_else(|| string(object, "agent_id"))
-        .unwrap_or("unknown");
-    let digest = blake3::hash(content.as_bytes()).to_hex();
-    format!(
-        "hook:{}:{session}:{turn}:{event}:{digest}",
-        harness_name(harness)
+    let (session_state, session) =
+        string(object, "session_id").map_or(("missing", ""), |session| ("present", session));
+    let (turn_source, turn) = ["turn_id", "prompt_id", "agent_id"]
+        .into_iter()
+        .find_map(|key| string(object, key).map(|value| (key, value)))
+        .unwrap_or(("missing", ""));
+    automatic_idempotency_key(
+        "cli.hook.host-event",
+        &[
+            harness_name(harness),
+            session_state,
+            session,
+            turn_source,
+            turn,
+            event,
+            content,
+        ],
     )
 }
 
@@ -264,6 +270,45 @@ mod tests {
         let changed = hook_idempotency_key(&object, HarnessArg::Claude, "Stop", "two");
         assert_eq!(first, retry);
         assert_ne!(first, changed);
+        assert_eq!(first.len(), 68);
+    }
+
+    #[test]
+    fn idempotency_frames_host_fields_and_bounds_long_identifiers() {
+        let left = serde_json::from_value::<Map<String, Value>>(json!({
+            "session_id": "s:t",
+            "turn_id": "u"
+        }))
+        .unwrap();
+        let right = serde_json::from_value::<Map<String, Value>>(json!({
+            "session_id": "s",
+            "turn_id": "t:u"
+        }))
+        .unwrap();
+        let literal_unknown = serde_json::from_value::<Map<String, Value>>(json!({
+            "session_id": "unknown",
+            "turn_id": "unknown"
+        }))
+        .unwrap();
+        let missing = Map::new();
+        let long = "host:id:".repeat(64);
+        let long_fields = serde_json::from_value::<Map<String, Value>>(json!({
+            "session_id": long,
+            "turn_id": long
+        }))
+        .unwrap();
+
+        assert_ne!(
+            hook_idempotency_key(&left, HarnessArg::Claude, "Stop", "same"),
+            hook_idempotency_key(&right, HarnessArg::Claude, "Stop", "same")
+        );
+        assert_ne!(
+            hook_idempotency_key(&literal_unknown, HarnessArg::Claude, "Stop", "same"),
+            hook_idempotency_key(&missing, HarnessArg::Claude, "Stop", "same")
+        );
+        assert!(
+            hook_idempotency_key(&long_fields, HarnessArg::Claude, "Stop", "same").len() <= 256
+        );
     }
 
     #[test]
