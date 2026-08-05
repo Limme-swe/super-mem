@@ -6,7 +6,7 @@ use rusqlite::{Connection, OpenFlags};
 
 use crate::{Durability, EngineOptions, Error, Result};
 
-pub(crate) const SCHEMA_VERSION: u32 = 3;
+pub(crate) const SCHEMA_VERSION: u32 = 4;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
@@ -40,7 +40,54 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
     connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA temp_store=MEMORY;")?;
 
     // Verify identity before enabling WAL, which would otherwise mutate an
-    // unrelated SQLite file supplied accidentally.
+    // unrelated SQLite file supplied accidentally. The same check is repeated
+    // after acquiring the migration writer lock because another process may
+    // initialize an empty file between these two steps.
+    validate_identity(connection)?;
+
+    let journal_mode: String =
+        connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    // In-memory databases correctly report `memory` rather than `wal`.
+    if journal_mode != "wal" && journal_mode != "memory" {
+        return Err(Error::Migration(format!(
+            "SQLite refused WAL mode and selected {journal_mode}"
+        )));
+    }
+    match options.durability {
+        Durability::Balanced => connection.execute_batch("PRAGMA synchronous=NORMAL;")?,
+        Durability::Durable => connection.execute_batch("PRAGMA synchronous=FULL;")?,
+    }
+
+    connection.execute_batch("BEGIN IMMEDIATE;")?;
+    let migration = (|| {
+        let current = validate_identity(connection)?;
+        if current == 0 {
+            migrate_v1(connection)?;
+        }
+        if current < 2 {
+            migrate_v2(connection)?;
+        }
+        if current < 3 {
+            migrate_v3(connection)?;
+        }
+        if current < 4 {
+            migrate_v4(connection)?;
+        }
+        Ok(())
+    })();
+    match migration {
+        Ok(()) => {
+            connection.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = connection.execute_batch("ROLLBACK;");
+            Err(error)
+        }
+    }
+}
+
+fn validate_identity(connection: &Connection) -> Result<u32> {
     let current: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     let application_id: u32 =
         connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
@@ -61,30 +108,7 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
             "database schema {current} is newer than supported schema {SCHEMA_VERSION}"
         )));
     }
-
-    let journal_mode: String =
-        connection.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-    // In-memory databases correctly report `memory` rather than `wal`.
-    if journal_mode != "wal" && journal_mode != "memory" {
-        return Err(Error::Migration(format!(
-            "SQLite refused WAL mode and selected {journal_mode}"
-        )));
-    }
-    match options.durability {
-        Durability::Balanced => connection.execute_batch("PRAGMA synchronous=NORMAL;")?,
-        Durability::Durable => connection.execute_batch("PRAGMA synchronous=FULL;")?,
-    }
-
-    if current == 0 {
-        migrate_v1(connection)?;
-    }
-    if current < 2 {
-        migrate_v2(connection)?;
-    }
-    if current < 3 {
-        migrate_v3(connection)?;
-    }
-    Ok(())
+    Ok(current)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -92,8 +116,6 @@ fn migrate_v1(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
             r"
-            BEGIN IMMEDIATE;
-
             CREATE TABLE events (
                 seq               INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id          TEXT NOT NULL UNIQUE,
@@ -269,7 +291,6 @@ fn migrate_v1(connection: &Connection) -> Result<()> {
 
             PRAGMA application_id=1397572941;
             PRAGMA user_version=1;
-            COMMIT;
             ",
         )
         .map_err(|error| Error::Migration(error.to_string()))?;
@@ -280,7 +301,6 @@ fn migrate_v2(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
             r"
-            BEGIN IMMEDIATE;
             CREATE INDEX memory_entities_lookup
                 ON memory_entities(entity_id,memory_id,revision);
             CREATE INDEX memory_artifacts_memory_lookup
@@ -312,7 +332,6 @@ fn migrate_v2(connection: &Connection) -> Result<()> {
             JOIN memory_revisions r
               ON r.memory_id=h.memory_id AND r.revision=h.head_revision;
             PRAGMA user_version=2;
-            COMMIT;
             ",
         )
         .map_err(|error| Error::Migration(error.to_string()))?;
@@ -323,8 +342,6 @@ fn migrate_v3(connection: &Connection) -> Result<()> {
     connection
         .execute_batch(
             r"
-            BEGIN IMMEDIATE;
-
             -- Workspace is an independent isolation boundary even for two
             -- workspaces sharing a repository/branch scope key. This remains
             -- non-unique so every database/snapshot valid under v1/v2,
@@ -352,7 +369,91 @@ fn migrate_v3(connection: &Connection) -> Result<()> {
                 ON entities(lower(display),entity_id);
 
             PRAGMA user_version=3;
-            COMMIT;
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
+fn migrate_v4(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            -- Scope remains canonical in scope_json. This expression index is
+            -- a rebuildable projection used to ground session checkpoints
+            -- without scanning every historical event.
+            CREATE INDEX events_session_scope
+                ON events(
+                    namespace,
+                    json_extract(scope_json,'$.workspace_id'),
+                    json_extract(scope_json,'$.repository.repo_id'),
+                    json_extract(scope_json,'$.repository.branch'),
+                    json_extract(scope_json,'$.session_id'),
+                    seq DESC
+                )
+                WHERE json_extract(scope_json,'$.session_id') IS NOT NULL;
+
+            -- Head rows remain optimized for current reads. This companion
+            -- table preserves every revision's ranking, validity, lifecycle,
+            -- and canonical metadata instead of projecting history through
+            -- the latest head.
+            CREATE TABLE memory_revision_metadata (
+                memory_id         TEXT NOT NULL,
+                revision          INTEGER NOT NULL,
+                kind              TEXT NOT NULL,
+                state             TEXT NOT NULL,
+                canonical_key     TEXT,
+                importance        REAL NOT NULL,
+                confidence        REAL NOT NULL,
+                trust             TEXT NOT NULL,
+                valid_from_ms     INTEGER,
+                valid_until_ms    INTEGER,
+                expires_at_ms     INTEGER,
+                metadata_complete INTEGER NOT NULL CHECK(metadata_complete IN (0,1)),
+                PRIMARY KEY(memory_id, revision),
+                FOREIGN KEY(memory_id, revision)
+                    REFERENCES memory_revisions(memory_id, revision)
+            );
+            INSERT INTO memory_revision_metadata(
+                memory_id,revision,kind,state,canonical_key,importance,
+                confidence,trust,valid_from_ms,valid_until_ms,expires_at_ms,
+                metadata_complete
+            )
+            SELECT r.memory_id,r.revision,h.kind,h.state,h.canonical_key,
+                   h.importance,h.confidence,h.trust,h.valid_from_ms,
+                   h.valid_until_ms,h.expires_at_ms,
+                   CASE WHEN r.revision=h.head_revision
+                             AND r.recorded_seq=h.updated_seq
+                        THEN 1 ELSE 0 END
+            FROM memory_revisions r
+            JOIN memory_heads h ON h.memory_id=r.memory_id;
+
+            CREATE TABLE memory_link_revisions (
+                link_id           TEXT NOT NULL,
+                source_memory_id  TEXT NOT NULL,
+                source_revision   INTEGER NOT NULL,
+                target_memory_id  TEXT NOT NULL,
+                relation          TEXT NOT NULL,
+                weight            INTEGER NOT NULL CHECK(weight >= 0 AND weight <= 1000),
+                created_event_id  TEXT NOT NULL REFERENCES events(event_id),
+                created_at_ms     INTEGER NOT NULL,
+                PRIMARY KEY(source_memory_id,source_revision,target_memory_id,relation),
+                FOREIGN KEY(source_memory_id,source_revision)
+                    REFERENCES memory_revisions(memory_id,revision),
+                FOREIGN KEY(target_memory_id) REFERENCES memory_heads(memory_id)
+            );
+            INSERT INTO memory_link_revisions(
+                link_id,source_memory_id,source_revision,target_memory_id,
+                relation,weight,created_event_id,created_at_ms
+            )
+            SELECT l.link_id,l.source_memory_id,r.revision,
+                   l.target_memory_id,l.relation,l.weight,
+                   l.created_event_id,l.created_at_ms
+            FROM memory_links l
+            JOIN events e ON e.event_id=l.created_event_id
+            JOIN memory_revisions r
+              ON r.memory_id=l.source_memory_id AND r.recorded_seq=e.seq;
+            PRAGMA user_version=4;
             ",
         )
         .map_err(|error| Error::Migration(error.to_string()))?;
@@ -361,6 +462,8 @@ fn migrate_v3(connection: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier};
+
     use super::*;
 
     #[test]
@@ -371,11 +474,20 @@ mod tests {
             .execute_batch(
                 r#"
                 INSERT INTO events(seq,event_id,namespace,kind,scope_json,content,attributes_json,trust,occurred_at_ms,ingested_at_ms,content_hash,redaction_count)
-                VALUES(1,'018f0000-0000-7000-8000-000000000001','default','explicit_memory','{"namespace":"default"}','source','{}','explicit',1,1,'hash',0);
+                VALUES
+                    (1,'018f0000-0000-7000-8000-000000000001','default','explicit_memory','{"namespace":"default"}','source one','{}','explicit',1,1,'hash-one',0),
+                    (2,'018f0000-0000-7000-8000-000000000005','default','explicit_memory','{"namespace":"default"}','source two','{}','explicit',2,2,'hash-two',0);
                 INSERT INTO memory_heads(docid,memory_id,namespace,scope_key,kind,state,head_revision,importance,confidence,trust,created_at_ms,updated_at_ms,created_seq,updated_seq)
-                VALUES(1,'018f0000-0000-7000-8000-000000000002','default','scope','procedure','active',1,0.5,0.5,'explicit',1,1,1,1);
+                VALUES
+                    (1,'018f0000-0000-7000-8000-000000000002','default','scope','procedure','active',2,0.9,0.8,'user_confirmed',1,2,1,2),
+                    (2,'018f0000-0000-7000-8000-000000000003','default','scope','fact','retracted',1,0.5,0.5,'explicit',1,2,1,2);
                 INSERT INTO memory_revisions(memory_id,revision,title,body,attributes_json,scope_json,content_hash,recorded_at_ms,recorded_seq)
-                VALUES('018f0000-0000-7000-8000-000000000002',1,'Migration test','contentless searchable needle','{}','{"namespace":"default"}','hash',1,1);
+                VALUES
+                    ('018f0000-0000-7000-8000-000000000002',1,'Migration test old','older searchable needle','{}','{"namespace":"default"}','hash-old',1,1),
+                    ('018f0000-0000-7000-8000-000000000002',2,'Migration test','contentless searchable needle','{}','{"namespace":"default"}','hash-new',2,2),
+                    ('018f0000-0000-7000-8000-000000000003',1,'Migration target','link target','{}','{"namespace":"default"}','target-hash',1,1);
+                INSERT INTO memory_links(link_id,source_memory_id,target_memory_id,relation,weight,created_event_id,created_at_ms)
+                VALUES('018f0000-0000-7000-8000-000000000004','018f0000-0000-7000-8000-000000000002','018f0000-0000-7000-8000-000000000003','documents',400,'018f0000-0000-7000-8000-000000000001',1);
                 INSERT INTO memory_fts(rowid,title,body,tags,entities,paths)
                 VALUES(1,'Migration test','contentless searchable needle','','','');
                 "#,
@@ -395,6 +507,33 @@ mod tests {
                     "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'needle'",
                     [],
                     |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        let metadata_fidelity = connection
+            .prepare(
+                "SELECT revision,metadata_complete FROM memory_revision_metadata WHERE memory_id='018f0000-0000-7000-8000-000000000002' ORDER BY revision",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, bool>(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(metadata_fidelity, [(1, false), (2, true)]);
+        assert!(!connection
+            .query_row(
+                "SELECT metadata_complete FROM memory_revision_metadata WHERE memory_id='018f0000-0000-7000-8000-000000000003' AND revision=1",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT source_revision FROM memory_link_revisions WHERE link_id='018f0000-0000-7000-8000-000000000004'",
+                    [],
+                    |row| row.get::<_, u32>(0),
                 )
                 .unwrap(),
             1
@@ -462,6 +601,46 @@ mod tests {
                 "updated_seq",
                 "memory_id"
             ]
+        );
+    }
+
+    #[test]
+    fn concurrent_first_open_serializes_schema_migrations() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("memory.sqlite3");
+        let workers = 8;
+        let barrier = Arc::new(Barrier::new(workers));
+        let handles = (0..workers)
+            .map(|_| {
+                let database = database.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let connection = Connection::open(database).unwrap();
+                    barrier.wait();
+                    initialize(&connection, &EngineOptions::default())
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        let connection = Connection::open(database).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name='memory_heads'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
         );
     }
 }

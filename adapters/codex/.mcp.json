@@ -1,0 +1,6 @@
+{
+  "super_mem": {
+    "command": "supermem",
+    "args": ["mcp", "--root", ".", "--namespace", "default"]
+  }
+}

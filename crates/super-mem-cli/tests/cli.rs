@@ -129,6 +129,13 @@ fn remember_recall_inspect_and_retract_round_trip() {
         .stdout(predicate::str::contains("Package manager"));
 
     command(&database)
+        .args(["inspect", id, "--history"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"metadata_complete\": true"))
+        .stdout(predicate::str::contains("\"events\""));
+
+    command(&database)
         .args([
             "retract",
             id,
@@ -173,6 +180,36 @@ fn observe_retries_are_idempotent() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"events\": 1"));
+}
+
+#[test]
+fn observe_accepts_structured_tool_result_metadata() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database)
+        .args([
+            "observe",
+            "--kind",
+            "command_result",
+            "--content-stdin",
+            "--event-id",
+            "tool-call-1",
+            "--tool-name",
+            "Bash",
+            "--succeeded",
+            "false",
+            "--verification",
+            "true",
+            "--error-fingerprint",
+            "smerr1:test",
+            "--session",
+            "session-1",
+            "--cwd",
+        ])
+        .arg(temp.path())
+        .write_stdin("cargo test failed")
+        .assert()
+        .success();
 }
 
 #[test]

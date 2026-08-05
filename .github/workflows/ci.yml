@@ -65,10 +65,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - name: Validate JSON and evaluation fixtures
+      - name: Validate evaluation fixture contract
+        run: node scripts/validate-eval-fixture.mjs
+      - name: Validate adapter manifests
         run: |
           python -m json.tool adapters/codex/.codex-plugin/plugin.json >/dev/null
+          python -m json.tool adapters/codex/.mcp.json >/dev/null
           python -m json.tool adapters/codex/hooks/hooks.json >/dev/null
+          python -m json.tool .agents/plugins/marketplace.json >/dev/null
           python -m json.tool adapters/claude/.mcp.json >/dev/null
           python -m json.tool adapters/claude/.claude/settings.json >/dev/null
           python -m json.tool adapters/opencode/opencode.json >/dev/null
@@ -79,10 +83,15 @@ jobs:
           from pathlib import Path
           manifest = json.loads(Path("adapters/codex/.codex-plugin/plugin.json").read_text())
           assert manifest["name"] == "super-mem"
-          assert manifest["mcpServers"]["super_mem"]["command"] == "supermem"
-          for line in Path("fixtures/eval/v1.jsonl").read_text().splitlines():
-              if line.strip():
-                  assert json.loads(line)["schema_version"] == "supermem.eval.v1"
+          assert manifest["mcpServers"] == "./.mcp.json"
+          assert manifest["hooks"] == "./hooks/hooks.json"
+          assert isinstance(manifest["interface"]["defaultPrompt"], list)
+          mcp_servers = json.loads(Path("adapters/codex/.mcp.json").read_text())
+          assert mcp_servers["super_mem"]["command"] == "supermem"
+          marketplace = json.loads(Path(".agents/plugins/marketplace.json").read_text())
+          entry = marketplace["plugins"][0]
+          assert entry["name"] == "super-mem"
+          assert entry["source"] == {"source": "local", "path": "./adapters/codex"}
           PY
       - name: Type-check current host adapters
         run: |

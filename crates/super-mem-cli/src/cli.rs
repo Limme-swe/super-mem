@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 /// Local, evidence-first memory for coding agents.
 #[derive(Clone, Debug, Parser)]
@@ -55,10 +55,10 @@ pub(crate) enum Command {
 #[derive(Clone, Debug, Default, Args)]
 pub struct ScopeArgs {
     /// Hard isolation namespace.
-    #[arg(long, default_value = "default")]
+    #[arg(long, env = "SUPER_MEM_NAMESPACE", default_value = "default")]
     pub namespace: String,
     /// Optional workspace identity.
-    #[arg(long)]
+    #[arg(long, env = "SUPER_MEM_WORKSPACE")]
     pub workspace: Option<String>,
     /// Explicit repository identity; otherwise discovered from --cwd.
     #[arg(long)]
@@ -192,6 +192,9 @@ pub struct RememberArgs {
     pub trust: TrustArg,
     #[arg(long, value_delimiter = ',')]
     pub tags: Vec<String>,
+    /// Repository-relative file to fingerprint as applicability evidence. Repeatable.
+    #[arg(long = "file")]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -217,6 +220,18 @@ pub struct ObserveArgs {
     pub idempotency_key: Option<String>,
     #[arg(long, value_enum)]
     pub trust: Option<TrustArg>,
+    /// Harness tool name associated with a tool, command, or file result.
+    #[arg(long)]
+    pub tool_name: Option<String>,
+    /// Whether the harness reported the tool execution as successful.
+    #[arg(long)]
+    pub succeeded: Option<bool>,
+    /// Mark this event as the result of a verification command.
+    #[arg(long, action = ArgAction::Set, default_value_t = false)]
+    pub verification: bool,
+    /// Stable, non-sensitive fingerprint for a failed execution.
+    #[arg(long)]
+    pub error_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -247,6 +262,12 @@ pub struct CheckpointArgs {
     pub tags: Vec<String>,
     #[arg(long, value_enum, default_value_t)]
     pub trust: TrustArg,
+    /// Repository-relative file to fingerprint. Repeatable.
+    #[arg(long = "file")]
+    pub files: Vec<PathBuf>,
+    /// Do not automatically fingerprint changed Git files.
+    #[arg(long)]
+    pub no_auto_artifacts: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -278,14 +299,23 @@ pub struct RecallArgs {
     pub format: RecallFormat,
     #[arg(long)]
     pub include_stale: bool,
+    /// Include memories from descendant or diverged Git history.
+    #[arg(long)]
+    pub include_divergent: bool,
     #[arg(long)]
     pub include_superseded: bool,
+    /// Repository-relative file whose current fingerprint should guide recall. Repeatable.
+    #[arg(long = "file")]
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Args)]
 pub struct IdArgs {
     /// Memory UUID.
     pub memory_id: String,
+    /// Include every revision, cited event, and historical link.
+    #[arg(long)]
+    pub history: bool,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -346,6 +376,12 @@ pub struct PurgeArgs {
 pub struct HookArgs {
     #[arg(value_enum)]
     pub harness: HarnessArg,
+    /// Hard isolation namespace. Must match the MCP server configuration.
+    #[arg(long, env = "SUPER_MEM_NAMESPACE", default_value = "default")]
+    pub namespace: String,
+    /// Optional hard workspace identity. Must match the MCP server configuration.
+    #[arg(long, env = "SUPER_MEM_WORKSPACE")]
+    pub workspace: Option<String>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -354,9 +390,9 @@ pub struct McpArgs {
     #[arg(long, default_value = ".")]
     pub root: PathBuf,
     /// Hard isolation namespace pinned for the lifetime of this server.
-    #[arg(long, default_value = "default")]
+    #[arg(long, env = "SUPER_MEM_NAMESPACE", default_value = "default")]
     pub namespace: String,
     /// Optional hard workspace identity pinned for the lifetime of this server.
-    #[arg(long)]
+    #[arg(long, env = "SUPER_MEM_WORKSPACE")]
     pub workspace: Option<String>,
 }

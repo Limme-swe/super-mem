@@ -1,0 +1,20 @@
+{
+  "name": "super-mem",
+  "interface": {
+    "displayName": "Super Mem"
+  },
+  "plugins": [
+    {
+      "name": "super-mem",
+      "source": {
+        "source": "local",
+        "path": "./adapters/codex"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

@@ -12,7 +12,9 @@ claude mcp add --scope project --transport stdio super_mem --   supermem mcp --r
 
 Verify the connection with claude mcp list and /mcp.
 
-The included command pins --root . --namespace default. Use an absolute trusted root for user-level configuration and add --workspace when needed.
+The included command pins --root to `${CLAUDE_PROJECT_DIR:-.}` and uses namespace `default`. Use an absolute trusted root for user-level configuration and add `--workspace` when needed.
+
+Hooks and MCP are separate processes. If you change the MCP `--namespace` or `--workspace`, set `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE` to the same values in the environment that launches Claude Code. Hooks otherwise use namespace `default` with no workspace.
 
 ## Captured events
 
@@ -21,6 +23,7 @@ The included command pins --root . --namespace default. Use an absolute trusted 
 | SessionStart | Recall context. |
 | UserPromptSubmit | Record the prompt and recall context. |
 | SubagentStart | Recall context for the subagent. |
+| PostToolUse / PostToolUseFailure | Record successful and failed non-memory tool outcomes. |
 | Stop / SubagentStop | Checkpoint the finalized assistant message. |
 | PostCompact | Store the supplied compact summary. |
 

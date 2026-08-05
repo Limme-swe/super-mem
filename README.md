@@ -16,7 +16,7 @@ super-mem records prompts, decisions, tool results, tests, and failed attempts i
 
 - Keeps observable evidence with each memory instead of storing detached summaries.
 - Separates successful procedures, failed attempts, decisions, facts, and open work.
-- Tracks revisions, corrections, retractions, and conflicting evidence without erasing history.
+- Tracks revisions, source events, historical links, corrections, retractions, and conflicting evidence without erasing history.
 - Classifies repository memories as exact, compatible, stale, divergent, or unversioned.
 - Builds a small, deterministic context packet under a fixed token budget.
 - Runs locally without an embedding model, hosted database, or telemetry service.
@@ -48,6 +48,7 @@ Record a repository decision:
 supermem remember \
   --kind decision \
   --body "Use the workspace-level Cargo release profile" \
+  --file Cargo.toml \
   --cwd .
 ~~~
 
@@ -59,6 +60,8 @@ supermem recall \
   --cwd . \
   --token-budget 1200
 ~~~
+
+`--file` is repeatable on `remember`, `recall`, and `checkpoint`; it records or checks repository-relative content hashes. Checkpoints also attempt to fingerprint the complete changed-file set by default and attach nothing if automatic capture is incomplete. Use `--no-auto-artifacts` to disable that capture.
 
 Run the MCP server:
 
@@ -79,7 +82,7 @@ A generic stdio configuration looks like this:
 }
 ~~~
 
-The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries.
+The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries. `SUPER_MEM_NAMESPACE` and `SUPER_MEM_WORKSPACE` can provide the same scope to scoped CLI commands, hooks, and MCP; keep both processes configured alike.
 
 ## Integrations
 
@@ -104,7 +107,9 @@ Automatic capture is fail-open: a memory error must not stop the coding session.
 5. Git applicability, feedback, evidence quality, and redundancy affect ranking.
 6. Selected records are rendered as untrusted evidence under the requested budget.
 
-SQLite rows are canonical. FTS and lookup indexes are rebuildable projections. Recall does not depend on network access or an embedding model.
+Stale records require `--include-stale`. Descendant and diverged records are hidden unless recall uses `--include-divergent` or MCP sets `include_divergent`. A complete set of matching artifact hashes can keep a memory exact despite unrelated dirty files; incomplete automatic Git capture supplies no artifact evidence.
+
+SQLite rows are canonical. FTS and lookup indexes are rebuildable projections. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Recall does not depend on network access or an embedding model.
 
 ## MCP tools
 
@@ -115,9 +120,15 @@ The model-facing surface has four tools:
 | **memory_context** | Recall a scoped context packet for the current task. |
 | **memory_record** | Store a typed memory, observation, or checkpoint. |
 | **memory_feedback** | Attach an observed result or judgment to a memory. |
-| **memory_manage** | Inspect or retract a memory. |
+| **memory_manage** | Inspect a memory, load its revision, event, link, and feedback history, or retract it. |
 
 Database status, import/export, and physical purge remain CLI operations.
+
+The CLI exposes the same history as JSON:
+
+~~~sh
+supermem --json inspect MEMORY_ID --history
+~~~
 
 ## Data and safety
 
@@ -146,6 +157,7 @@ Run the full local checks with:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
+node scripts/validate-eval-fixture.mjs
 ~~~
 
 Changes to retrieval, scoping, snapshots, or performance need a focused regression test. Performance claims need a reproducible workload and hardware description.

@@ -17,20 +17,29 @@ Published results must include enough configuration and raw data to reproduce th
 
 ## Checks included in this repository
 
-The test suite protects these storage and retrieval invariants:
+The repository includes checks for these storage and retrieval invariants:
 
 - Replaying a stable source ID is idempotent, and derived records cannot reference missing evidence.
 - Supersession changes the current view without deleting history.
-- Scope filtering and kind, lifecycle, and time eligibility run before channel limits.
+- Scope filtering and kind, lifecycle, time, stale, and divergent eligibility run before channel limits. Divergent history is opt-in.
 - The v1 migration rebuilds contentless FTS without losing search matches.
 - Tied-score recall returns the same ordered IDs, signals, and score bit patterns.
-- Export, empty-target import, and re-export preserve canonical rows, SQLite `REAL` bit patterns, and the snapshot row-integrity footer.
+- Snapshot v2 export, empty-target import, and re-export preserve canonical rows, SQLite `REAL` bit patterns, per-revision metadata, historical links, and the row-integrity footer; v1 imports remain supported.
 - Batched hydration preserves the full order of evidence, artifacts, entities, and tags.
-- On supported Unix hosts, full-store purge removes the database, WAL, and shared-memory sidecars while leaving unrelated, symbolic-link, and multiply hard-linked paths untouched. v0.1 refuses purge on Windows.
+- Rendered text, structured sections, and ranked hits retain the same selected and truncated bodies under the reported token budget.
+- Complete matching artifact sets can remain exact across unrelated dirty changes; partial automatic changed-file capture cannot establish exact applicability.
+- Schema-v4 history retains source events, revision metadata fidelity, and immutable revision-scoped links. Legacy non-head metadata is explicitly incomplete.
+- On supported Unix hosts, full-store purge removes the database, WAL, shared-memory, and rollback-journal files while leaving unrelated, symbolic-link, and multiply hard-linked paths untouched. v0.1 refuses purge on Windows.
 - Scope-sensitive opening rejects a repository-local database or sidecar that is tracked, not ignored, reached through a symbolic link or symlinked ancestor, or has a hard-link alias.
 - Workspaces sharing a repository cannot merge canonical identities or idempotency keys, revise each other's explicit IDs, attach each other's evidence or memory links, or overwrite each other's entity displays or artifact language metadata.
 
-The [v1 fixture](../fixtures/eval/v1.jsonl) covers supersession, failures, repository isolation, branch divergence, stale artifacts, and exact errors. It checks required and forbidden records, classification, relative rank, provenance, and context size. Passing requires semantic assertions, not string matches.
+The [v1 fixture](../fixtures/eval/v1.jsonl) covers supersession, failures, repository isolation, branch divergence, stale artifacts, and exact errors. Its executable contract checks case structure, references, provenance, Git relationships, required and forbidden records, classifications, and the evidence behind relative-rank assertions:
+
+~~~sh
+node scripts/validate-eval-fixture.mjs
+~~~
+
+The script is deterministic and uses only the Node.js standard library. It validates the fixture's labeled retrieval intent; it is not a production-engine or end-to-end quality benchmark.
 
 ## Development probes
 
