@@ -167,13 +167,18 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 }
 
 fn validate_identity(connection: &Connection) -> Result<u32> {
-    let current: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    let application_id: u32 =
-        connection.query_row("PRAGMA application_id", [], |row| row.get(0))?;
-    let user_objects: i64 = connection.query_row(
-        "SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%'",
+    // Read all identity fields in one SQLite statement. Separate PRAGMA and
+    // schema queries can straddle another process's migration commit and
+    // observe an impossible mixture of the old header and new schema.
+    let (current, application_id, user_objects) = connection.query_row(
+        r"
+        SELECT
+            (SELECT user_version FROM pragma_user_version),
+            (SELECT application_id FROM pragma_application_id),
+            (SELECT count(*) FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%')
+        ",
         [],
-        |row| row.get(0),
+        |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u32>(1)?, row.get::<_, i64>(2)?)),
     )?;
     if (current != 0 || application_id != 0 || user_objects != 0)
         && application_id != APPLICATION_ID
@@ -686,40 +691,53 @@ mod tests {
     #[test]
     fn concurrent_first_open_serializes_schema_migrations() {
         let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("memory.sqlite3");
-        let workers = 8;
-        let barrier = Arc::new(Barrier::new(workers));
-        let handles = (0..workers)
-            .map(|_| {
-                let database = database.clone();
-                let barrier = Arc::clone(&barrier);
-                std::thread::spawn(move || {
-                    let connection = Connection::open(database).unwrap();
-                    barrier.wait();
-                    initialize(&connection, &EngineOptions::default())
+        for round in 0..8 {
+            let database = directory.path().join(format!("memory-{round}.sqlite3"));
+            let workers = 8;
+            let barrier = Arc::new(Barrier::new(workers));
+            let handles = (0..workers)
+                .map(|_| {
+                    let database = database.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let connection = Connection::open(database).unwrap();
+                        barrier.wait();
+                        initialize(&connection, &EngineOptions::default())
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
-        for handle in handles {
-            handle.join().unwrap().unwrap();
+            for handle in handles {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| panic!("first-open worker panicked in round {round}"))
+                    .unwrap_or_else(|error| {
+                        panic!("first-open worker failed in round {round}: {error}")
+                    });
+            }
+            let connection = Connection::open(database).unwrap();
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                SCHEMA_VERSION
+            );
+            assert_eq!(
+                connection
+                    .query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0))
+                    .unwrap(),
+                APPLICATION_ID
+            );
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM sqlite_schema WHERE name='memory_heads'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1
+            );
         }
-        let connection = Connection::open(database).unwrap();
-        assert_eq!(
-            connection
-                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM sqlite_schema WHERE name='memory_heads'",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            1
-        );
     }
 }
