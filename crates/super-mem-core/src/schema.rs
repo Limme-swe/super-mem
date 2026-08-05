@@ -1,8 +1,12 @@
 //! `SQLite` schema and connection initialization.
 
-use std::path::Path;
+use std::{
+    fs::File,
+    io::{ErrorKind, Read},
+    path::Path,
+};
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::Connection;
 
 use crate::{Durability, EngineOptions, Error, Result};
 
@@ -20,18 +24,25 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
     if !path.as_ref().is_file() {
         return Ok(false);
     }
-    let Ok(connection) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
+    let Ok(mut file) = File::open(path) else {
         return Ok(false);
     };
-    let Ok(application_id) =
-        connection.query_row("PRAGMA application_id", [], |row| row.get::<_, u32>(0))
-    else {
+    // Read immutable database-header fields directly. Opening SQLite here can
+    // trigger rollback-journal recovery or reject an otherwise identifiable
+    // store whose crash journal is damaged, exactly when purge is most useful.
+    let mut header = [0_u8; 72];
+    if let Err(error) = file.read_exact(&mut header) {
+        return if error.kind() == ErrorKind::UnexpectedEof {
+            Ok(false)
+        } else {
+            Err(error.into())
+        };
+    }
+    if &header[..16] != b"SQLite format 3\0" {
         return Ok(false);
-    };
-    let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    }
+    let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
+    let application_id = u32::from_be_bytes([header[68], header[69], header[70], header[71]]);
     Ok(application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version))
 }
 
