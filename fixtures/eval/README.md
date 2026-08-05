@@ -1,6 +1,6 @@
 # Evaluation fixture format
 
-[`v1.jsonl`](v1.jsonl) is a compact, hand-labeled retrieval fixture for core memory semantics. Each line is an independent case and must be valid JSON.
+[`v1.jsonl`](v1.jsonl) contains independent, hand-labeled retrieval cases. Each line is valid JSON.
 
 ## Shape
 
@@ -33,7 +33,7 @@
 
 ## Record fields
 
-Records use only the fields needed by a case:
+Each record uses only the fields needed by its case:
 
 - `id`: stable fixture identifier.
 - `kind`: fact, correction, decision, attempt, procedure, artifact, or diagnostic.
@@ -46,28 +46,28 @@ Records use only the fields needed by a case:
 - `provenance`: observable source type and identifier.
 - `diagnostic_signature`: normalized exact-error key.
 
-Production schemas may be richer. The fixture schema stays intentionally small so alternative implementations can consume it.
+The production schema is richer; this smaller format is portable across evaluators.
 
 ## Assertions
 
-- `must_return`: records required in the bounded context.
-- `must_not_return`: records forbidden by isolation or current-view semantics.
-- `status`: expected lifecycle or outcome classification, such as current, superseded, validated-procedure, or known-failure.
+- `must_return`: records required within the budget.
+- `must_not_return`: records forbidden by isolation or current-view rules.
+- `status`: expected lifecycle or outcome, such as current, superseded, validated-procedure, or known-failure.
 - Git applicability uses the model-facing values `exact`, `compatible`, `stale`, `divergent`, `unversioned`, and `inapplicable`. `inapplicable` is a hard scope exclusion, not a low-ranked result.
 - `rank_before`: ordered pairs `[preferred, lower_ranked]`.
 
-A record may be absent from ordinary current-context output yet available through a historical/audit query. For example, `must_not_return` in the supersession case means “do not return as current evidence,” not “erase history.”
+A record can be absent from current context but available to a historical query. In the supersession case, `must_not_return` means “not current,” not “erase history.”
 
-## Running an evaluator
+## Evaluator contract
 
-An evaluator should:
+For each case, an evaluator must:
 
 1. Create an empty temporary store per case.
 2. Insert records in listed order.
-3. Configure the supplied repository graph/state without reading the labels.
+3. Configure the supplied repository graph and state without reading labels.
 4. Execute the query at its fixed budget.
-5. Resolve returned record IDs and classifications.
+5. Resolve returned IDs and classifications.
 6. Check all semantic assertions.
-7. Report raw rankings and serialized context size.
+7. Report raw ranks and serialized context size.
 
-The fixture is deliberately too small for performance or general quality claims. Its purpose is regression coverage for dangerous semantic failures.
+This fixture checks semantic regressions; it is not a performance or general-quality benchmark.

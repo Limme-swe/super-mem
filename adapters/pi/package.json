@@ -1,7 +1,7 @@
 {
   "name": "@super-mem/pi",
   "version": "0.1.0",
-  "description": "Native Super Mem extension for Pi",
+  "description": "Native super-mem extension for Pi",
   "license": "MIT",
   "repository": {
     "type": "git",

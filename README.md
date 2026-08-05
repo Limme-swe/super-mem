@@ -1,109 +1,74 @@
 # super-mem
 
-Evidence-first, Git-aware experience memory for coding agents.
+[![CI](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml)
+[![MSRV](https://img.shields.io/badge/rustc-1.88%2B-000000?logo=rust)](Cargo.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
-`super-mem` is a local memory service for agents that work in repositories. It records observable evidence—prompts, tool outcomes, patches, tests, decisions, and corrections—and retrieves only the parts that fit the current task and repository state.
+Local, Git-aware memory for coding agents.
 
-It is intended to work across Codex, Claude Code, OpenCode, Pi, and any client that can launch an MCP stdio server. The core and CLI are written in Rust; harness-specific adapters may be thin configuration or JavaScript/TypeScript wrappers where the host requires them.
+super-mem records prompts, decisions, tool results, tests, and failed attempts in a local SQLite store. Recall is filtered by workspace, repository, and Git state before anything is ranked, so an old note from another branch is not treated as current fact.
 
-> [!IMPORTANT]
-> This repository is in early development. The storage schema and command surface may change before the first stable release. There are no unmeasured speed, quality, or benchmark claims here.
+**Status:** pre-1.0. The CLI and database schema may change before the first stable release. Packages and release binaries are not published yet.
 
-## Why this exists
+[Architecture](docs/architecture.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
 
-Coding agents need more than a searchable transcript. Useful experience has state and evidence:
+## What it does
 
-- A workaround may have failed, while a similar-looking command succeeded.
-- An architecture decision may apply on `main` but not on a release branch.
-- A note about a symbol may become stale after that symbol changes.
-- A user correction should supersede an older claim without erasing its history.
-- An exact compiler diagnostic can matter more than semantic similarity.
+- Keeps observable evidence with each memory instead of storing detached summaries.
+- Separates successful procedures, failed attempts, decisions, facts, and open work.
+- Tracks revisions, corrections, retractions, and conflicting evidence without erasing history.
+- Classifies repository memories as exact, compatible, stale, divergent, or unversioned.
+- Builds a small, deterministic context packet under a fixed token budget.
+- Runs locally without an embedding model, hosted database, or telemetry service.
 
-Poorly selected context can hurt coding-agent performance, while accurately selected prior experience can improve accuracy and reduce work. That is the central finding behind [SWE-ContextBench](https://arxiv.org/abs/2602.08316). `super-mem` therefore treats selection, applicability, and provenance as part of memory—not as cleanup after retrieval.
+The Rust core owns storage, scoping, retrieval, and context assembly. Harness adapters only translate lifecycle events and inject the resulting context.
 
-## Design principles
+## Install from source
 
-### Evidence before summaries
+The workspace requires Rust 1.88 or newer.
 
-Derived facts and procedures point back to observable source events. A summary is an index, not the ground truth.
-
-### Git state is part of truth
-
-Memories can be scoped to a repository, commit, branch, worktree patch, path, or symbol. Results can be classified as exact, compatible, stale, divergent, or unversioned relative to the current checkout. A different namespace or repository is inapplicable and excluded before ranking.
-
-### Success and failure are different memories
-
-Commands, exit status, diagnostics, changed files, and validation results remain attached to an episode. A failed attempt is useful as a warning, but it must not be returned as a recommended procedure.
-
-### Corrections do not destroy history
-
-New evidence may supersede, contest, or retract a claim. Historical evidence remains inspectable unless the user explicitly purges the local store.
-
-### Context has a budget
-
-Recall is assembled under an explicit token or byte budget. The goal is a small evidence bundle containing current facts, useful procedures, known failures, conflicts, and source references.
-
-### Required rules stay in the repository
-
-Memory is a recall layer, not a policy mechanism. Put requirements that must always apply in `AGENTS.md`, `CLAUDE.md`, checked-in documentation, or deterministic hooks. This matches [Codex's own guidance](https://learn.chatgpt.com/docs/customization/memories?surface=app) to keep required team instructions outside generated memory.
-
-## Model
-
-```mermaid
-flowchart TD
-    Events["Immutable evidence events"] --> Memory["Revisioned claims, decisions, episodes, procedures"]
-    Memory --> Scope["Namespace + repository + Git applicability"]
-    Scope --> Retrieval["Exact, lexical, entity, artifact, error, and recency retrieval"]
-    Retrieval --> Ranking["Fusion, utility scoring, and diversity selection"]
-    Ranking --> Context["Budgeted, provenance-rich context"]
-```
-
-The append-only event history is the source of truth. Search indexes and active views are derived and can be rebuilt.
+~~~sh
+git clone https://github.com/Limme-swe/super-mem.git
+cd super-mem
+cargo install --path crates/super-mem-cli --locked
+supermem --version
+~~~
 
 ## Quickstart
 
-The examples below use the current `supermem` command surface. Until release artifacts are published, build the workspace locally.
+Create the local store:
 
-```sh
-cargo build --release
-./target/release/supermem --help
-```
-
-The workspace currently requires Rust 1.88. Put `target/release` on `PATH` for the commands below, or replace `supermem` with `./target/release/supermem`.
-
-Initialize a local store:
-
-```sh
+~~~sh
 supermem init
-```
+~~~
 
-Record an explicit observation or decision for the repository discovered from the working directory:
+Record a repository decision:
 
-```sh
+~~~sh
 supermem remember \
   --kind decision \
-  --body "Use the workspace-level Cargo profile; package profiles are ignored" \
+  --body "Use the workspace-level Cargo release profile" \
   --cwd .
-```
+~~~
 
-Compile a bounded evidence packet for a task:
+Recall relevant context:
 
-```sh
+~~~sh
 supermem recall \
-  --query "why is the release profile not taking effect?" \
+  --query "why is the release profile ignored?" \
   --cwd . \
   --token-budget 1200
-```
+~~~
 
-Run the MCP server over stdio:
+Run the MCP server:
 
-```sh
+~~~sh
 supermem mcp --root /absolute/path/to/repo --namespace default
-```
+~~~
 
-An MCP client configuration has this general shape:
+A generic stdio configuration looks like this:
 
-```json
+~~~json
 {
   "mcpServers": {
     "super-mem": {
@@ -112,123 +77,80 @@ An MCP client configuration has this general shape:
     }
   }
 }
-```
+~~~
 
-See [Harness integrations](docs/integrations.md) for host-specific configuration and the distinction between MCP access and automatic hook capture.
+The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries.
 
-Create a full, integrity-checked snapshot with
-`supermem export --output memory.jsonl`. Restore with
-`supermem import memory.jsonl`; snapshot restore is atomic and intentionally
-requires an otherwise empty Super Mem database rather than attempting
-ambiguous record merges. Export streams directly to stdout or a private file;
-the current import API still buffers the complete snapshot in memory.
+## Integrations
 
-Keep the database outside the repository when possible. Before a
-scope-sensitive command (`remember`, `observe`, `checkpoint`, or `recall`), a
-hook, or MCP opens SQLite, Unix builds accept a database inside the worktree
-only when all four possible paths (the main file plus `-wal`, `-shm`, and
-`-journal`) are untracked, Git-ignored, and free of symbolic links or multiple
-hard links. These paths also reject `..`; pass a canonical path instead. V0.1
-requires repository-local databases to be moved outside the worktree on
-non-Unix platforms because safe hard-link verification is unavailable.
-The non-scoped `init`, `inspect`, `feedback`, `retract`, `status`, `doctor`,
-`export`, `import`, and `purge` commands intentionally do not apply this
-Git-applicability guard.
+Reference adapters are included in [adapters/](adapters/). They currently install from a checkout; their npm packages are not published.
 
-## MCP surface
+| Harness | Explicit access | Automatic capture | Included adapter |
+| --- | --- | --- | --- |
+| Codex | MCP | Command hooks | Plugin manifest and hook configuration |
+| Claude Code | MCP | Command hooks | Project MCP and hook configuration |
+| OpenCode | MCP | TypeScript plugin | Source plugin and project configuration |
+| Pi | CLI management | Native extension | Source extension package |
+| Generic client | MCP | Host-dependent | Stdio configuration |
 
-The model-facing surface is deliberately small so tool schemas do not consume unnecessary context:
+Automatic capture is fail-open: a memory error must not stop the coding session. See [Harness integrations](docs/integrations.md) for installation details and the events captured by each adapter.
+
+## How recall works
+
+1. Harness events and explicit records are validated, redacted, and appended to SQLite.
+2. Queryable records keep their source events, outcome, scope, and revision history.
+3. Hard namespace, workspace, repository, lifecycle, and time filters run before channel limits.
+4. Exact, lexical, diagnostic, entity, artifact, and recency channels produce candidates.
+5. Git applicability, feedback, evidence quality, and redundancy affect ranking.
+6. Selected records are rendered as untrusted evidence under the requested budget.
+
+SQLite rows are canonical. FTS and lookup indexes are rebuildable projections. Recall does not depend on network access or an embedding model.
+
+## MCP tools
+
+The model-facing surface has four tools:
 
 | Tool | Purpose |
 | --- | --- |
-| `memory_context` | Build a scoped, budgeted evidence packet for the current task. |
-| `memory_feedback` | Attach an observed result or user judgment to prior memory. |
-| `memory_manage` | Inspect or retract a memory. Status and physical purge are restricted to the human-facing CLI. |
-| `memory_record` | Record a typed memory, task checkpoint, or source observation. |
+| **memory_context** | Recall a scoped context packet for the current task. |
+| **memory_record** | Store a typed memory, observation, or checkpoint. |
+| **memory_feedback** | Attach an observed result or judgment to a memory. |
+| **memory_manage** | Inspect or retract a memory. |
 
-Automatic capture should use deterministic harness hooks rather than relying on the model to remember to call a tool.
-Namespace, workspace, root, and repository identity are pinned by the trusted
-MCP launch command and never accepted from model tool arguments. The server
-rediscovers current Git state from the pinned root on every call.
+Database status, import/export, and physical purge remain CLI operations.
 
-## Lossless performance design
+## Data and safety
 
-SQLite remains the canonical event and revision store. Recall batches the
-canonical rows and their evidence instead of issuing per-memory queries. Its
-contentless FTS5 table is a rebuildable projection, and static hot-path SQL
-uses a bounded prepared-statement cache. Eligibility is applied before channel
-limits, and every tied collector, scorer, and diversity-selection step has an
-explicit deterministic order.
-These optimizations do not lower candidate limits, omit evidence, weaken
-durability, or approximate similarity. Snapshot tests compare canonical rows,
-floating-point bit patterns, and integrity footers across export and restore.
+The default store is local, plaintext SQLite. New files use restrictive permissions where the platform supports them. Treat the store like source code or terminal history.
 
-The OpenCode and Pi adapters preserve the existing UTF-8-safe lifecycle cap
-while scanning oversized messages without materializing an array of every
-Unicode code point. The cap and its truncation marker are data-minimization
-policy, not a performance shortcut introduced by this optimization.
+- With the default configuration, common credential patterns are redacted before storage. Redaction is not a guarantee.
+- Recalled content is labeled as untrusted evidence, never promoted to instructions.
+- Repository and workspace filters are applied before ranking.
+- Automatic capture is capped and uses stdin rather than command arguments for captured text.
+- Full snapshots are integrity-checked. Import is atomic and requires an otherwise empty store.
 
-## How it differs from generic vector memory
+Keep the database outside the Git worktree unless there is a specific reason not to. Repository-local paths have additional platform and link-safety restrictions. Read [Security and privacy](docs/privacy-and-threat-model.md) before enabling automatic capture.
 
-This is a difference in data model, not a claim that one approach wins every workload.
+Create or restore a snapshot with:
 
-| Concern | Generic chunk/vector memory | `super-mem` design |
-| --- | --- | --- |
-| Stored unit | Text chunk or summary | Evidence event plus derived claim, decision, episode, or procedure |
-| Retrieval | Primarily semantic similarity | Scope and Git applicability first; exact and lexical retrieval; optional semantic retrieval later |
-| Updates | New chunk, overwrite, or delete | Explicit supersession, contest, retraction, and historical view |
-| Repository state | Usually metadata or a filter | Commit DAG, branch, dirty patch, path, and symbol applicability |
-| Failed work | Often indistinguishable from useful text | Outcome-labeled failed attempt or known failure |
-| Provenance | Document/chunk reference | Event, tool result, patch, diagnostic, and Git source reference |
-| Context output | Ranked snippets | Budgeted sections for current facts, procedures, failures, conflicts, and evidence |
+~~~sh
+supermem export --output memory.jsonl
+supermem import memory.jsonl
+~~~
 
-Vector search remains useful for paraphrases. It is not sufficient by itself for exact diagnostics, branch validity, contradictions, or outcome-aware experience.
+## Development
 
-## Privacy and safety
+Run the full local checks with:
 
-The intended default is local storage with no telemetry and no remote model requirement. Local-first does not automatically make captured data safe: tool output can contain credentials, private source, or malicious instructions.
+~~~sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
+~~~
 
-The design therefore requires:
+Changes to retrieval, scoping, snapshots, or performance need a focused regression test. Performance claims need a reproducible workload and hardware description.
 
-- Secret and sensitive-path filtering before durable storage.
-- Repository and identity scoping before retrieval, not after ranking.
-- Memory content treated as untrusted evidence, never as executable instruction.
-- User-visible provenance and controls for inspection, export, retraction, and supported-platform full-store purge. V0.1 conservatively refuses purge on Windows because stable Rust cannot verify hard-link counts.
-- No collection of hidden model reasoning.
-
-Read the full [privacy and threat model](docs/privacy-and-threat-model.md) before enabling automatic capture.
-
-## Evaluation
-
-Quality is evaluated at fixed context budgets, with separate measurements for retrieval, stale-memory handling, supersession, evidence coverage, and downstream task outcomes. Latency and memory use are reported separately from quality.
-
-The repository includes a small labeled [evaluation fixture](fixtures/eval/v1.jsonl) covering:
-
-- Supersession.
-- Failed attempts.
-- Repository isolation.
-- Branch divergence.
-- Stale artifacts.
-- Exact error recall.
-
-See [Evaluation methodology](docs/evaluation.md) and [benchmark notes](benches/README.md). Published results must include the commit, corpus, hardware, model, prompt, budget, and comparison configuration needed to reproduce them.
-
-## Documentation
-
-- [Architecture](docs/architecture.md)
-- [Harness integrations](docs/integrations.md)
-- [Privacy and threat model](docs/privacy-and-threat-model.md)
-- [Evaluation methodology](docs/evaluation.md)
-- [Fixture format](fixtures/eval/README.md)
-
-## Non-goals for the first release
-
-- Replacing repository instructions or policy enforcement.
-- Storing hidden chain-of-thought.
-- Claiming causal relationships from event order alone.
-- Automatically sharing memory between unrelated repositories or users.
-- Becoming a document-ingestion platform or general personal knowledge base.
-- Supporting every programming language with deep semantic indexing on day one.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and [SUPPORT.md](SUPPORT.md) for usage questions.
 
 ## License
 

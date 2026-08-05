@@ -1,0 +1,61 @@
+name: Feature request
+description: Propose a focused improvement to super-mem.
+title: "[Feature] "
+labels:
+  - enhancement
+  - "status: needs triage"
+body:
+  - type: markdown
+    attributes:
+      value: Describe the problem first. A concrete workflow is more useful than a broad feature list.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow is difficult or impossible today, and who does it affect?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful change and how it should behave.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Primary area
+      options:
+        - Core storage or retrieval
+        - CLI
+        - MCP
+        - Harness integration
+        - Evaluation or benchmarks
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Note existing commands, workarounds, or smaller designs you considered.
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Supporting evidence
+      description: For performance or quality requests, include a reproducible workload if available.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and documentation for this request.
+          required: true

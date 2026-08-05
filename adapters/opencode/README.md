@@ -1,23 +1,19 @@
 # OpenCode adapter
 
-Install the `supermem` binary on `PATH` first. Then install
-`@super-mem/opencode` and merge `opencode.json` into the project config.
-For local development, place `src/index.ts` in `.opencode/plugins/super-mem.ts`
-and remove the package name from the `plugin` array.
+The manifest is configured for @super-mem/opencode, but the package is not published. For a checkout:
 
-The stable `chat.message` hook adds recalled memory to the per-message system
-prompt without creating a synthetic user message. One `recall --observe-prompt`
-process captures the prompt and returns context with one Git discovery.
-`session.idle` retrieves the
-last finalized assistant message through the public SDK and writes one partial
-checkpoint without a duplicate observation. Automatic prompt and assistant
-text is capped at 64 KiB before it crosses stdin. The compaction hook is
-experimental and can be removed independently.
+1. Install supermem on PATH.
+2. Copy src/index.ts to .opencode/plugins/super-mem.ts.
+3. Merge opencode.json into the project configuration and remove the unpublished package name from the plugin array.
 
-Subprocess errors and timeouts fail open. A future resident `supermem` daemon
-will be used internally by the same CLI calls; no plugin API change is planned.
+## Behavior
 
-The MCP command pins `--root . --namespace default` in `opencode.json`. Use an
-absolute trusted root when the launch directory may differ from the project,
-and add `--workspace <id>` for another hard boundary. Model tool input cannot
-change the pinned root, repository, namespace, or workspace.
+- chat.message records the prompt and recalls context in one CLI call.
+- Recalled evidence is appended to the per-message system prompt without creating a synthetic user message.
+- session.idle checkpoints the latest finalized assistant message.
+- The optional compaction hook adds recall during OpenCode's experimental compaction event.
+- Individual tool outcomes are not captured yet.
+
+The MCP command pins --root . --namespace default. Use an absolute trusted root when the launch directory may differ, and add --workspace when needed.
+
+Automatic text is capped at 64 KiB before it crosses stdin. Subprocess failures and timeouts are fail-open.

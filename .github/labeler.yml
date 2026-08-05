@@ -1,0 +1,38 @@
+"area: core":
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/super-mem-core/**
+
+"area: cli":
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/super-mem-cli/**
+
+"area: mcp":
+  - changed-files:
+      - any-glob-to-any-file:
+          - crates/super-mem-cli/src/mcp.rs
+
+"area: integrations":
+  - changed-files:
+      - any-glob-to-any-file:
+          - adapters/**
+
+"area: evaluation":
+  - changed-files:
+      - any-glob-to-any-file:
+          - benches/**
+          - fixtures/**
+          - docs/evaluation.md
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - "**/*.md"
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          - Cargo.lock
+          - "**/package.json"
+          - rust-toolchain.toml

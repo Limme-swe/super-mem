@@ -1,0 +1,36 @@
+name: Question
+description: Ask about installation, configuration, behavior, or project design.
+title: "[Question] "
+labels:
+  - question
+  - "status: needs triage"
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: Be specific about the result you are trying to achieve.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Include relevant versions, environment details, and sanitized configuration.
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Link the documentation you followed and describe the result.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the documentation and existing issues.
+          required: true
+        - label: I did not include credentials or private project data.
+          required: true

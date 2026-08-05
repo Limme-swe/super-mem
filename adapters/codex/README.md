@@ -1,24 +1,23 @@
 # Codex adapter
 
-Install the `supermem` binary first, then install this directory as a Codex
-plugin. Codex discovers `hooks/hooks.json` automatically; the MCP server is
-declared directly in the plugin manifest. Review and trust the hook definition
-when Codex prompts. For a configuration-only install, copy `hooks/hooks.json`
-to `.codex/hooks.json` and merge `config.toml` into the active Codex
-configuration. Verify hooks with `/hooks` and MCP with `codex mcp list` or
-`/mcp verbose`.
+## Install
 
-The example MCP launch pins `--root . --namespace default`. Replace `.` with an
-absolute trusted repository root when the host process working directory is not
-guaranteed. Add `--workspace <id>` when workspace isolation is required; these
-hard boundaries are never accepted from model tool arguments.
+1. Install supermem on PATH.
+2. Install this directory as a Codex plugin, or copy hooks/hooks.json to .codex/hooks.json and merge config.toml into the active Codex configuration.
+3. Review the hook commands before trusting them.
+4. Verify hooks with /hooks and MCP with codex mcp list or /mcp verbose.
 
-The hook consumes the official JSON payload on stdin. It observes prompts and
-uses each final message to create one partial checkpoint, without a duplicate
-assistant observation. Automatic text is capped at 64 KiB. `transcript_path`
-is retained as provenance only because Codex documents the transcript
-representation as unstable.
+The included MCP command uses --root . --namespace default. Use an absolute trusted root if Codex may start elsewhere, and add --workspace when separate workspaces share a repository.
 
-The current hook launches the CLI synchronously and fails open. A future local
-daemon will be hidden behind `supermem hook codex`, so this configuration will
-not need to change.
+## Captured events
+
+| Event | Action |
+| --- | --- |
+| SessionStart | Recall context. |
+| UserPromptSubmit | Record the prompt and recall context. |
+| SubagentStart | Recall a smaller context packet. |
+| Stop / SubagentStop | Create one partial checkpoint from the finalized assistant message. |
+
+The checkpoint stores the final message once; no duplicate assistant observation is written. transcript_path is provenance only because Codex does not guarantee its format.
+
+Automatic text is capped at 64 KiB. Hook failures are fail-open.

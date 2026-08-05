@@ -1,0 +1,78 @@
+name: Integration issue
+description: Report a compatibility problem with a supported coding-agent harness.
+title: "[Integration] "
+labels:
+  - "area: integrations"
+  - "status: needs triage"
+body:
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Harness
+      options:
+        - Codex
+        - Claude Code
+        - OpenCode
+        - Pi
+        - Other MCP client
+    validations:
+      required: true
+
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: Include the harness version and `supermem --version` output or commit SHA.
+      placeholder: Codex ..., supermem 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system and architecture.
+      placeholder: macOS 15, arm64
+    validations:
+      required: true
+
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Sanitized configuration
+      description: Include the relevant hook, plugin, extension, or MCP configuration without secrets or private paths.
+      render: text
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction and observed behavior
+      description: Describe the smallest sequence that reproduces the problem and what happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Include only the smallest useful excerpt. Redact secrets and private repository data.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this harness and behavior.
+          required: true
+        - label: The `supermem` binary is installed and available on `PATH`.
+          required: true
+        - label: I removed credentials, private paths, source, and memory content.
+          required: true

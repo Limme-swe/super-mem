@@ -1,7 +1,7 @@
 {
   "name": "@super-mem/opencode",
   "version": "0.1.0",
-  "description": "Super Mem lifecycle adapter for OpenCode",
+  "description": "super-mem lifecycle adapter for OpenCode",
   "license": "MIT",
   "repository": {
     "type": "git",

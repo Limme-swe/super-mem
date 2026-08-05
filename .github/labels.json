@@ -1,0 +1,107 @@
+[
+  {
+    "name": "bug",
+    "color": "d73a4a",
+    "description": "Something is not working as documented."
+  },
+  {
+    "name": "enhancement",
+    "color": "a2eeef",
+    "description": "New capability or meaningful improvement."
+  },
+  {
+    "name": "documentation",
+    "color": "0075ca",
+    "description": "Documentation-only change or documentation issue."
+  },
+  {
+    "name": "performance",
+    "color": "5319e7",
+    "description": "Measured runtime, memory, storage, or startup work."
+  },
+  {
+    "name": "security",
+    "color": "b60205",
+    "description": "Public security hardening only; disclose vulnerabilities privately."
+  },
+  {
+    "name": "dependencies",
+    "color": "0366d6",
+    "description": "Dependency or toolchain updates."
+  },
+  {
+    "name": "question",
+    "color": "d876e3",
+    "description": "Usage or design question."
+  },
+  {
+    "name": "breaking change",
+    "color": "d4c5f9",
+    "description": "Changes a documented interface, storage format, or integration contract."
+  },
+  {
+    "name": "area: core",
+    "color": "0e8a16",
+    "description": "Storage, retrieval, ranking, redaction, or Git applicability."
+  },
+  {
+    "name": "area: cli",
+    "color": "1d76db",
+    "description": "CLI behavior and local operator workflows."
+  },
+  {
+    "name": "area: mcp",
+    "color": "7057ff",
+    "description": "MCP server, schemas, transport, or isolation."
+  },
+  {
+    "name": "area: integrations",
+    "color": "fbca04",
+    "description": "Codex, Claude Code, OpenCode, Pi, and other adapters."
+  },
+  {
+    "name": "area: evaluation",
+    "color": "c2e0c6",
+    "description": "Fixtures, benchmarks, and reproducibility."
+  },
+  {
+    "name": "status: needs triage",
+    "color": "e4e669",
+    "description": "Awaiting maintainer review and classification."
+  },
+  {
+    "name": "status: needs reproduction",
+    "color": "f9d0c4",
+    "description": "More information or a minimal reproduction is required."
+  },
+  {
+    "name": "status: blocked",
+    "color": "000000",
+    "description": "Waiting on an external decision or dependency."
+  },
+  {
+    "name": "good first issue",
+    "color": "7057ff",
+    "description": "Small, well-scoped contribution with clear acceptance criteria."
+  },
+  {
+    "name": "help wanted",
+    "color": "008672",
+    "description": "Maintainers welcome community implementation help."
+  },
+  {
+    "name": "duplicate",
+    "color": "cfd3d7",
+    "description": "Already tracked elsewhere."
+  },
+  {
+    "name": "invalid",
+    "color": "e4e669",
+    "description": "Not actionable as filed."
+  },
+  {
+    "name": "wontfix",
+    "color": "ffffff",
+    "description": "Not planned or outside the project scope."
+  }
+]

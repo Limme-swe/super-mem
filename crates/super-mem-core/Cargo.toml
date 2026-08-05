@@ -1,6 +1,6 @@
 [package]
 name = "super-mem-core"
-description = "Evidence-first, repository-aware memory engine for coding agents"
+description = "Local Git-aware memory engine for coding agents"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

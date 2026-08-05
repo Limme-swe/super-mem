@@ -1,9 +1,8 @@
 # Benchmark notes
 
-This directory documents reproducible Rust performance work. Development
-probes live beside the private functions they measure and are paired with
-non-ignored invariant or equivalence tests. They are ignored during the
-ordinary test suite.
+Rust probes live beside measured functions. Normal tests ignore the probes but run their invariant and equivalence checks.
+
+## Available probes
 
 Run the in-process core pipeline probe with:
 
@@ -20,12 +19,11 @@ cargo test --release -p super-mem-core \
   -- --ignored --exact --nocapture --test-threads=1
 ```
 
-The selector's non-ignored equivalence test compares the complete selected ID
-and score-bit sequence across tied and pseudo-random inputs. The wider engine
-suite separately checks recall ordering, scope exclusion, snapshot parity,
-and attachment ordering, so a faster timing alone is never sufficient.
+Equivalence tests compare every selected ID and score bit on tied and pseudo-random inputs. Engine tests cover recall and attachment order, scope exclusion, and snapshot parity. All must pass after timing changes.
 
-## Required benchmark groups
+## Planned benchmark coverage
+
+The probes do not cover every production path. A complete suite should include:
 
 ### Capture
 
@@ -52,11 +50,11 @@ and attachment ordering, so a faster timing alone is never sufficient.
 - Database migration.
 - Recovery after an interrupted write.
 
-## Corpus sizes
+## Corpus design
 
-Run each relevant benchmark at multiple deterministic fixture sizes, initially 1k, 10k, and 100k events. A 1M-event run should be reported only where hardware and runtime make it practical.
+Use deterministic fixtures at 1k, 10k, and 100k events. Add a 1M-event run when practical.
 
-Synthetic generation must preserve realistic distributions for:
+Synthetic data should vary:
 
 - Event payload size.
 - Repository and branch count.
@@ -65,11 +63,11 @@ Synthetic generation must preserve realistic distributions for:
 - Tool successes and failures.
 - Sparse versus dense symbol links.
 
-Do not use a corpus consisting only of identical tiny records; it produces misleading cache and compression behavior.
+Identical tiny records are not a valid corpus.
 
 ## Reporting
 
-Criterion output or another raw machine-readable format should be retained. A summary must include:
+Retain machine-readable results. Record:
 
 - Git commit and dirty status.
 - Hardware, OS, filesystem, and storage medium.
@@ -80,6 +78,6 @@ Criterion output or another raw machine-readable format should be retained. A su
 - Median and tail latency.
 - Resident memory and database/index size where relevant.
 
-Keep local embedded-store timing separate from optional embedding or remote-model latency.
+Separate local storage from embedding or remote-model latency.
 
-See [Evaluation methodology](../docs/evaluation.md) for quality and end-to-end evaluation. Microbenchmarks establish implementation behavior; they do not establish memory quality.
+See [Evaluation](../docs/evaluation.md) for quality methods. Microbenchmarks do not measure memory quality.

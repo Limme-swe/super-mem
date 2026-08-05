@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability privately
+    url: https://github.com/Limme-swe/super-mem/security/advisories/new
+    about: Do not disclose vulnerabilities, credentials, or private repository data in a public issue.

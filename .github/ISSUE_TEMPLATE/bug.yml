@@ -1,0 +1,99 @@
+name: Bug report
+description: Report reproducible behavior that differs from the documentation.
+title: "[Bug] "
+labels:
+  - bug
+  - "status: needs triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove credentials, private source, and sensitive memory content before submitting.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Paste the output of `supermem --version`, or provide the commit SHA.
+      placeholder: supermem 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: installation
+    attributes:
+      label: Installation method
+      options:
+        - Built from source
+        - Cargo install
+        - Release binary
+        - Other
+    validations:
+      required: true
+
+  - type: dropdown
+    id: harness
+    attributes:
+      label: Client or harness
+      options:
+        - Standalone CLI
+        - MCP client
+        - Codex
+        - Claude Code
+        - OpenCode
+        - Pi
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system, architecture, and any relevant harness version.
+      placeholder: Ubuntu 24.04, x86_64, Codex ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: List the smallest sequence of commands or actions that reproduces the problem.
+      placeholder: |
+        1. Run ...
+        2. Record ...
+        3. Recall ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant output
+      description: Include only the smallest useful excerpt. Redact secrets and private repository data.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed credentials, private source, and sensitive memory content.
+          required: true

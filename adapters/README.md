@@ -1,30 +1,35 @@
 # Harness adapters
 
-All adapters require the `supermem` binary to be installed and available on
-`PATH`. Until release binaries are published, build it from the repository
-root with `cargo install --path crates/super-mem-cli --locked`.
+The reference adapters connect harness lifecycle events to the same Rust core. Install the supermem binary first:
 
-These adapters keep automatic memory capture and recall close to each harness's
-native lifecycle while sharing the `supermem` Rust binary.
+~~~sh
+cargo install --path crates/super-mem-cli --locked
+~~~
 
-| Harness | Automatic path | Explicit tools |
-| --- | --- | --- |
-| Codex | command hooks | MCP over stdio |
-| Claude Code | command hooks | MCP over stdio |
-| OpenCode | TypeScript plugin events | MCP over stdio |
-| Pi | native TypeScript extension | native extension commands |
+Packages and release binaries are not published yet. Use the files in this directory from a checkout.
 
-The MVP starts a short-lived `supermem` process for each hook or plugin event.
-The CLI boundary is deliberately stable: a future resident daemon can be added
-behind the same commands (Unix socket on Unix, named pipe on Windows) without
-changing any harness configuration. Adapters must fail open: memory being
-unavailable must never prevent the coding agent from continuing.
+| Harness | Automatic capture | Explicit access | Guide |
+| --- | --- | --- | --- |
+| Codex | Command hooks | MCP | [Codex](codex/README.md) |
+| Claude Code | Command hooks | MCP | [Claude Code](claude/README.md) |
+| OpenCode | TypeScript plugin | MCP | [OpenCode](opencode/README.md) |
+| Pi | Native extension | CLI | [Pi](pi/README.md) |
 
-`supermem mcp` reserves stdout for JSON-RPC. Hooks likewise emit only the JSON
-object required by the host on stdout; diagnostics go to stderr.
+## Shared behavior
 
-MCP isolation is pinned by the trusted launch command, for example
-`supermem mcp --root /path/to/repo --namespace default --workspace team-a`.
-The server rediscovers Git state from that root on every call. Model-facing
-schemas expose only an optional session ID; they cannot select a namespace,
-working directory, repository, or workspace.
+- Captured text is sent through stdin, not command arguments.
+- Automatic prompt, assistant, and compaction text is capped at 64 KiB.
+- Stable content-sensitive keys deduplicate identical hook retries.
+- Hook and plugin failures are fail-open.
+- stdout is reserved for the host protocol; diagnostics go to stderr.
+- Storage, scoping, ranking, and redaction remain in the Rust core.
+
+For MCP, the trusted launch command pins the root, namespace, and optional workspace:
+
+~~~sh
+supermem mcp --root /path/to/repo --namespace default --workspace team-a
+~~~
+
+Model-facing schemas cannot select another root, repository, namespace, or workspace. The server rediscovers current Git state from the pinned root on each call.
+
+See [Harness integrations](../docs/integrations.md) for the event matrix and [Security and privacy](../docs/privacy-and-threat-model.md) before enabling automatic capture.

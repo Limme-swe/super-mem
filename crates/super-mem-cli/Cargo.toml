@@ -1,6 +1,6 @@
 [package]
 name = "super-mem"
-description = "Local evidence memory and MCP server for coding agents"
+description = "Local Git-aware memory CLI and MCP server for coding agents"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,264 +1,160 @@
 # Architecture
 
-This document defines the intended architecture of `super-mem`. It distinguishes durable evidence from derived memory and makes repository applicability part of retrieval.
+super-mem stores append-only events, builds searchable records, and filters recall by namespace, workspace, repository, and Git state. Future work is labeled explicitly.
 
-## System boundaries
+## Components
 
-The system has four layers:
+| Layer | Responsibility |
+| --- | --- |
+| Capture adapters | Translate harness lifecycle events into a shared envelope. |
+| Core memory | Validate, redact, store, and derive records. |
+| Retrieval | Filter, rank, and assemble context within a budget. |
+| Interfaces | Expose the core through the `supermem` CLI and MCP server. |
 
-1. **Capture adapters** translate harness lifecycle events into a shared event envelope.
-2. **Core memory** validates, redacts, stores, and derives memory records.
-3. **Retrieval and context assembly** filter and rank evidence for a query and budget.
-4. **Interfaces** expose the core through the `supermem` CLI and MCP.
+Scoping, conflicts, ranking, and persistence stay in the Rust core so adapters behave consistently.
 
-Harness adapters should remain thin. Memory semantics, scoping, conflict handling, and ranking belong in the Rust core so behavior does not drift between clients.
+## Canonical data
 
-## Source of truth
-
-The authoritative layer is an append-only sequence of observable events. A durable event includes:
+Canonical state is stored across several SQLite tables. Immutable source observations use the Rust `Event` type:
 
 | Field | Meaning |
 | --- | --- |
-| `event_id` | Stable content or event identifier. |
-| `recorded_at` | When `super-mem` accepted the event. |
-| `observed_at` | When the represented action or statement occurred, if known. |
-| `actor` | User, agent, tool, hook, or importer. |
-| `session` / `turn` | Explicit harness identifiers; never inferred from a transport connection. |
-| `scope` | Identity, organization, workspace, repository, branch, path, and symbol constraints. |
-| `repo_state` | Repository identity, HEAD/tree, branch, and dirty-patch digest. |
-| `kind` | Prompt, tool call, tool result, patch, validation, correction, decision, or annotation. |
-| `payload` | Redacted observable content or a reference to it. |
-| `provenance` | Original harness, file, Git object, tool call, or import reference. |
-| `integrity` | Digest of normalized content and relevant metadata. |
+| `seq` | Database sequence number. |
+| `event_id` | Stable event ID. |
+| `kind` | `EventKind`: conversation turn, tool call/result, command result, file change, verification, explicit memory, checkpoint, manual note, or lifecycle event. |
+| `scope` | Namespace plus optional workspace, repository, and session IDs. |
+| `content` | Redacted source text. |
+| `attributes` | Structured redacted metadata. |
+| `trust` | `External`, `Agent`, `ToolVerified`, or `UserConfirmed`. |
+| `occurred_at` | Time reported by the source. |
+| `ingested_at` | Time committed by super-mem. |
+| `redaction_count` | Number of redacted secret-shaped values. |
 
-Search indexes and active-state tables are projections. A damaged or incompatible projection should be rebuildable from accepted events.
+When `scope.repository` is present, `RepositoryContext` contains:
 
-## Derived record types
+| Field | Meaning |
+| --- | --- |
+| `repo_id` | Stable identity supplied by the adapter. |
+| `root` | Optional normalized local root, used as metadata. |
+| `common_dir` | Git common directory for worktrees and submodules. |
+| `branch` | Current branch. |
+| `head_oid` | Current commit ID. |
+| `remote` | Normalized remote URL or opaque caller-supplied identity. |
+| `dirty_hash` | Fingerprint of tracked and untracked changes. |
 
-### Claims
+Canonical snapshot state includes events, memory heads and revisions, evidence, tags, entities, artifacts, links, event-memory mappings, feedback, and idempotency records. Only contentless FTS and ordinary SQLite indexes are derived and rebuilt on import; events alone cannot reconstruct the current tables.
 
-A claim is a queryable proposition derived from one or more events. It carries:
+## Memory kinds
 
-- Kind: fact, preference, constraint, state, plan, or relationship.
-- Confidence and authority class.
-- Supporting and contradicting evidence IDs.
-- Valid-time and recorded-time intervals.
-- Scope and Git applicability.
-- Lifecycle state: active, contested, superseded, or retracted. Git applicability is classified separately.
+`MemoryKind` has nine values:
 
-An extractor may propose a claim; it cannot erase source evidence.
+| Kind | Meaning |
+| --- | --- |
+| `Fact` | Potentially verifiable proposition. |
+| `Preference` | User or team preference. |
+| `Constraint` | Requirement or invariant. |
+| `Decision` | Choice and rationale. |
+| `Procedure` | Reusable method. |
+| `Episode` | Task or session summary. |
+| `Outcome` | Successful, failed, or partial attempt. |
+| `Task` | Work that remains. |
+| `Observation` | Low-level observation from the event stream. |
 
-### Decisions
+Each memory head is `Active`, `Contested`, `Superseded`, or `Retracted` and points to its current revision. Revisions can attach event spans, artifacts, entities, and tags; memories can link to other memories. Writing a memory cannot erase its source event. Reference adapters do not request or capture hidden model reasoning.
 
-A decision records the selected option, explicit rationale, constraints, alternatives when available, affected repository entities, and subsequent outcome evidence. Only user-visible rationale or an explicit annotation is retained.
+## Repository applicability
 
-### Episodes
+Built-in Git discovery hashes a normalized non-local `origin` remote when available. For a local or missing remote, it hashes the native bytes of the canonical common Git directory, falling back to the repository root. Linked worktrees share the common-directory identity. `RepositoryContext` also carries root/common directory, branch, HEAD, remote, and dirty-worktree state; artifact references add path, symbol, content hash, Git object ID, and language.
 
-An episode represents an attempted task:
-
-- Task description and starting repository state.
-- Observable tools and commands.
-- Patches and affected symbols.
-- Diagnostics and failures.
-- Validation evidence.
-- Final status and explicit feedback.
-
-An episode is not automatically a reusable procedure.
-
-### Procedures and known failures
-
-A procedure is a parameterized action pattern with preconditions, expected observations, postconditions, and supporting episodes. A known failure records an action pattern, the conditions under which it failed, and the observed failure signature.
-
-Promotion should be conservative. A single apparently successful episode remains an episode unless a user approves it or compatible evidence repeats it.
-
-## Repository identity and applicability
-
-Chronological recency is insufficient for source code. Applicability is evaluated against Git state.
-
-An implementation should capture:
-
-- A repository identity independent of the local checkout path.
-- HEAD commit and tree OIDs.
-- Current branch when meaningful.
-- A digest of tracked and relevant untracked changes.
-- Path and stable symbol references where available.
-
-For a memory `m` and current repository state `r`, retrieval classifies applicability:
+Recall assigns one applicability class:
 
 | Class | Meaning |
 | --- | --- |
-| `exact` | Same repository state and relevant patch state. |
-| `compatible` | The source commit is in the current lineage and linked artifacts remain compatible. |
-| `stale` | A linked file or symbol changed enough that the conclusion requires revalidation. |
-| `divergent` | The memory belongs to another branch lineage. It may be useful as history, not current truth. |
-| `unversioned` | The memory is intentionally repository-independent or lacks version evidence. |
-| `inapplicable` | The namespace or repository differs. This is a hard exclusion before ranking. |
+| `exact` | No dirty-state mismatch, plus the same commit or a matching artifact content hash. |
+| `compatible` | Stored commit is an ancestor of the current commit. |
+| `stale` | Dirty state differs or a matching artifact's content hash changed. |
+| `divergent` | Stored commit is a descendant, Git history diverged, or branch names differ without commit data. |
+| `unversioned` | Repository or Git data is insufficient for classification. |
+| `inapplicable` | Namespace, required workspace, or repository scope is incompatible; excluded before ranking. |
 
-Two branch-specific claims may both be valid. Divergence is not itself contradiction.
+Divergent memories can both be valid. Artifact comparison matches repository ID, path, and optional symbol before comparing content hashes. Language-aware symbol identity and rename remapping are future work.
 
-Paths are weak identities. When language support is available, a symbol reference should combine language, qualified name, signature digest, syntax digest, file path, and source commit. Rename and diff evidence may remap it; uncertain remapping must lower confidence rather than silently attach a memory to the wrong symbol.
+## Lifecycle links, trust, and removal
 
-## Conflict resolution
+Lifecycle changes are explicit. A `supersedes` link marks its target superseded. A `contests` link marks both source and active target contested. A same-kind revision of a contested head returns it to active unless the revision adds another contest. There is no automatic promotion or domain-specific conflict resolver.
 
-Conflict handling is domain-specific:
+Trust is a ranking factor, not proof of truth: `External`, `Agent`, `ToolVerified`, and `UserConfirmed` receive increasing weights. Supersession and retraction preserve history; retracted memories are excluded from normal recall.
 
-- For a user preference, an explicit user correction has the highest authority.
-- For a code-state claim, an observation from the current checkout or validation at the matching commit outranks an inference.
-- For a project decision, checked-in documentation or an explicitly accepted decision may outrank an agent summary.
+On Unix, `purge --yes` removes the database, WAL, and shared-memory sidecars after rejecting symlinks and multiple hard links. Stop all database users first; SQLite cannot portably identify idle open handles. v0.1 refuses Windows purge because stable Rust cannot verify hard-link counts without prohibited unsafe FFI. Item-level physical erasure is unavailable.
 
-The resolver may create a `supersedes` edge when authority, scope, and chronology make the relationship unambiguous. Otherwise it marks a contested set. The context assembler should surface an unresolved conflict rather than selecting a convenient winner.
-
-Retraction and supersession differ. Supersession preserves a newer current revision; retraction removes a memory from ordinary retrieval while retaining its audit history. On Unix, the current `purge --yes` CLI operation deletes the database and its WAL and shared-memory sidecars after refusing symbolic links and paths with multiple hard links. V0.1 refuses purge on Windows because stable Rust does not expose the hard-link count and the workspace forbids unsafe platform FFI. All processes using the database must be stopped first because SQLite cannot portably detect idle open handles. Item-level erasure is not part of the initial interface.
-
-## Capture pipeline
+## Capture
 
 ```text
 harness event
     -> envelope validation
     -> scope resolution
-    -> secret/path redaction
-    -> durable event append
-    -> deterministic extraction
-    -> active-view update
-    -> lexical index update
-    -> optional background enrichment
+    -> secret redaction
+    -> transactional event insert
+    -> optional checkpoint or memory revision
+    -> lexical index update when memory changes
 ```
 
-The hook path must stay bounded. Expensive embedding, model-assisted extraction, and consolidation belong off the synchronous path. Backpressure must be explicit; silently dropping capture events produces false confidence in memory completeness.
+Automatic hook capture is capped at 64 KiB. Oversized UTF-8 input keeps its head and tail with an explicit middle-omitted marker. Hook failures fail open so the coding session continues. The Rust hook prints errors to stderr, but the OpenCode and Pi adapters discard that stream, so diagnostics are not always visible.
 
-Large tool output should be truncated using a documented head/tail or diagnostic-preserving policy. Store a digest and artifact reference so truncation is visible.
+Future embeddings, model extraction, and consolidation must stay outside the critical path. Exact and lexical retrieval must continue without models, downloads, or network access.
 
-## Query pipeline
+## Recall
 
-### 1. Establish scope
+Recall runs in four stages:
 
-Resolve the caller identity, repository, branch/worktree state, session, and requested historical/current view. Access-control and repository filters happen before candidate ranking.
+1. **Scope:** resolve identity, repository, branch/worktree, session, and current or historical view. Access filters run before ranking.
+2. **Candidates:** combine exact IDs and diagnostics, lexical FTS, and structured lookups. Scope, lifecycle, kind, and time predicates run before channel limits so ineligible rows cannot crowd out eligible ones. IDs and attachments hydrate in bounded batches.
+3. **Ranking:** fuse exact text, error fingerprint, verified artifact, lexical, sparse identifier/artifact, entity, and recency signals. The score also applies importance, confidence, lifecycle state, age, trust, Git applicability, and feedback utility before diversity selection.
+4. **Assembly:** select within budget and emit `constraints_and_preferences`, `decisions`, `attempts_and_outcomes`, `procedures`, `open_tasks`, and `relevant_history`. Warnings cover stale, divergent, and contested records. Items retain applicability, reasons, token estimates, and citations.
 
-### 2. Generate candidates
+Fusion and diversity selection are totally ordered by score and memory ID. Incremental maximum-redundancy updates are exactly equivalent to full recomputation while reducing broad MMR selection from quadratic-in-output to linear-in-output work per candidate.
 
-The initial implementation can combine:
+Embeddings and graph expansion are possible future channels, not replacements for exact and lexical retrieval.
 
-- Exact IDs, identifiers, and normalized error signatures.
-- Lexical full-text retrieval.
-- Structured lookups for active claims, linked symbols, decisions, outcomes, and time.
+## Persistence and invariants
 
-Semantic embeddings and graph expansion can be added as independent candidate channels. The lexical/exact path must remain functional without an embedding model or network access.
+SQLite stores canonical events, revisions, evidence, links, and feedback. Contentless FTS5 is rebuildable; hot statements use a bounded prepared cache, and related rows load in batches.
 
-All hard scope, lifecycle, kind, and temporal eligibility predicates are part
-of each candidate query before that channel's limit. A high-ranked ineligible
-row therefore cannot crowd out a lower-ranked eligible row. Candidate IDs are
-then hydrated in bounded batches together with tags, entities, artifacts,
-evidence, and feedback; the engine does not issue an attachment query per
-candidate.
+Schema v2 added contentless FTS and entity/artifact indexes. Schema v3 made canonical lookup workspace-aware and indexed scope-partitioned attachments. Entity display and artifact language metadata are partitioned by scope, so workspaces cannot overwrite each other's attachments. Canonical columns did not change: lossless snapshots remain schema v1, and derived indexes are never snapshot truth.
 
-### 3. Rank applicability and utility
+Artifact and dirty-state checks precede Git history traversal. Commit-DAG queries are lazy and cached per recall by root and stored/current object-ID tuple.
 
-Ranking features may include:
+Enforced invariants:
 
-- Exact diagnostic or symbol match.
-- Lexical relevance.
-- Repository and Git applicability.
-- Temporal validity.
-- Evidence authority and confidence.
-- Episode outcome.
-- Procedure precondition match.
-- Redundancy and contradiction penalties.
+- Derived records cannot point to missing evidence.
+- Reprocessing a stable harness event is idempotent.
+- Concurrent subagents remain inside their resolved scope.
+- Schema migrations are explicit; export and backup provide the recovery path.
+- Export, empty-target import, and re-export preserve canonical SQLite scalar values, including exact floating-point bit patterns and the snapshot integrity footer. Import restores atomically and rebuilds FTS.
 
-Weights are configuration backed by evaluation; they are not product claims.
+SQLite uses WAL. The default `Balanced` mode sets `synchronous=NORMAL`: transactions survive process crashes, but the latest acknowledged commit can be lost after power loss. `Durable` mode sets `synchronous=FULL` and fsyncs every acknowledged commit.
 
-### 4. Assemble context
+The database is not a security boundary; see the [privacy and threat model](privacy-and-threat-model.md).
 
-Selection is constrained by an explicit budget and should maximize marginal evidence coverage rather than append every top result. The current structured result groups records into stable sections:
+The default database is outside the worktree. On Unix, scope-sensitive commands, hooks, and MCP allow a repository-local database only when its main file and possible `-wal`, `-shm`, and `-journal` sidecars are untracked and ignored. Raw and resolved paths reject `..`, symlink components, multiple hard links, and tracked aliases. Non-Unix v0.1 rejects repository-local databases for these operations because hard-link aliases cannot be verified. The non-scoped `init`, `inspect`, `feedback`, `retract`, `status`, `doctor`, `export`, `import`, and `purge` commands skip this Git-applicability guard.
 
-1. `constraints_and_preferences`.
-2. `decisions`.
-3. `attempts_and_outcomes`.
-4. `procedures`.
-5. `open_tasks`.
-6. `relevant_history`.
+## MCP server
 
-Stale, divergent, and contested records also produce explicit warnings. Structured items retain applicability, reason codes, token estimates, and evidence citations.
+The server uses the [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). Trusted stdio launch pins root, namespace, and optional workspace; every call rebuilds Git scope. MCP revision 2026-07-28 is stateless, so a model session ID is provenance, not a security boundary.
 
-Derived entries should include at least one primary evidence reference. When confidence is low, prefer a compact source excerpt over an unsupported summary.
+The model-facing tools are:
 
-Fusion and diversity selection are total-ordered by score and memory ID.
-Maximum redundancy is updated incrementally after each selected item, which is
-equivalent to recomputing the maximum against the complete selected set but
-reduces broad MMR selection from quadratic-in-output work to linear-in-output
-work per candidate.
+- `memory_context`: scoped recall under a token budget.
+- `memory_feedback`: retrieval feedback tied to a memory and optional query.
+- `memory_manage`: inspect or retract; status and purge remain CLI-only.
+- `memory_record`: record a memory, checkpoint, or observation.
 
-## Persistence and consistency
+Tools return compact text blocks and JSON-text receipts. `ContextPack` retains hits, applicability, reasons, and citations for CLI JSON and future structured MCP output. Deterministic schemas reject unknown fields and omit namespace, working directory, repository, and workspace, preventing model calls from spoofing scope.
 
-The initial workspace uses an embedded SQLite store. Accepted events,
-revisions, evidence, links, and feedback are canonical SQLite rows. FTS is a
-contentless, rebuildable projection so searchable text is not duplicated in a
-second durable copy. Static hot-path statements use a bounded prepared cache,
-and related rows are loaded in batches. Database schema v2 adds the derived FTS
-layout and selective entity/artifact indexes. Schema v3 makes canonical-key
-lookup explicitly workspace-aware and adds entity lookup indexes for
-scope-partitioned attachment rows. New writes partition entity display and
-artifact language metadata by durable scope so one workspace cannot overwrite
-another's attachments. Neither migration changes canonical table columns, so
-the lossless snapshot schema remains version 1; derived indexes are never
-snapshot truth.
-
-Repository applicability first performs artifact and dirty-state checks that
-can decide exactness or staleness without Git history traversal. Commit-DAG
-queries are lazy and cached by repository root plus stored/current OID tuple
-for the duration of recall.
-
-Important invariants:
-
-- An acknowledged event is durable or the caller receives an error.
-- A derived record never points to nonexistent evidence.
-- A projection records which event generation it covers.
-- Reprocessing the same stable harness event is idempotent.
-- Concurrent subagents cannot escape their resolved scope.
-- Schema migration is explicit and reversible through export or backup.
-- Export/import preserves canonical SQLite scalar values, including exact
-  floating-point bit patterns, and rebuilds derived FTS after an atomic restore.
-
-The database is not the security boundary. File permissions, identity resolution, encryption choices, host process permissions, and retrieval filtering all matter.
-
-The recommended database location is outside the Git worktree. Before a
-scope-sensitive command, hook, or MCP operation opens SQLite, Unix builds
-permit a repository-local database only when the main file and all three
-possible SQLite sidecars are untracked and ignored. Raw and resolved paths are
-both checked; symbolic-link components, multiple hard links, tracked aliases,
-and `..` components are rejected. Non-Unix v0.1 builds reject repository-local
-databases on these paths because the implementation cannot verify hard-link
-aliases safely. This prevents the store itself from changing the Git state used
-to classify its memories. The CLI's non-scoped `init`, `inspect`, `feedback`,
-`retract`, `status`, `doctor`, `export`, `import`, and `purge` commands
-intentionally do not apply this Git-applicability guard.
-
-## MCP shape
-
-Use the official [Rust MCP SDK](https://github.com/modelcontextprotocol/rust-sdk). The trusted stdio launch pins a canonical root, namespace, and optional workspace. The server rebuilds current Git scope from that root on every call. The 2026-07-28 MCP revision is stateless and removes protocol-level sessions; the model may supply only an optional session provenance value, never a hard isolation boundary.
-
-The public model-facing surface should remain small:
-
-- `memory_context`: scoped recall under an explicit token budget.
-- `memory_feedback`: retrieval-quality feedback tied to a memory and optional query.
-- `memory_manage`: `inspect` or `retract`; status and database purge remain CLI-only.
-- `memory_record`: `record`, `checkpoint`, or `observation` mode.
-
-The initial MCP surface returns compact text content blocks; record and management operations serialize their receipts as JSON text. The core `ContextPack` retains structured hits, applicability, reason codes, and citations for CLI JSON output and future structured MCP content. Tool order and schemas are deterministic to help client prompt caching.
-Tool schemas intentionally omit namespace, working directory, repository, and
-workspace fields, and reject unknown fields so a caller cannot spoof them.
-
-## Deliberate limitations
+## Limitations
 
 - Event order establishes `followed_by`, not causation.
-- A green test is positive evidence, not proof that a change is correct.
+- A passing test is evidence, not proof that a change is correct.
 - Repository-independent memories require explicit scope.
-- Deep symbol identity is language-dependent and must fall back safely.
-- Automatic extraction can be wrong; inspection and correction are core operations.
-
-## Related evidence
-
-- [SWE-ContextBench](https://arxiv.org/abs/2602.08316): selected prior coding context can help; incorrect context can hurt.
-- [LongMemEval-V2](https://arxiv.org/abs/2605.12493): agent memory must retain state, workflows, environment gotchas, and premise awareness from trajectories.
-- [MemoryAgentBench](https://arxiv.org/abs/2507.05257): evaluates retrieval, test-time learning, long-range understanding, and selective forgetting.
-- [Memora](https://arxiv.org/abs/2604.20006): exposes obsolete-memory failures under repeated mutation.
-- [MemMachine](https://arxiv.org/abs/2604.04853): motivates preserving raw episodic ground truth beneath optimized retrieval.
+- Deep symbol identity remains language-dependent and must fall back safely.
+- Extraction can be wrong; inspection, feedback, correction, and retraction remain necessary.

@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "description": "Evidence-first, Git-aware local memory for Codex",
   "author": {
-    "name": "Liam",
-    "url": "https://github.com/Limme-swe"
+    "name": "super-mem contributors",
+    "url": "https://github.com/Limme-swe/super-mem"
   },
   "homepage": "https://github.com/Limme-swe/super-mem",
   "repository": "https://github.com/Limme-swe/super-mem",
@@ -20,7 +20,7 @@
     "displayName": "Super Mem",
     "shortDescription": "Repository-aware memory for coding agents.",
     "longDescription": "Recall evidence-backed decisions, outcomes, and procedures that still fit the current Git state.",
-    "developerName": "Liam",
+    "developerName": "super-mem contributors",
     "category": "Developer Tools",
     "capabilities": ["Read", "Write"],
     "defaultPrompt": "Recall relevant repository decisions and failed attempts before I start."

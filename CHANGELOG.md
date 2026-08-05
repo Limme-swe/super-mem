@@ -1,27 +1,27 @@
 # Changelog
 
-All notable changes will be documented here. The project follows Semantic Versioning after the first
-stable release.
+Notable changes are recorded here. Semantic Versioning begins with the first stable release.
 
 ## [Unreleased]
 
-- Initial evidence-first, Git-aware memory engine.
-- SQLite/FTS5 local store, context compiler, CLI, MCP server, and harness adapters.
-- Batch candidate hydration, feedback, evidence, entity, artifact, and tag reads while preserving
-  complete provenance and deterministic ordering.
-- Replace duplicate FTS payload storage with a rebuildable contentless FTS5 projection and add
-  selective entity/artifact indexes through an atomic schema migration.
-- Make broad diversity selection incremental without changing its selected IDs, scores, or order;
-  apply lifecycle, temporal, kind, and scope eligibility before per-channel limits.
-- Preserve snapshot floating-point values bit-for-bit, keep the canonical snapshot format compatible
-  across the derived-index migration, and total-order tied retrieval results.
-- Make workspace identity part of canonical identity, idempotency, explicit revision, evidence, and
-  memory-link isolation; partition attachment metadata by durable scope so another workspace cannot
-  overwrite it. Schema v3 adds the supporting lookup indexes while the snapshot schema remains v1.
-- Reduce one-shot CLI and hook startup overhead, move blocking MCP operations off the async
-  transport thread, and avoid whole-message Unicode copies in the OpenCode and Pi adapters.
-- Derive automatic capture idempotency keys from bounded, domain-separated, length-framed tuples so
-  long host identifiers and delimiter characters cannot collide or exceed the core key limit.
-- Harden repository identity for native-byte and newline-ending paths, and reject scope-sensitive
-  use of repository-local databases that could mutate tracked Git state through non-ignored files,
-  links, or aliases.
+### Added
+
+- Local SQLite/FTS5 memory engine, context compiler, CLI, MCP server, and harness adapters.
+- Lossless snapshot export and atomic empty-store import.
+
+### Changed
+
+- Batch candidate, feedback, evidence, entity, artifact, and tag hydration while preserving provenance and deterministic order.
+- Contentless, rebuildable FTS5 projection and selective entity/artifact indexes through atomic schema migration.
+- Incremental diversity selection with the same IDs, scores, and order; scope, lifecycle, kind, and time eligibility now run before channel limits.
+- Workspace-aware canonical identity, idempotency, revisions, evidence, links, and attachment metadata. Database schema v3 retains snapshot schema v1.
+- Snapshot round trips preserve canonical rows, floating-point bits, integrity footers, and tied result order.
+
+### Performance
+
+- Lower CLI and hook startup cost, blocking MCP work moved off the transport thread, and bounded-memory Unicode handling in the OpenCode and Pi adapters.
+
+### Security
+
+- Bounded, domain-separated, length-framed automatic idempotency keys.
+- Native-byte and trailing-newline repository identity handling; scope-sensitive commands reject repository-local database paths that could alter tracked Git state through non-ignored files, links, or aliases.

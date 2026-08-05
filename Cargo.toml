@@ -10,7 +10,6 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-authors = ["Liam"]
 repository = "https://github.com/Limme-swe/super-mem"
 homepage = "https://github.com/Limme-swe/super-mem"
 readme = "README.md"
