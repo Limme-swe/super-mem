@@ -155,11 +155,8 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 arguments.summary.unwrap_or_default()
             };
             let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
-            let artifacts = capture_scope_artifacts(
-                &scope,
-                &arguments.files,
-                !arguments.no_auto_artifacts,
-            )?;
+            let artifacts =
+                capture_scope_artifacts(&scope, &arguments.files, !arguments.no_auto_artifacts)?;
             let receipt = engine.checkpoint_session(CheckpointRequest {
                 idempotency_key: arguments.idempotency_key,
                 scope,
@@ -235,11 +232,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             let engine = open_engine(&database)?;
             if arguments.history {
                 let history = engine.history(parse_memory_id(&arguments.memory_id)?)?;
-                print_value(
-                    &history,
-                    true,
-                    "history is only emitted as JSON".to_owned(),
-                )?;
+                print_value(&history, true, "history is only emitted as JSON".to_owned())?;
                 return Ok(());
             }
             let memory = engine.get(parse_memory_id(&arguments.memory_id)?)?;
@@ -429,11 +422,7 @@ pub(crate) fn capture_scope_artifacts(
         }
     }
     artifacts.sort_by(|left, right| {
-        (&left.repo_id, &left.path, &left.symbol).cmp(&(
-            &right.repo_id,
-            &right.path,
-            &right.symbol,
-        ))
+        (&left.repo_id, &left.path, &left.symbol).cmp(&(&right.repo_id, &right.path, &right.symbol))
     });
     Ok(artifacts)
 }

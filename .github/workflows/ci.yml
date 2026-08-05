@@ -28,12 +28,7 @@ jobs:
           toolchain: 1.97.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all
-      - uses: actions/upload-artifact@v4
-        with:
-          name: formatted-rust
-          path: crates/**/*.rs
-          retention-days: 1
+      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --all-targets --all-features
 

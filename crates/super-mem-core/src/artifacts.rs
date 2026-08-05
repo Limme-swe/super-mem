@@ -237,7 +237,7 @@ fn validate_no_symlink_components(root: &Path, relative: &Path) -> Result<PathBu
 fn hash_file(path: &Path) -> Result<String> {
     let mut input = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = input.read(&mut buffer)?;
         if read == 0 {
@@ -292,7 +292,14 @@ fn changed_paths(root: &Path) -> Result<Option<Vec<PathBuf>>> {
         if output.stdout.len() > MAX_GIT_PATH_OUTPUT_BYTES {
             return Ok(None);
         }
-        for value in output.stdout.split(|byte| *byte == 0).filter(|value| !value.is_empty()) {
+        for value in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|value| !value.is_empty())
+        {
+            #[cfg(unix)]
+            let path = bytes_to_path(value);
+            #[cfg(not(unix))]
             let Some(path) = bytes_to_path(value) else {
                 return Ok(None);
             };
@@ -306,9 +313,9 @@ fn changed_paths(root: &Path) -> Result<Option<Vec<PathBuf>>> {
 }
 
 #[cfg(unix)]
-fn bytes_to_path(value: &[u8]) -> Option<PathBuf> {
+fn bytes_to_path(value: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStringExt;
-    Some(PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())))
+    PathBuf::from(std::ffi::OsString::from_vec(value.to_vec()))
 }
 
 #[cfg(not(unix))]
@@ -317,7 +324,12 @@ fn bytes_to_path(value: &[u8]) -> Option<PathBuf> {
 }
 
 fn language_for_path(path: &str) -> Option<&'static str> {
-    match Path::new(path).extension().and_then(OsStr::to_str)?.to_ascii_lowercase().as_str() {
+    match Path::new(path)
+        .extension()
+        .and_then(OsStr::to_str)?
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "rs" => Some("rust"),
         "ts" | "tsx" => Some("typescript"),
         "js" | "jsx" | "mjs" | "cjs" => Some("javascript"),
@@ -359,7 +371,11 @@ mod tests {
     fn explicit_capture_hashes_files_and_represents_deletions() {
         let directory = tempfile::tempdir().unwrap();
         fs::create_dir(directory.path().join("src")).unwrap();
-        fs::write(directory.path().join("src/lib.rs"), "pub fn answer() -> u8 { 42 }").unwrap();
+        fs::write(
+            directory.path().join("src/lib.rs"),
+            "pub fn answer() -> u8 { 42 }",
+        )
+        .unwrap();
         let artifacts = capture_artifact_paths(
             directory.path(),
             "repo",
@@ -368,14 +384,26 @@ mod tests {
         .unwrap();
         assert_eq!(artifacts.len(), 2);
         assert_eq!(artifacts[0].language.as_deref(), Some("rust"));
-        assert!(artifacts[0].content_hash.as_deref().unwrap().starts_with("blake3:"));
-        assert_eq!(artifacts[1].content_hash.as_deref(), Some(MISSING_CONTENT_HASH));
+        assert!(
+            artifacts[0]
+                .content_hash
+                .as_deref()
+                .unwrap()
+                .starts_with("blake3:")
+        );
+        assert_eq!(
+            artifacts[1].content_hash.as_deref(),
+            Some(MISSING_CONTENT_HASH)
+        );
     }
 
     #[test]
     fn traversal_and_absolute_paths_are_rejected() {
         let directory = tempfile::tempdir().unwrap();
-        for path in [PathBuf::from("../outside"), directory.path().join("absolute")] {
+        for path in [
+            PathBuf::from("../outside"),
+            directory.path().join("absolute"),
+        ] {
             assert!(capture_artifact_paths(directory.path(), "repo", &[path]).is_err());
         }
     }
@@ -410,11 +438,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["tracked.rs", "untracked.rs"]
         );
-        assert!(
-            artifacts
-                .iter()
-                .all(|artifact| artifact.content_hash.as_deref().is_some_and(|hash| hash.starts_with("blake3:")))
-        );
+        assert!(artifacts.iter().all(|artifact| {
+            artifact
+                .content_hash
+                .as_deref()
+                .is_some_and(|hash| hash.starts_with("blake3:"))
+        }));
 
         fs::remove_file(directory.path().join("tracked.rs")).unwrap();
         let artifacts = capture_changed_artifacts(directory.path(), "repo").unwrap();
@@ -434,12 +463,8 @@ mod tests {
         fs::write(outside.path().join("secret.rs"), "secret").unwrap();
         symlink(outside.path(), directory.path().join("link")).unwrap();
         assert!(
-            capture_artifact_paths(
-                directory.path(),
-                "repo",
-                &[PathBuf::from("link/secret.rs")]
-            )
-            .is_err()
+            capture_artifact_paths(directory.path(), "repo", &[PathBuf::from("link/secret.rs")])
+                .is_err()
         );
     }
 }

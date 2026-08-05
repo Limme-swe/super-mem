@@ -23,8 +23,8 @@ use crate::{
     ContextSection, EngineOptions, EntityRef, Error, Event, EventId, EventKind, EvidenceRef,
     FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory, MemoryFeedback, MemoryHistory,
     MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState, ObserveReceipt, ObserveRequest,
-    QueryId, RecallHit, RecallRequest, RepositoryContext, Result,
-    RetractRequest, RetrievalSignal, Scope, Status, TrustLevel, WriteReceipt,
+    QueryId, RecallHit, RecallRequest, RepositoryContext, Result, RetractRequest, RetrievalSignal,
+    Scope, Status, TrustLevel, WriteReceipt,
     applicability::classify_applicability_with_relation,
     artifacts::materialize_current_artifacts,
     ranking::{Candidate, safe_fts_query, score_candidate, select_mmr},
@@ -450,8 +450,7 @@ impl MemoryEngine {
         {
             let original_scope: Scope = serde_json::from_str(&scope_json)?;
             if original_scope.key() != request.scope.key()
-                || original_scope.workspace_id.as_deref()
-                    != request.scope.workspace_id.as_deref()
+                || original_scope.workspace_id.as_deref() != request.scope.workspace_id.as_deref()
             {
                 return Err(Error::Conflict(
                     "idempotent checkpoint crossed a durable scope boundary".into(),
@@ -489,14 +488,15 @@ impl MemoryEngine {
                         event_id: row.get(0)?,
                         kind: row.get(1)?,
                         content: row.get(2)?,
-                        attributes: serde_json::from_str(&row.get::<_, String>(3)?)
-                            .map_err(|error| {
+                        attributes: serde_json::from_str(&row.get::<_, String>(3)?).map_err(
+                            |error| {
                                 rusqlite::Error::FromSqlConversionFailure(
                                     3,
                                     rusqlite::types::Type::Text,
                                     Box::new(error),
                                 )
-                            })?,
+                            },
+                        )?,
                     })
                 },
             )?
@@ -1273,7 +1273,11 @@ impl MemoryEngine {
                         ));
                     }
                     let table = required_string(&value, "table")?.to_owned();
-                    let version = snapshot_version.expect("header sets snapshot version");
+                    let Some(version) = snapshot_version else {
+                        return Err(Error::InvalidInput(
+                            "snapshot row appeared before a valid header".into(),
+                        ));
+                    };
                     if snapshot_columns(&table, version).is_none() {
                         return Err(Error::InvalidInput(format!(
                             "snapshot table {table:?} is not allowed"
@@ -2848,9 +2852,8 @@ fn load_events(connection: &Connection, event_ids: &[EventId]) -> Result<Vec<Eve
                         .ok_or_else(|| Error::Migration("unknown event trust level".into()))?,
                     occurred_at: from_ms(occurred_at)?,
                     ingested_at: from_ms(ingested_at)?,
-                    redaction_count: usize::try_from(redaction_count).map_err(|_| {
-                        Error::Migration("negative event redaction count".into())
-                    })?,
+                    redaction_count: usize::try_from(redaction_count)
+                        .map_err(|_| Error::Migration("negative event redaction count".into()))?,
                 })
             },
         )
@@ -3490,9 +3493,11 @@ fn compile_context(
     // blind truncation that disagrees with the structured views.
     for mut hit in hits {
         let (priority, section) = section_for(hit.memory.kind);
-        let section_tokens = (!grouped.contains_key(&priority))
-            .then(|| estimate_tokens(&format!("\n[{section}]\n")))
-            .unwrap_or(0);
+        let section_tokens = if grouped.contains_key(&priority) {
+            0
+        } else {
+            estimate_tokens(&format!("\n[{section}]\n"))
+        };
         let mut hit_warnings = Vec::new();
         if matches!(
             hit.applicability,
@@ -3510,9 +3515,11 @@ fn compile_context(
                 hit.memory.memory_id
             ));
         }
-        let warning_header_tokens = (!hit_warnings.is_empty() && warnings.is_empty())
-            .then(|| estimate_tokens("\n[warnings]\n"))
-            .unwrap_or(0);
+        let warning_header_tokens = if !hit_warnings.is_empty() && warnings.is_empty() {
+            estimate_tokens("\n[warnings]\n")
+        } else {
+            0
+        };
         let warning_tokens = hit_warnings
             .iter()
             .map(|warning| estimate_tokens(&render_warning(warning)))
@@ -3563,7 +3570,7 @@ fn compile_context(
         // must obey the same body budget as `sections` and `rendered`. Dropping
         // the original allocation here also prevents a short excerpt from
         // retaining a potentially megabyte-sized source body in the pack.
-        hit.memory.body = body.clone();
+        hit.memory.body.clone_from(&body);
         let item = ContextItem {
             memory_id: hit.memory.memory_id,
             revision: hit.memory.revision,
@@ -3781,9 +3788,7 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::InvalidInput(format!("import field {field:?} must be a string")))
 }
 
-fn snapshot_tables(
-    version: u32,
-) -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
+fn snapshot_tables(version: u32) -> impl Iterator<Item = (&'static str, &'static [&'static str])> {
     let additions: &'static [(&'static str, &'static [&'static str])] =
         if version >= SNAPSHOT_SCHEMA_VERSION {
             SNAPSHOT_V2_TABLES
@@ -4159,14 +4164,18 @@ mod tests {
         assert_eq!(history.events.len(), 2);
         let target_history = engine.history(target).unwrap();
         assert_eq!(target_history.links.len(), 2);
-        assert!(target_history
-            .links
-            .iter()
-            .all(|link| link.target_memory_id == target));
-        assert!(target_history.links.iter().all(|link| target_history
-            .events
-            .iter()
-            .any(|event| event.event_id == link.created_event_id)));
+        assert!(
+            target_history
+                .links
+                .iter()
+                .all(|link| link.target_memory_id == target)
+        );
+        assert!(target_history.links.iter().all(|link| {
+            target_history
+                .events
+                .iter()
+                .any(|event| event.event_id == link.created_event_id)
+        }));
     }
 
     #[test]
@@ -4315,8 +4324,18 @@ mod tests {
 
         let episode = engine.get(first.memory_ids[0]).unwrap();
         assert!(episode.title.contains("Fix the SQLite migration race"));
-        assert!(episode.evidence.iter().any(|evidence| evidence.event_id == prompt.event_id));
-        assert!(episode.evidence.iter().any(|evidence| evidence.event_id == tool.event_id));
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == prompt.event_id)
+        );
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == tool.event_id)
+        );
         assert!(episode.body.contains("cargo test migration"));
 
         let second = engine
@@ -4332,14 +4351,18 @@ mod tests {
         assert!(!second.deduplicated);
         assert_eq!(second.memory_ids.len(), 1);
         let second_episode = engine.get(second.memory_ids[0]).unwrap();
-        assert!(!second_episode
-            .evidence
-            .iter()
-            .any(|evidence| evidence.event_id == prompt.event_id));
-        assert!(!second_episode
-            .evidence
-            .iter()
-            .any(|evidence| evidence.event_id == tool.event_id));
+        assert!(
+            !second_episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == prompt.event_id)
+        );
+        assert!(
+            !second_episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == tool.event_id)
+        );
     }
 
     #[test]
@@ -4497,10 +4520,9 @@ mod tests {
         assert!(pack.hits.is_empty());
         assert!(engine.export_jsonl().unwrap().contains("deprecated_switch"));
         let history = engine.history(id).unwrap();
-        assert!(history
-            .events
-            .iter()
-            .any(|event| event.kind == EventKind::Lifecycle && event.content == "No longer applies"));
+        assert!(history.events.iter().any(
+            |event| event.kind == EventKind::Lifecycle && event.content == "No longer applies"
+        ));
     }
 
     #[test]

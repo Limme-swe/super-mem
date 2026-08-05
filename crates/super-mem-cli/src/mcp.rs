@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use super_mem_core::{
     Applicability, ArtifactRef, CheckpointAttempt, CheckpointDecision, CheckpointOutcome,
-    CheckpointRequest, ContextHints, FeedbackRequest, FeedbackSignal, Memory, MemoryEngine, MemoryKind,
-    ObserveRequest, RecallRequest, RememberRequest, RepositoryContext, RetractRequest, Scope,
-    TrustLevel, canonical_path_digest, classify_applicability, discover_repository,
+    CheckpointRequest, ContextHints, FeedbackRequest, FeedbackSignal, Memory, MemoryEngine,
+    MemoryKind, ObserveRequest, RecallRequest, RememberRequest, RepositoryContext, RetractRequest,
+    Scope, TrustLevel, canonical_path_digest, classify_applicability, discover_repository,
 };
 
 use crate::app::{
@@ -94,7 +94,11 @@ impl MemoryServer {
         let result = self
             .run_blocking(move |engine, policy| {
                 let scope = policy.current_scope(arguments.session_id.clone())?;
-                let files = arguments.files.iter().map(PathBuf::from).collect::<Vec<_>>();
+                let files = arguments
+                    .files
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
                 let artifacts = capture_scope_artifacts(&scope, &files, false)
                     .map_err(|error| error.to_string())?;
                 engine
@@ -130,57 +134,67 @@ impl MemoryServer {
                 let scope = policy.current_scope(arguments.session_id.clone())?;
                 match arguments.mode {
                     RecordMode::Record => {
-                        let files = arguments.files.iter().map(PathBuf::from).collect::<Vec<_>>();
+                        let files = arguments
+                            .files
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>();
                         let artifacts = capture_scope_artifacts(&scope, &files, false)
                             .map_err(|error| error.to_string())?;
-                        engine.remember(RememberRequest {
-                            idempotency_key: arguments.idempotency_key.clone(),
-                            kind: arguments.kind.into(),
-                            scope,
-                            canonical_key: arguments.canonical_key.clone(),
-                            title: arguments
-                                .title
-                                .clone()
-                                .unwrap_or_else(|| title_from_body(&arguments.content)),
-                            body: arguments.content.clone(),
-                            importance: arguments.importance.unwrap_or(0.5),
-                            confidence: arguments.confidence.unwrap_or(0.7),
-                            trust: TrustLevel::Agent,
-                            tags: arguments.tags.clone(),
-                            artifacts,
-                            ..RememberRequest::default()
-                        })
-                        .map_err(|error| error.to_string())
-                        .and_then(to_json)
+                        engine
+                            .remember(RememberRequest {
+                                idempotency_key: arguments.idempotency_key.clone(),
+                                kind: arguments.kind.into(),
+                                scope,
+                                canonical_key: arguments.canonical_key.clone(),
+                                title: arguments
+                                    .title
+                                    .clone()
+                                    .unwrap_or_else(|| title_from_body(&arguments.content)),
+                                body: arguments.content.clone(),
+                                importance: arguments.importance.unwrap_or(0.5),
+                                confidence: arguments.confidence.unwrap_or(0.7),
+                                trust: TrustLevel::Agent,
+                                tags: arguments.tags.clone(),
+                                artifacts,
+                                ..RememberRequest::default()
+                            })
+                            .map_err(|error| error.to_string())
+                            .and_then(to_json)
                     }
                     RecordMode::Checkpoint => {
-                        let files = arguments.files.iter().map(PathBuf::from).collect::<Vec<_>>();
+                        let files = arguments
+                            .files
+                            .iter()
+                            .map(PathBuf::from)
+                            .collect::<Vec<_>>();
                         let artifacts = capture_scope_artifacts(
                             &scope,
                             &files,
                             arguments.auto_artifacts.unwrap_or(true),
                         )
                         .map_err(|error| error.to_string())?;
-                        engine.checkpoint_session(CheckpointRequest {
-                            idempotency_key: arguments.idempotency_key.clone(),
-                            scope,
-                            goal: arguments
-                                .goal
-                                .clone()
-                                .unwrap_or_else(|| "coding task".into()),
-                            summary: arguments.content.clone(),
-                            outcome: arguments.outcome.into(),
-                            open_tasks: arguments.open_tasks.clone(),
-                            verification: arguments.verification.clone(),
-                            decisions: arguments.decisions.clone(),
-                            attempts: arguments.attempts.clone(),
-                            trust: TrustLevel::Agent,
-                            tags: arguments.tags.clone(),
-                            artifacts,
-                            ..CheckpointRequest::default()
-                        })
-                        .map_err(|error| error.to_string())
-                        .and_then(to_json)
+                        engine
+                            .checkpoint_session(CheckpointRequest {
+                                idempotency_key: arguments.idempotency_key.clone(),
+                                scope,
+                                goal: arguments
+                                    .goal
+                                    .clone()
+                                    .unwrap_or_else(|| "coding task".into()),
+                                summary: arguments.content.clone(),
+                                outcome: arguments.outcome.into(),
+                                open_tasks: arguments.open_tasks.clone(),
+                                verification: arguments.verification.clone(),
+                                decisions: arguments.decisions.clone(),
+                                attempts: arguments.attempts.clone(),
+                                trust: TrustLevel::Agent,
+                                tags: arguments.tags.clone(),
+                                artifacts,
+                                ..CheckpointRequest::default()
+                            })
+                            .map_err(|error| error.to_string())
+                            .and_then(to_json)
                     }
                     RecordMode::Observation => {
                         if !arguments.files.is_empty() || arguments.auto_artifacts.is_some() {
@@ -188,20 +202,21 @@ impl MemoryServer {
                                 "files and auto_artifacts are not valid in observation mode".into(),
                             );
                         }
-                        engine.observe(ObserveRequest {
-                            idempotency_key: arguments.idempotency_key.clone(),
-                            kind: arguments.event_kind.into(),
-                            scope,
-                            content: arguments.content.clone(),
-                            attributes: std::collections::BTreeMap::from([(
-                                "source".into(),
-                                json!("mcp"),
-                            )]),
-                            trust: TrustLevel::Agent,
-                            ..ObserveRequest::default()
-                        })
-                        .map_err(|error| error.to_string())
-                        .and_then(to_json)
+                        engine
+                            .observe(ObserveRequest {
+                                idempotency_key: arguments.idempotency_key.clone(),
+                                kind: arguments.event_kind.into(),
+                                scope,
+                                content: arguments.content.clone(),
+                                attributes: std::collections::BTreeMap::from([(
+                                    "source".into(),
+                                    json!("mcp"),
+                                )]),
+                                trust: TrustLevel::Agent,
+                                ..ObserveRequest::default()
+                            })
+                            .map_err(|error| error.to_string())
+                            .and_then(to_json)
                     }
                 }
             })
@@ -965,7 +980,11 @@ mod tests {
             .await;
 
         assert_eq!(result.is_error, Some(true));
-        assert!(serde_json::to_string(&result).unwrap().contains("repository appeared"));
+        assert!(
+            serde_json::to_string(&result)
+                .unwrap()
+                .contains("repository appeared")
+        );
     }
 
     #[test]

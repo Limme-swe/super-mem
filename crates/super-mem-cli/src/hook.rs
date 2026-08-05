@@ -10,8 +10,7 @@ use super_mem_core::{
 
 use crate::{
     app::{
-        automatic_idempotency_key, capture_scope_artifacts, context_envelope,
-        open_engine_and_scope,
+        automatic_idempotency_key, capture_scope_artifacts, context_envelope, open_engine_and_scope,
     },
     cli::{HarnessArg, ScopeArgs},
 };
@@ -141,7 +140,10 @@ fn process_inner(
                 }
                 if let Some(command) = command.as_deref() {
                     attributes.insert("command".into(), json!(cap_automatic_capture(command)));
-                    attributes.insert("verification".into(), json!(is_verification_command(command)));
+                    attributes.insert(
+                        "verification".into(),
+                        json!(is_verification_command(command)),
+                    );
                 }
                 if let Some(exit_code) = exit_code {
                     attributes.insert("exit_code".into(), json!(exit_code));
@@ -156,9 +158,7 @@ fn process_inner(
                     );
                 }
                 engine.observe(ObserveRequest {
-                    idempotency_key: Some(hook_idempotency_key(
-                        object, harness, event, &content,
-                    )),
+                    idempotency_key: Some(hook_idempotency_key(object, harness, event, &content)),
                     kind: tool_event_kind(tool_name),
                     scope: scope.clone(),
                     content,
@@ -245,10 +245,7 @@ fn tool_event_kind(tool_name: &str) -> EventKind {
         .rsplit(['_', '.', ':', '/'])
         .find(|component| !component.is_empty())
         .unwrap_or(&normalized);
-    if matches!(
-        leaf,
-        "bash" | "shell" | "exec" | "command" | "terminal"
-    ) {
+    if matches!(leaf, "bash" | "shell" | "exec" | "command" | "terminal") {
         EventKind::CommandResult
     } else if ["write", "edit", "apply_patch", "notebookedit", "multiedit"]
         .iter()
@@ -612,10 +609,7 @@ mod tests {
             })
             .unwrap();
         assert!(pack.rendered.contains("all migration tests passed"));
-        assert!(pack
-            .hits
-            .iter()
-            .any(|hit| hit.memory.evidence.len() >= 2));
+        assert!(pack.hits.iter().any(|hit| hit.memory.evidence.len() >= 2));
 
         let isolated = engine
             .recall(RecallRequest {
