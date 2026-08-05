@@ -34,7 +34,8 @@ jobs:
       - name: Validate crate packages
         run: |
           cargo package -p super-mem-core --locked --no-verify
-          cargo package -p super-mem --locked --no-verify
+          cargo package -p super-mem --locked --no-verify \
+            --config 'patch.crates-io.super-mem-core.path="crates/super-mem-core"'
 
   msrv:
     name: Rust 1.88 compatibility
