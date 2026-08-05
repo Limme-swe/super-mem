@@ -2,7 +2,7 @@
 
 Use MCP for agent-initiated memory access and native hooks or extensions for automatic capture. Most harnesses use both.
 
-The reference files live in [adapters/](../adapters/). They install from a checkout; the npm package names are not published yet.
+The reference files live in [adapters/](../adapters/) and are bundled in every binary release archive. The npm package names are not published separately.
 
 ## Support matrix
 
@@ -66,7 +66,7 @@ env_vars = ["SUPER_MEM_DB", "SUPER_MEM_NAMESPACE", "SUPER_MEM_WORKSPACE"]
 
 The final assistant message is checkpointed once rather than also stored as a duplicate observation. Transcript paths are retained only as provenance because their format is not stable.
 
-The checkout includes a repository marketplace at [.agents/plugins/marketplace.json](../.agents/plugins/marketplace.json). Open `/plugins` in Codex CLI, choose the Super Mem source, and install the plugin; desktop users can restart the app and install it from Plugins. Review the hook commands before trusting them. A manual configuration remains in [adapters/codex](../adapters/codex). See the [Codex plugin](https://developers.openai.com/codex/plugins) and [hooks](https://developers.openai.com/codex/hooks) documentation.
+The extracted release archive and source checkout include a repository marketplace at [.agents/plugins/marketplace.json](../.agents/plugins/marketplace.json). Open `/plugins` in Codex CLI, choose the Super Mem source, and install the plugin; desktop users can restart the app and install it from Plugins. Review the hook commands before trusting them. A manual configuration remains in [adapters/codex](../adapters/codex). See the [Codex plugin](https://developers.openai.com/codex/plugins) and [hooks](https://developers.openai.com/codex/hooks) documentation.
 
 ## Claude Code
 
@@ -125,7 +125,7 @@ Pi uses a native extension rather than MCP. The included extension:
 - exposes a human-facing /super-mem-status command;
 - keeps Pi session IDs as provenance while repository and workspace scope control recall.
 
-Install a checkout with:
+From an extracted release archive or repository checkout, run:
 
 ~~~sh
 pi install ./adapters/pi

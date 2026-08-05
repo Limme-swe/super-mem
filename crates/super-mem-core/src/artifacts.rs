@@ -8,6 +8,8 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
 };
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 use crate::{ArtifactRef, Error, Result};
 
@@ -140,9 +142,9 @@ fn capture_paths(
     for (display, relative) in normalized {
         let target = validate_no_symlink_components(&root, &relative)?;
         let metadata = match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_like(&metadata) => {
                 return Err(Error::InvalidInput(format!(
-                    "artifact path {display} is a symbolic link"
+                    "artifact path {display} is a symbolic link or reparse point"
                 )));
             }
             Ok(metadata) if metadata.is_file() => Some(metadata),
@@ -220,9 +222,9 @@ fn validate_no_symlink_components(root: &Path, relative: &Path) -> Result<PathBu
     for component in relative.components() {
         cursor.push(component.as_os_str());
         match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_like(&metadata) => {
                 return Err(Error::InvalidInput(format!(
-                    "artifact path {} contains a symbolic-link component",
+                    "artifact path {} contains a symbolic-link or reparse-point component",
                     relative.display()
                 )));
             }
@@ -232,6 +234,18 @@ fn validate_no_symlink_components(root: &Path, relative: &Path) -> Result<PathBu
         }
     }
     Ok(root.join(relative))
+}
+
+#[cfg(windows)]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -466,5 +480,29 @@ mod tests {
             capture_artifact_paths(directory.path(), "repo", &[PathBuf::from("link/secret.rs")])
                 .is_err()
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junction_components_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside").unwrap();
+        let junction = directory.path().join("junction");
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(outside.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let error = capture_artifact_paths(
+            directory.path(),
+            "repository",
+            &[PathBuf::from("junction/secret.txt")],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("reparse-point"));
     }
 }

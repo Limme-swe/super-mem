@@ -2,6 +2,8 @@
 /.cargo-home/
 /.rustup/
 node_modules/
+__pycache__/
+*.py[cod]
 dist/
 *.db
 *.db-shm

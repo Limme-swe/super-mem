@@ -1,6 +1,6 @@
 # Pi adapter
 
-Pi uses a native extension instead of MCP. Install supermem on PATH, then install the adapter from a checkout:
+Pi uses a native extension instead of MCP. Install supermem on PATH, then install the adapter from an extracted release archive or repository checkout:
 
 ~~~sh
 pi install ./adapters/pi

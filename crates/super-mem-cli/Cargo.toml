@@ -27,6 +27,9 @@ super-mem-core = { version = "0.1.0", path = "../super-mem-core" }
 tokio.workspace = true
 uuid.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 assert_cmd = "2.2"
 predicates = "3.1"

@@ -53,10 +53,15 @@ pub(crate) fn build_scope(arguments: &ScopeArgs) -> Scope {
 }
 
 pub(crate) fn normalize_path(path: &Path) -> String {
-    path.canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf())
-        .to_string_lossy()
-        .replace('\\', "/")
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
 #[cfg(test)]

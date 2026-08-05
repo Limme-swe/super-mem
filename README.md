@@ -1,6 +1,7 @@
 # super-mem
 
 [![CI](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Limme-swe/super-mem?display_name=tag)](https://github.com/Limme-swe/super-mem/releases/latest)
 [![MSRV](https://img.shields.io/badge/rustc-1.88%2B-000000?logo=rust)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
@@ -8,9 +9,9 @@ Local, Git-aware memory for coding agents.
 
 super-mem records prompts, decisions, tool results, tests, and failed attempts in a local SQLite store. Recall is filtered by workspace, repository, and Git state before anything is ranked, so an old note from another branch is not treated as current fact.
 
-**Status:** pre-1.0. The CLI and database schema may change before the first stable release. Packages and release binaries are not published yet.
+**Status:** pre-1.0. The CLI and database schema may change between minor releases. Native release binaries are available for Linux, Windows, and both Intel and Apple Silicon Macs; crates.io and npm packages are not published yet.
 
-[Architecture](docs/architecture.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
+[Installation](docs/installation.md) · [Architecture](docs/architecture.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -24,16 +25,20 @@ super-mem records prompts, decisions, tool results, tests, and failed attempts i
 
 The Rust core owns storage, scoping, retrieval, and context assembly. Harness adapters only translate lifecycle events and inject the resulting context.
 
-## Install from source
+## Install
 
-The workspace requires Rust 1.88 or newer.
+Download the archive for your system from the [latest GitHub release](https://github.com/Limme-swe/super-mem/releases/latest), extract `supermem` (`supermem.exe` on Windows), and place it on `PATH`.
 
-~~~sh
-git clone https://github.com/Limme-swe/super-mem.git
-cd super-mem
-cargo install --path crates/super-mem-cli --locked
-supermem --version
-~~~
+| System | Release target |
+| --- | --- |
+| Linux x86-64 | `x86_64-unknown-linux-musl` |
+| Windows x86-64 | `x86_64-pc-windows-msvc` |
+| macOS Apple Silicon | `aarch64-apple-darwin` |
+| macOS Intel | `x86_64-apple-darwin` |
+
+Every release includes `SHA256SUMS` and GitHub build-provenance attestations. See [Installation](docs/installation.md) for exact commands, default data locations, verification, unsigned-binary notices, and source builds.
+
+Keep Git on `PATH` to enable repository identity, ancestry, changed-file capture, and file-freshness checks. The CLI still supports unscoped local memory when Git is unavailable.
 
 ## Quickstart
 
@@ -46,20 +51,13 @@ supermem init
 Record a repository decision:
 
 ~~~sh
-supermem remember \
-  --kind decision \
-  --body "Use the workspace-level Cargo release profile" \
-  --file Cargo.toml \
-  --cwd .
+supermem remember --kind decision --body "Use the workspace-level Cargo release profile" --file Cargo.toml --cwd .
 ~~~
 
 Recall relevant context:
 
 ~~~sh
-supermem recall \
-  --query "why is the release profile ignored?" \
-  --cwd . \
-  --token-budget 1200
+supermem recall --query "why is the release profile ignored?" --cwd . --token-budget 1200
 ~~~
 
 `--file` is repeatable on `remember`, `recall`, and `checkpoint`; it records or checks repository-relative content hashes. Checkpoints also attempt to fingerprint the complete changed-file set by default and attach nothing if automatic capture is incomplete. Use `--no-auto-artifacts` to disable that capture.
@@ -67,7 +65,7 @@ supermem recall \
 Run the MCP server:
 
 ~~~sh
-supermem mcp --root /absolute/path/to/repo
+supermem mcp --root .
 ~~~
 
 A generic stdio configuration looks like this:
@@ -77,7 +75,7 @@ A generic stdio configuration looks like this:
   "mcpServers": {
     "super-mem": {
       "command": "supermem",
-      "args": ["mcp", "--root", "/absolute/path/to/repo"]
+      "args": ["mcp", "--root", "."]
     }
   }
 }
@@ -87,7 +85,7 @@ The launch command pins the root, namespace, and optional workspace. Model tool 
 
 ## Integrations
 
-Reference adapters are included in [adapters/](adapters/). They currently install from a checkout; their npm packages are not published.
+Reference adapters are included in [adapters/](adapters/) in both the repository and each binary archive. Their npm packages are not published separately.
 
 | Harness | Explicit access | Automatic capture | Included adapter |
 | --- | --- | --- | --- |
@@ -151,6 +149,12 @@ supermem import memory.jsonl
 ~~~
 
 ## Development
+
+To build the CLI from source, install Rust 1.88 or newer, clone the repository, and run:
+
+~~~sh
+cargo install --path crates/super-mem-cli --locked
+~~~
 
 Run the full local checks with:
 

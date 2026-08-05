@@ -150,12 +150,28 @@ fn normalize_discovered_remote(remote: &str, repository_root: &Path) -> Option<S
         return normalize_remote(remote);
     }
     let path = PathBuf::from(remote.trim());
+    #[cfg(windows)]
+    if windows_drive_relative(remote.trim()) {
+        // `C:relative` is relative to that drive's process-local current
+        // directory, not to `repository_root`. Preserve a stable opaque form
+        // instead of resolving it against whichever drive cwd launched us.
+        return normalize_remote(remote);
+    }
     let absolute = if path.is_absolute() {
         path
     } else {
         repository_root.join(path)
     };
     Some(format!("file://{}", normalize_path(&absolute)))
+}
+
+#[cfg(windows)]
+fn windows_drive_relative(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || !matches!(bytes[2], b'/' | b'\\'))
 }
 
 fn remote_is_local_repository(remote: &str) -> bool {
@@ -173,7 +189,7 @@ fn remote_is_local_repository(remote: &str) -> bool {
     if let Some((authority, path)) = value.split_once(':') {
         let windows_drive = authority.len() == 1
             && authority.as_bytes()[0].is_ascii_alphabetic()
-            && path.starts_with(['/', '\\']);
+            && (cfg!(windows) || path.starts_with(['/', '\\']));
         if !windows_drive && !authority.contains(['/', '\\']) && !path.is_empty() {
             return false;
         }
@@ -537,7 +553,17 @@ fn hash_reader_prefix(
 
 fn normalize_path(path: &Path) -> String {
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    path.to_string_lossy().replace('\\', "/")
+    #[cfg(windows)]
+    {
+        // Canonical Windows paths can carry a verbatim `\\?\` prefix. Replacing
+        // its separators produces `//?/...`, which is not a round-trippable
+        // native path and makes artifact freshness silently unverifiable.
+        path.to_string_lossy().into_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().replace('\\', "/")
+    }
 }
 
 #[cfg(test)]
@@ -572,11 +598,50 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn drive_relative_remote_is_local_on_windows() {
+        assert!(remote_is_local_repository(r"C:relative\origin.git"));
+        assert!(remote_is_local_repository(r"C:\absolute\origin.git"));
+        assert_eq!(
+            normalize_discovered_remote(
+                r"C:relative\origin.git",
+                Path::new(r"C:\work\repository"),
+            ),
+            Some("C:relative/origin".into())
+        );
+        assert_eq!(
+            normalize_discovered_remote(r"C:", Path::new(r"C:\work\repository")),
+            Some("C:".into())
+        );
+    }
+
     #[test]
     fn preserves_file_remote_authority() {
         assert_eq!(
             normalize_remote("file://BuildHost/Org/Repo.git"),
             Some("file://buildhost/Org/Repo".into())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn discovered_windows_root_round_trips_as_a_native_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository with spaces");
+        std::fs::create_dir(&repository).unwrap();
+        if !run_git(&repository, &["init", "--quiet"]) {
+            return;
+        }
+
+        let discovered = discover_repository(&repository)
+            .unwrap()
+            .expect("repository");
+        let stored = PathBuf::from(discovered.root.expect("root"));
+        assert!(stored.is_dir());
+        assert_eq!(
+            stored.canonicalize().unwrap(),
+            repository.canonicalize().unwrap()
         );
     }
 

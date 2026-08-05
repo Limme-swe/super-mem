@@ -2036,9 +2036,13 @@ fn normalize_artifact_path_checked(path: &str) -> Result<String> {
                     "artifact paths must not contain parent traversal".into(),
                 ));
             }
-            value if components.is_empty() && value.ends_with(':') => {
+            value
+                if components.is_empty()
+                    && value.as_bytes().get(1) == Some(&b':')
+                    && value.as_bytes()[0].is_ascii_alphabetic() =>
+            {
                 return Err(Error::InvalidInput(
-                    "artifact paths must not contain a drive root".into(),
+                    "artifact paths must not contain a drive prefix".into(),
                 ));
             }
             value => components.push(value),
@@ -3976,6 +3980,16 @@ mod tests {
     use super::*;
     use crate::{CheckpointAttempt, CheckpointDecision, FeedbackSignal, RememberRequest};
     use std::{hint::black_box, time::Instant};
+
+    #[test]
+    fn artifact_paths_reject_windows_drive_relative_prefixes() {
+        assert!(normalize_artifact_path_checked("C:secret.rs").is_err());
+        assert!(normalize_artifact_path_checked("C:/secret.rs").is_err());
+        assert_eq!(
+            normalize_artifact_path_checked("src/secret.rs").unwrap(),
+            "src/secret.rs"
+        );
+    }
 
     fn engine() -> MemoryEngine {
         MemoryEngine::open_in_memory(EngineOptions::default()).unwrap()

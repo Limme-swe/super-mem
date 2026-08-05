@@ -1,5 +1,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 use std::{
     ffi::OsString,
     fs::{self, OpenOptions},
@@ -11,7 +13,7 @@ use std::{
 use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use serde_json::json;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use super_mem_core::is_super_mem_database;
 use super_mem_core::{
     ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextHints, EngineOptions, EventKind,
@@ -494,6 +496,7 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
     }
 
     for candidate in candidates {
+        validate_scoped_database_path(&candidate)?;
         let Ok(relative) = candidate.strip_prefix(&repository_root) else {
             continue;
         };
@@ -529,23 +532,7 @@ pub(crate) fn validate_database_for_scope(database: &Path, cwd: &Path) -> anyhow
 
 fn validate_repo_local_candidate(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
     reject_symlink_components(candidate, repository_root)?;
-    let metadata = match fs::symlink_metadata(candidate) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return validate_repo_local_link_policy(candidate, repository_root, None);
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", candidate.display()));
-        }
-    };
-    if metadata.file_type().is_symlink() {
-        bail!(
-            "refusing scoped memory operation because {} is a symbolic link and may redirect writes into tracked worktree data; move --db outside {}",
-            candidate.display(),
-            repository_root.display()
-        );
-    }
-    validate_repo_local_link_policy(candidate, repository_root, Some(&metadata))
+    Ok(())
 }
 
 fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow::Result<()> {
@@ -560,9 +547,9 @@ fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow
     for component in relative.components() {
         cursor.push(component.as_os_str());
         match fs::symlink_metadata(&cursor) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_like(&metadata) => {
                 bail!(
-                    "refusing scoped memory operation because {} contains symbolic-link component {}; move --db outside {}",
+                    "refusing scoped memory operation because {} contains symbolic-link component or Windows reparse point {}; move --db outside {}",
                     candidate.display(),
                     cursor.display(),
                     repository_root.display()
@@ -578,33 +565,33 @@ fn reject_symlink_components(candidate: &Path, repository_root: &Path) -> anyhow
     Ok(())
 }
 
-#[cfg(unix)]
-fn validate_repo_local_link_policy(
-    candidate: &Path,
-    repository_root: &Path,
-    metadata: Option<&fs::Metadata>,
-) -> anyhow::Result<()> {
-    if metadata.is_some_and(|metadata| metadata.nlink() > 1) {
+fn validate_scoped_database_path(candidate: &Path) -> anyhow::Result<()> {
+    let metadata = match fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspect {}", candidate.display()));
+        }
+    };
+    if metadata_is_link_like(&metadata) {
         bail!(
-            "refusing scoped memory operation because {} has multiple hard links and may alias tracked worktree data; move --db outside {}",
-            candidate.display(),
-            repository_root.display()
+            "refusing scoped memory operation because {} is a symbolic link or reparse point",
+            candidate.display()
+        );
+    }
+    if !metadata.is_file() {
+        bail!(
+            "refusing scoped memory operation because {} is not a regular file",
+            candidate.display()
+        );
+    }
+    if hard_link_count(candidate, &metadata)? > 1 {
+        bail!(
+            "refusing scoped memory operation because {} has multiple hard links and may alias tracked worktree data",
+            candidate.display()
         );
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_repo_local_link_policy(
-    candidate: &Path,
-    repository_root: &Path,
-    _metadata: Option<&fs::Metadata>,
-) -> anyhow::Result<()> {
-    bail!(
-        "refusing scoped memory operation because repo-local databases are not supported on this platform: hard-link aliases cannot be verified safely; move --db outside {} (candidate {})",
-        repository_root.display(),
-        candidate.display()
-    )
 }
 
 fn native_git_root(cwd: &Path) -> anyhow::Result<Option<PathBuf>> {
@@ -767,13 +754,20 @@ pub(crate) fn resolve_database(explicit: Option<&Path>) -> anyhow::Result<PathBu
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
     }
-    if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+    #[cfg(windows)]
+    if let Some(base) = std::env::var_os("LOCALAPPDATA") {
         return Ok(PathBuf::from(base).join("super-mem/memory.sqlite3"));
     }
-    if cfg!(windows)
-        && let Some(base) = std::env::var_os("LOCALAPPDATA")
-    {
-        return Ok(PathBuf::from(base).join("super-mem/memory.sqlite3"));
+    #[cfg(target_os = "macos")]
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join("Library/Application Support/super-mem/memory.sqlite3"));
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    if let Some(base) = std::env::var_os("XDG_DATA_HOME") {
+        let base = PathBuf::from(base);
+        if base.is_absolute() {
+            return Ok(base.join("super-mem/memory.sqlite3"));
+        }
     }
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -805,7 +799,7 @@ pub(crate) fn title_from_body(body: &str) -> String {
     title
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn purge_database(database: &Path) -> anyhow::Result<()> {
     let paths = [
         database.to_path_buf(),
@@ -838,7 +832,7 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn purge_database(database: &Path) -> anyhow::Result<()> {
     bail!(
         "refusing to purge {}: safe purge is not supported on this platform because hard-link counts cannot be verified",
@@ -846,18 +840,37 @@ fn purge_database(database: &Path) -> anyhow::Result<()> {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
-    let metadata = match fs::symlink_metadata(path) {
+    let absolute = absolute_lexical_path(path)?;
+    let mut cursor = PathBuf::new();
+    for component in absolute.components() {
+        cursor.push(component.as_os_str());
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) if metadata_is_link_like(&metadata) => {
+                bail!(
+                    "refusing to purge {} because path component {} is a symbolic link or reparse point",
+                    path.display(),
+                    cursor.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", cursor.display()));
+            }
+        }
+    }
+    let metadata = match fs::symlink_metadata(&absolute) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => {
-            return Err(error).with_context(|| format!("inspect {}", path.display()));
+            return Err(error).with_context(|| format!("inspect {}", absolute.display()));
         }
     };
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_like(&metadata) {
         bail!(
-            "refusing to purge {} because it is a symbolic link",
+            "refusing to purge {} because it is a symbolic link or reparse point",
             path.display()
         );
     }
@@ -867,13 +880,73 @@ fn validate_purge_path(path: &Path) -> anyhow::Result<()> {
             path.display()
         );
     }
-    if metadata.nlink() > 1 {
+    if hard_link_count(path, &metadata)? > 1 {
         bail!(
             "refusing to purge {} because it has multiple hard links",
             path.display()
         );
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    // Junctions and mount points are reparse points but are not always
+    // reported by `FileType::is_symlink`.
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_type().is_symlink()
+        || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+#[cfg(unix)]
+fn hard_link_count(_path: &Path, metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    Ok(metadata.nlink())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = fs::File::open(path)
+        .with_context(|| format!("open {} to verify hard links", path.display()))?;
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: `file` owns a live Windows file handle for the full call and
+    // `information` points to writable storage of exactly the structure the
+    // API initializes. Success is checked before `assume_init`.
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("verify hard links for {}", path.display()));
+    }
+    // SAFETY: a successful `GetFileInformationByHandle` initialized the full
+    // `BY_HANDLE_FILE_INFORMATION` value.
+    let information = unsafe { information.assume_init() };
+    if information.nNumberOfLinks == 0 {
+        bail!(
+            "refusing database operation because Windows returned an invalid zero hard-link count for {}",
+            path.display()
+        );
+    }
+    Ok(u64::from(information.nNumberOfLinks))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn hard_link_count(path: &Path, _metadata: &fs::Metadata) -> anyhow::Result<u64> {
+    bail!(
+        "refusing database operation because hard-link counts are unavailable for {}",
+        path.display()
+    )
 }
 
 fn export_private_file(engine: &MemoryEngine, path: &Path) -> anyhow::Result<()> {
@@ -1251,7 +1324,7 @@ mod tests {
         assert!(validate_database_for_scope(&plain.join("memory.sqlite3"), &plain).is_err());
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn purge_removes_every_sqlite_sidecar_including_rollback_journal() {
         let temp = TempDir::new().unwrap();

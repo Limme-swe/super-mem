@@ -539,7 +539,126 @@ fn hook_fails_open_when_no_database_location_can_be_resolved() {
         .stdout("{}\n");
 }
 
-#[cfg(unix)]
+#[test]
+fn default_database_uses_the_platform_data_directory() {
+    let temp = TempDir::new().unwrap();
+    let home = temp.path().join("home");
+    let local_app_data = temp.path().join("local-app-data");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&local_app_data).unwrap();
+
+    Command::cargo_bin("supermem")
+        .unwrap()
+        .env_remove("SUPER_MEM_DB")
+        .env("XDG_DATA_HOME", "relative-xdg-must-be-ignored")
+        .env("HOME", &home)
+        .env("LOCALAPPDATA", &local_app_data)
+        .arg("init")
+        .assert()
+        .success();
+
+    #[cfg(windows)]
+    let expected = local_app_data.join("super-mem/memory.sqlite3");
+    #[cfg(target_os = "macos")]
+    let expected = home.join("Library/Application Support/super-mem/memory.sqlite3");
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let expected = home.join(".local/share/super-mem/memory.sqlite3");
+    assert!(expected.is_file(), "{} was not created", expected.display());
+}
+
+#[test]
+fn changed_artifact_is_stale_on_the_native_platform() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repository with spaces and ünicode");
+    init_git_repository(&repository);
+    let artifact = repository.join("tracked.txt");
+    fs::write(&artifact, "original\n").unwrap();
+    git(&repository, &["add", "tracked.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "add artifact"]);
+    let database = temp.path().join("memory.sqlite3");
+
+    command(&database)
+        .args([
+            "remember",
+            "--body",
+            "The native freshness sentinel is copper-lark.",
+            "--file",
+            "tracked.txt",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .success();
+    fs::write(&artifact, "changed\n").unwrap();
+
+    command(&database)
+        .args([
+            "recall",
+            "--query",
+            "native freshness sentinel",
+            "--format",
+            "context",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("copper-lark").not());
+    command(&database)
+        .args([
+            "recall",
+            "--query",
+            "native freshness sentinel",
+            "--format",
+            "context",
+            "--include-stale",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("copper-lark"))
+        .stdout(predicate::str::contains("; stale]"));
+}
+
+#[test]
+fn descendant_commit_remains_compatible_on_the_native_platform() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repository with spaces and ünicode");
+    init_git_repository(&repository);
+    let database = temp.path().join("memory.sqlite3");
+
+    command(&database)
+        .args([
+            "remember",
+            "--body",
+            "The ancestry sentinel is silver-heron.",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .success();
+    fs::write(repository.join("later.txt"), "later commit\n").unwrap();
+    git(&repository, &["add", "later.txt"]);
+    git(&repository, &["commit", "--quiet", "-m", "descendant"]);
+
+    command(&database)
+        .args([
+            "recall",
+            "--query",
+            "ancestry sentinel",
+            "--format",
+            "context",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("silver-heron"))
+        .stdout(predicate::str::contains("; compatible]"));
+}
+
+#[cfg(any(unix, windows))]
 #[test]
 fn repo_local_nonignored_database_is_rejected_before_creation() {
     let temp = TempDir::new().unwrap();
@@ -589,7 +708,7 @@ fn repo_local_nonignored_database_is_rejected_before_creation() {
     assert!(!database.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn fully_ignored_repo_local_database_recalls_as_exact() {
     let temp = TempDir::new().unwrap();
@@ -633,7 +752,7 @@ fn fully_ignored_repo_local_database_recalls_as_exact() {
         .stdout(predicate::str::contains("; exact]"));
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn repo_local_database_requires_every_sqlite_sidecar_to_be_ignored() {
     let temp = TempDir::new().unwrap();
@@ -659,7 +778,7 @@ fn repo_local_database_requires_every_sqlite_sidecar_to_be_ignored() {
     assert!(!database.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn tracked_repo_local_database_is_always_rejected() {
     let temp = TempDir::new().unwrap();
@@ -683,7 +802,7 @@ fn tracked_repo_local_database_is_always_rejected() {
         .stderr(predicate::str::contains("tracked by Git"));
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn ignored_hardlinked_database_cannot_mutate_a_tracked_alias() {
     let temp = TempDir::new().unwrap();
@@ -841,6 +960,58 @@ fn ignored_parent_symlink_cannot_hide_a_redirected_database() {
     assert!(status.stdout.is_empty());
 }
 
+#[cfg(windows)]
+#[test]
+fn ignored_parent_junction_is_rejected_for_scoped_use_and_purge() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    fs::write(repository.join(".gitignore"), "/.memory-store\n").unwrap();
+    git(&repository, &["add", ".gitignore"]);
+    git(
+        &repository,
+        &["commit", "--quiet", "-m", "ignore memory store junction"],
+    );
+
+    let external_store = temp.path().join("external-store");
+    fs::create_dir(&external_store).unwrap();
+    let external = external_store.join("memory.sqlite3");
+    command(&external).arg("init").assert().success();
+    let before = fs::read(&external).unwrap();
+    let store_link = repository.join(".memory-store");
+    let junction = ProcessCommand::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&store_link)
+        .arg(&external_store)
+        .output()
+        .unwrap();
+    assert!(
+        junction.status.success(),
+        "mklink failed: {}",
+        String::from_utf8_lossy(&junction.stderr)
+    );
+    let database = store_link.join("memory.sqlite3");
+
+    command(&database)
+        .args([
+            "remember",
+            "--body",
+            "Must not follow a Windows directory junction.",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reparse point"));
+    command(&database)
+        .args(["purge", "--yes"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("reparse point"));
+
+    assert_eq!(fs::read(&external).unwrap(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn parent_directory_component_cannot_bypass_symlink_validation() {
@@ -893,7 +1064,7 @@ fn parent_directory_component_cannot_bypass_symlink_validation() {
     assert!(status.stdout.is_empty());
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 #[test]
 fn repo_local_database_is_conservatively_rejected_without_safe_link_counts() {
     let temp = TempDir::new().unwrap();
@@ -918,7 +1089,7 @@ fn repo_local_database_is_conservatively_rejected_without_safe_link_counts() {
     assert!(!database.exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn purge_refuses_to_delete_an_unrelated_file() {
     let temp = TempDir::new().unwrap();
@@ -969,7 +1140,7 @@ fn purge_refuses_a_symlink_and_preserves_the_store() {
         .stdout(predicate::str::contains("\"active_memories\": 1"));
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[test]
 fn purge_refuses_a_hard_link_and_preserves_every_name() {
     let temp = TempDir::new().unwrap();
@@ -998,7 +1169,7 @@ fn purge_refuses_a_hard_link_and_preserves_every_name() {
 
 #[cfg(windows)]
 #[test]
-fn purge_is_conservatively_refused_on_windows() {
+fn purge_removes_a_windows_store_after_alias_verification() {
     let temp = TempDir::new().unwrap();
     let database = temp.path().join("memory.sqlite3");
     command(&database)
@@ -1009,12 +1180,48 @@ fn purge_is_conservatively_refused_on_windows() {
     command(&database)
         .args(["purge", "--yes"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "safe purge is not supported on this platform",
-        ));
+        .success();
 
-    assert!(database.is_file());
+    assert!(!database.exists());
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn external_database_hardlink_cannot_mutate_a_tracked_alias() {
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    let database = temp.path().join("external.sqlite3");
+    let tracked_alias = repository.join("tracked.sqlite3");
+    command(&database).arg("init").assert().success();
+    fs::hard_link(&database, &tracked_alias).unwrap();
+    git(&repository, &["add", "tracked.sqlite3"]);
+    git(
+        &repository,
+        &["commit", "--quiet", "-m", "track external database alias"],
+    );
+    let before = fs::read(&tracked_alias).unwrap();
+
+    command(&database)
+        .args([
+            "remember",
+            "--body",
+            "Must not mutate an external tracked alias.",
+            "--cwd",
+        ])
+        .arg(&repository)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("multiple hard links"));
+
+    assert_eq!(fs::read(&tracked_alias).unwrap(), before);
+    let status = ProcessCommand::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(&repository)
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    assert!(status.stdout.is_empty());
 }
 
 #[test]

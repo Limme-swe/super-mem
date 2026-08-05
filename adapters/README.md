@@ -1,12 +1,12 @@
 # Harness adapters
 
-The reference adapters connect harness lifecycle events to the same Rust core. Install the supermem binary first:
+The reference adapters connect harness lifecycle events to the same Rust core. Install the `supermem` binary from the [latest release](https://github.com/Limme-swe/super-mem/releases/latest) first. A source build is also available:
 
 ~~~sh
 cargo install --path crates/super-mem-cli --locked
 ~~~
 
-Packages and release binaries are not published yet. Use the files in this directory from a checkout.
+The adapter npm packages are not published separately. Use the files in this directory from the source tree or an extracted binary release archive.
 
 | Harness | Automatic capture | Explicit access | Guide |
 | --- | --- | --- | --- |
@@ -29,7 +29,7 @@ Packages and release binaries are not published yet. Use the files in this direc
 For MCP, the trusted launch command pins the root, namespace, and optional workspace:
 
 ~~~sh
-supermem mcp --root /path/to/repo
+supermem mcp --root .
 ~~~
 
 Model-facing schemas cannot select another root, repository, namespace, or workspace. The server rediscovers current Git state from the pinned root on each call.
