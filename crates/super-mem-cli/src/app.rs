@@ -16,17 +16,18 @@ use serde_json::json;
 #[cfg(any(unix, windows))]
 use super_mem_core::is_super_mem_database;
 use super_mem_core::{
-    ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextHints, EngineOptions, EventKind,
-    FeedbackRequest, FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest, QueryId,
-    RecallRequest, RememberRequest, RetractRequest, Scope, TrustLevel, capture_artifact_paths,
+    ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextHints, DenseQuery, EngineOptions,
+    EventKind, FeedbackRequest, FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest,
+    QueryId, RecallRequest, RegisterSearchProjectionsRequest, RememberRequest, RetractRequest,
+    Scope, SearchProfileRegistration, SearchProjectionInput, TrustLevel, capture_artifact_paths,
     capture_changed_artifacts, discover_repository,
 };
 use uuid::Uuid;
 
 use crate::{
     cli::{
-        Cli, Command, FeedbackArg, MemoryKindArg, ObserveKindArg, OutcomeArg, RecallFormat,
-        TrustArg,
+        Cli, Command, FeedbackArg, IndexCommand, MemoryKindArg, ObserveKindArg, OutcomeArg,
+        RecallFormat, TrustArg,
     },
     hook, mcp,
     scope::build_scope,
@@ -191,6 +192,24 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             };
             let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
             let artifacts = capture_scope_artifacts(&scope, &arguments.files, false)?;
+            let dense = match (
+                arguments.dense_profile,
+                arguments.dense_vector_file.as_deref(),
+            ) {
+                (Some(profile_id), Some(path)) => {
+                    let encoded = fs::read_to_string(path)
+                        .with_context(|| format!("read dense query vector {}", path.display()))?;
+                    let vector = serde_json::from_str::<Vec<f32>>(&encoded)
+                        .context("dense query vector must be a JSON number array")?;
+                    Some(DenseQuery {
+                        profile_id,
+                        vector,
+                        min_similarity: arguments.dense_min_similarity,
+                    })
+                }
+                (None, None) => None,
+                _ => bail!("--dense-profile and --dense-vector-file must be provided together"),
+            };
             if arguments.observe_prompt {
                 let harness = arguments.scope.harness.as_deref().unwrap_or("cli");
                 let attributes = std::collections::BTreeMap::from([
@@ -221,6 +240,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 include_superseded: arguments.include_superseded,
                 hints: ContextHints {
                     artifacts,
+                    dense,
                     ..ContextHints::default()
                 },
                 ..RecallRequest::default()
@@ -292,6 +312,82 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 )?;
             }
         }
+        Command::Index(arguments) => match arguments.command {
+            IndexCommand::AddProfile(arguments) => {
+                let engine = open_engine(&database)?;
+                let profile = engine.register_search_profile(SearchProfileRegistration {
+                    profile_id: arguments.profile_id,
+                    model_digest: arguments.model_digest,
+                    dimensions: arguments.dimensions,
+                })?;
+                print_value(
+                    &profile,
+                    cli.json,
+                    format!("registered search profile {}", profile.profile_id),
+                )?;
+            }
+            IndexCommand::Pending(arguments) => {
+                let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+                let documents = engine.pending_search_documents(
+                    &arguments.profile_id,
+                    scope,
+                    arguments.limit,
+                )?;
+                print_value(
+                    &documents,
+                    true,
+                    "pending search documents are emitted as JSON",
+                )?;
+            }
+            IndexCommand::Register(arguments) => {
+                let input = match arguments.input.as_deref() {
+                    Some(path) if path != Path::new("-") => fs::read_to_string(path)
+                        .with_context(|| format!("read {}", path.display()))?,
+                    _ => read_stdin()?,
+                };
+                let projections = parse_search_projection_inputs(&input)?;
+                let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+                let receipt =
+                    engine.register_search_projections(RegisterSearchProjectionsRequest {
+                        scope,
+                        profile_id: arguments.profile_id,
+                        projections,
+                    })?;
+                print_value(
+                    &receipt,
+                    cli.json,
+                    format!(
+                        "registered {} search projections ({} unchanged)",
+                        receipt.registered, receipt.unchanged
+                    ),
+                )?;
+            }
+            IndexCommand::Status(arguments) => {
+                let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+                let status = engine.search_index_status(&arguments.profile_id, scope)?;
+                print_value(
+                    &status,
+                    cli.json,
+                    format!(
+                        "profile={} indexed={}/{} pending={} stale={}",
+                        status.profile.profile_id,
+                        status.indexed,
+                        status.eligible,
+                        status.pending,
+                        status.stale
+                    ),
+                )?;
+            }
+            IndexCommand::Rebuild => {
+                let engine = open_engine(&database)?;
+                let indexed = engine.rebuild_search_indexes()?;
+                print_value(
+                    &json!({ "rebuilt": indexed }),
+                    cli.json,
+                    format!("rebuilt search index entries for {indexed} memories"),
+                )?;
+            }
+        },
         Command::Doctor(arguments) => {
             let engine = open_engine(&database)?;
             let status = engine.status()?;
@@ -834,6 +930,26 @@ pub(crate) fn parse_query_id(value: &str) -> anyhow::Result<QueryId> {
     Ok(QueryId(
         Uuid::parse_str(value).context("invalid query UUID")?,
     ))
+}
+
+fn parse_search_projection_inputs(input: &str) -> anyhow::Result<Vec<SearchProjectionInput>> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        bail!("search projection input must not be empty");
+    }
+    if trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed)
+            .context("search projection input must be a JSON array");
+    }
+    input
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line)
+                .with_context(|| format!("invalid search projection JSON on line {}", index + 1))
+        })
+        .collect()
 }
 
 pub(crate) fn title_from_body(body: &str) -> String {

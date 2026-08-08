@@ -38,6 +38,8 @@ pub(crate) enum Command {
     Retract(RetractArgs),
     /// Print database health and size information.
     Status(StatusArgs),
+    /// Manage optional background expansion and dense-vector search indexes.
+    Index(IndexArgs),
     /// Diagnose the database and repository integration.
     Doctor(DoctorArgs),
     /// Export the canonical JSONL representation.
@@ -307,6 +309,15 @@ pub struct RecallArgs {
     /// Repository-relative file whose current fingerprint should guide recall. Repeatable.
     #[arg(long = "file")]
     pub files: Vec<PathBuf>,
+    /// Registered profile that produced --dense-vector-file.
+    #[arg(long, requires = "dense_vector_file")]
+    pub dense_profile: Option<String>,
+    /// JSON array containing a caller-generated query vector.
+    #[arg(long, requires = "dense_profile")]
+    pub dense_vector_file: Option<PathBuf>,
+    /// Optional minimum cosine similarity for dense candidates.
+    #[arg(long, requires = "dense_profile")]
+    pub dense_min_similarity: Option<f32>,
 }
 
 #[derive(Clone, Debug, Args)]
@@ -343,6 +354,67 @@ pub struct StatusArgs {
     /// Perform the health check without printing output.
     #[arg(long)]
     pub quiet: bool,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexArgs {
+    #[command(subcommand)]
+    pub command: IndexCommand,
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum IndexCommand {
+    /// Register one immutable generator/model profile.
+    AddProfile(IndexAddProfileArgs),
+    /// List current memories missing a projection for a profile.
+    Pending(IndexPendingArgs),
+    /// Register a JSON or JSONL batch generated outside the write path.
+    Register(IndexRegisterArgs),
+    /// Show profile coverage in one exact namespace/workspace/repository scope.
+    Status(IndexStatusArgs),
+    /// Rebuild deterministic aliases and FTS from canonical rows.
+    Rebuild,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexAddProfileArgs {
+    /// Digest-derived profile identity.
+    #[arg(long)]
+    pub profile_id: String,
+    /// Digest covering weights, tokenizer, preprocessing, dimensions, and metric.
+    #[arg(long)]
+    pub model_digest: String,
+    /// Dense dimensions. Omit for document-expansion-only profiles.
+    #[arg(long)]
+    pub dimensions: Option<usize>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexPendingArgs {
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+    #[arg(long)]
+    pub profile_id: String,
+    #[arg(long, default_value_t = 100)]
+    pub limit: usize,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexRegisterArgs {
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+    #[arg(long)]
+    pub profile_id: String,
+    /// JSON array or JSONL projection input. Omit or use `-` for stdin.
+    pub input: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexStatusArgs {
+    #[command(flatten)]
+    pub scope: ScopeArgs,
+    #[arg(long)]
+    pub profile_id: String,
 }
 
 #[derive(Clone, Debug, Default, Args)]

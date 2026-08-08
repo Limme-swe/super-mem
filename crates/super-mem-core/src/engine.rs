@@ -1,7 +1,7 @@
 //! SQLite-backed memory engine implementation.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap},
     fmt::Write as _,
     fs,
     io::Write,
@@ -23,16 +23,31 @@ use crate::{
     ContextSection, EngineOptions, EntityRef, Error, Event, EventId, EventKind, EvidenceRef,
     FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory, MemoryFeedback, MemoryHistory,
     MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState, ObserveReceipt, ObserveRequest,
-    QueryId, RecallHit, RecallRequest, RepositoryContext, Result, RetractRequest, RetrievalSignal,
-    Scope, Status, TrustLevel, WriteReceipt,
+    PendingSearchDocument, QueryId, RecallHit, RecallRequest, RegisterSearchProjectionsRequest,
+    RepositoryContext, Result, RetractRequest, RetrievalSignal, Scope, SearchIndexStatus,
+    SearchProfile, SearchProfileRegistration, SearchProjectionReceipt, Status, TrustLevel,
+    WriteReceipt,
     applicability::classify_applicability_with_relation,
     artifacts::materialize_current_artifacts,
-    ranking::{Candidate, safe_fts_query, score_candidate, select_mmr},
+    ranking::{Candidate, safe_fts_query, safe_fts_strict_query, score_candidate, select_mmr},
     redaction::Redactor,
     schema::{SCHEMA_VERSION, initialize},
+    search::{
+        VECTOR_SIGNATURE_VERSION, code_aliases, cosine_similarity, decode_f32_vector,
+        encode_f32_vector, hamming_distance, rank_by_cosine, validate_signature_width,
+    },
 };
 
-const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts),h.memory_id LIMIT 120";
+const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts,4.0,1.0,2.5,3.0,3.5,2.0,0.8),h.memory_id LIMIT 512";
+const DENSE_EXACT_SCAN_LIMIT: usize = 4_096;
+const DENSE_BINARY_SHORTLIST: usize = 512;
+const CODE_ALIAS_VERSION: u32 = 1;
+const MAX_SEARCH_PROJECTION_BATCH: usize = 256;
+const MAX_SEARCH_EXPANSIONS: usize = 128;
+const MAX_SEARCH_EXPANSION_ITEM_BYTES: usize = 4_096;
+const MAX_SEARCH_EXPANSION_BYTES: usize = 16_384;
+const MAX_FTS_EXPANSION_BYTES: usize = 65_536;
+const ALIAS_INCOMPLETE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL LIMIT 1)";
 // Snapshot schema is independent from SQLite's user_version. Version 2 adds
 // immutable per-revision metadata and link provenance; version 1 remains
 // accepted for restore.
@@ -259,9 +274,10 @@ impl MemoryEngine {
         Self::from_connection(Connection::open_in_memory()?, options)
     }
 
-    fn from_connection(connection: Connection, options: EngineOptions) -> Result<Self> {
+    fn from_connection(mut connection: Connection, options: EngineOptions) -> Result<Self> {
         validate_options(&options)?;
         initialize(&connection, &options)?;
+        ensure_search_indexes(&mut connection)?;
         connection.set_prepared_statement_cache_capacity(32);
         let redactor = options.redact_secrets.then(Redactor::new).transpose()?;
         Ok(Self {
@@ -854,21 +870,43 @@ impl MemoryEngine {
         let eligibility = CandidateEligibility::new(&request)?;
         let terms = identifier_terms(&request.query);
         let query_id = QueryId::new();
-        let connection = self.lock()?;
+        let mut connection = self.lock()?;
+        // Candidate IDs, revisions, attachments, feedback, and the sequence
+        // watermark must come from one SQLite snapshot. Without this read
+        // transaction, a concurrent writer can revise a head after one
+        // channel scores it and cause recall to return unrelated new content.
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
         let mut candidates = HashMap::<MemoryId, Candidate>::new();
 
-        collect_exact(&connection, &request, &eligibility, &mut candidates)?;
-        collect_fts(&connection, &request, &eligibility, &mut candidates)?;
-        collect_sparse(&connection, &request, &eligibility, &terms, &mut candidates)?;
-        collect_entities(&connection, &request, &eligibility, &terms, &mut candidates)?;
-        collect_error_fingerprint(&connection, &request, &eligibility, &mut candidates)?;
-        collect_recent(&connection, &request, &eligibility, &mut candidates)?;
-        prune_candidates(&mut candidates, 256);
+        collect_exact(&transaction, &request, &eligibility, &mut candidates)?;
+        collect_fts(&transaction, &request, &eligibility, &mut candidates)?;
+        collect_sparse(
+            &transaction,
+            &request,
+            &eligibility,
+            &terms,
+            &mut candidates,
+        )?;
+        collect_entities(
+            &transaction,
+            &request,
+            &eligibility,
+            &terms,
+            &mut candidates,
+        )?;
+        collect_error_fingerprint(&transaction, &request, &eligibility, &mut candidates)?;
+        collect_dense(&transaction, &request, &eligibility, &mut candidates)?;
+        collect_recent(&transaction, &request, &eligibility, &mut candidates)?;
+        // Applicability can only be finalized after canonical artifact rows
+        // are loaded and, for Git scopes, ancestry is resolved. Keep enough
+        // per-channel oversampling that large stale/divergent clusters cannot
+        // crowd a current hit out before those checks run.
+        prune_candidates(&mut candidates, 1_024);
 
         let candidate_ids = candidates.keys().copied().collect::<Vec<_>>();
-        let mut memories = load_memories(&connection, &candidate_ids)?;
-        let utilities = feedback_utilities(&connection, &candidate_ids)?;
-        let database_seq = latest_sequence(&connection)?;
+        let mut memories = load_memories(&transaction, &candidate_ids)?;
+        let utilities = feedback_utilities(&transaction, &candidate_ids)?;
+        let database_seq = latest_sequence(&transaction)?;
         // Hash the artifacts of the strongest retrieval candidates first. A
         // lexical BTreeMap cap made freshness depend on path names once more
         // than 128 candidate artifacts existed, potentially starving the best
@@ -909,6 +947,7 @@ impl MemoryEngine {
                 }
             }
         }
+        transaction.commit()?;
         drop(connection);
 
         if let Some(repository) = &request.scope.repository
@@ -985,18 +1024,445 @@ impl MemoryEngine {
         ))
     }
 
+    /// Registers an immutable background search generator profile.
+    ///
+    /// The profile identifies caller-owned preprocessing and model material;
+    /// Super-mem never downloads or invokes that model itself.
+    pub fn register_search_profile(
+        &self,
+        registration: SearchProfileRegistration,
+    ) -> Result<SearchProfile> {
+        validate_bounded_text("search profile ID", &registration.profile_id, false, 256)?;
+        validate_bounded_text(
+            "search model digest",
+            &registration.model_digest,
+            false,
+            256,
+        )?;
+        if registration.dimensions.is_some_and(|dimensions| {
+            !(1..=crate::search::MAX_VECTOR_DIMENSION).contains(&dimensions)
+        }) {
+            return Err(Error::InvalidInput(format!(
+                "search dimensions must be between 1 and {}",
+                crate::search::MAX_VECTOR_DIMENSION
+            )));
+        }
+
+        let now = Utc::now();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) =
+            load_search_profile_optional(&transaction, &registration.profile_id)?
+        {
+            if existing.model_digest != registration.model_digest
+                || existing.dimensions != registration.dimensions
+            {
+                return Err(Error::Conflict(format!(
+                    "search profile {} is immutable and already has different settings",
+                    registration.profile_id
+                )));
+            }
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        transaction.execute(
+            "INSERT INTO search_profiles(profile_id,model_digest,dimensions,signature_version,created_at_ms) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                registration.profile_id,
+                registration.model_digest,
+                registration.dimensions.map(|dimensions| dimensions as i64),
+                i64::from(VECTOR_SIGNATURE_VERSION),
+                to_ms(now),
+            ],
+        )?;
+        let profile = load_search_profile(&transaction, &registration.profile_id)?;
+        transaction.commit()?;
+        Ok(profile)
+    }
+
+    /// Returns current documents whose derived projection is missing or stale.
+    ///
+    /// Scope matching is exact because this is an enrichment/write surface,
+    /// not recall's intentionally broader visibility policy.
+    pub fn pending_search_documents(
+        &self,
+        profile_id: &str,
+        mut scope: Scope,
+        limit: usize,
+    ) -> Result<Vec<PendingSearchDocument>> {
+        normalize_repository(&mut scope.repository);
+        self.validate_scope(&scope)?;
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let limit = limit.clamp(1, 1_000);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let profile = load_search_profile(&transaction, profile_id)?;
+        let rows = transaction
+            .prepare_cached(
+                "SELECT h.memory_id,h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision LEFT JOIN search_projections p ON p.profile_id=?1 AND p.memory_id=h.memory_id AND p.revision=h.head_revision AND p.content_hash=r.content_hash WHERE h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted' AND (p.memory_id IS NULL OR (?5 AND p.vector IS NULL)) ORDER BY h.updated_seq,h.memory_id LIMIT ?6",
+            )?
+            .query_map(
+                params![
+                    profile_id,
+                    scope.namespace,
+                    scope.key(),
+                    scope.workspace_id,
+                    profile.dimensions.is_some(),
+                    limit as i64,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let ids = rows
+            .iter()
+            .map(|(memory_id, _, _)| parse_memory_id(memory_id))
+            .collect::<Result<Vec<_>>>()?;
+        let mut memories = load_memories(&transaction, &ids)?;
+        let mut documents = Vec::with_capacity(rows.len());
+        for ((_, revision, content_hash), memory_id) in rows.into_iter().zip(ids) {
+            let memory = memories.remove(&memory_id).ok_or_else(|| Error::NotFound {
+                kind: "memory",
+                id: memory_id.to_string(),
+            })?;
+            documents.push(PendingSearchDocument {
+                memory_id,
+                revision,
+                content_hash,
+                title: memory.title,
+                body: memory.body,
+                tags: memory.tags,
+                entities: memory.entities,
+                artifacts: memory.artifacts,
+            });
+        }
+        transaction.commit()?;
+        Ok(documents)
+    }
+
+    /// Atomically registers caller-generated projections for current revisions.
+    ///
+    /// Expansions are redacted again before becoming a candidate-only FTS
+    /// field. Revision and content-hash checks reject results produced by a
+    /// worker after its source memory changed.
+    pub fn register_search_projections(
+        &self,
+        mut request: RegisterSearchProjectionsRequest,
+    ) -> Result<SearchProjectionReceipt> {
+        normalize_repository(&mut request.scope.repository);
+        self.validate_scope(&request.scope)?;
+        validate_bounded_text("search profile ID", &request.profile_id, false, 256)?;
+        validate_collection(
+            "search projection batch",
+            request.projections.len(),
+            MAX_SEARCH_PROJECTION_BATCH,
+        )?;
+
+        let profile = {
+            let connection = self.lock()?;
+            load_search_profile(&connection, &request.profile_id)?
+        };
+        let mut seen = BTreeSet::new();
+        let mut prepared = Vec::with_capacity(request.projections.len());
+        for projection in request.projections {
+            if projection.revision == 0 {
+                return Err(Error::InvalidInput(
+                    "search projection revision must be positive".into(),
+                ));
+            }
+            if projection.content_hash.len() != 64
+                || projection
+                    .content_hash
+                    .bytes()
+                    .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            {
+                return Err(Error::InvalidInput(
+                    "search projection content_hash must be 64 lowercase hexadecimal characters"
+                        .into(),
+                ));
+            }
+            if !seen.insert(projection.memory_id) {
+                return Err(Error::InvalidInput(format!(
+                    "search projection batch repeats memory {}",
+                    projection.memory_id
+                )));
+            }
+            validate_collection(
+                "search projection expansions",
+                projection.expansions.len(),
+                MAX_SEARCH_EXPANSIONS,
+            )?;
+            let mut expansions = BTreeSet::new();
+            for expansion in projection.expansions {
+                validate_bounded_text(
+                    "search expansion",
+                    &expansion,
+                    true,
+                    MAX_SEARCH_EXPANSION_ITEM_BYTES,
+                )?;
+                let (safe, _) = self.redact_text(expansion.trim());
+                let safe = safe.trim();
+                if !safe.is_empty() {
+                    expansions.insert(safe.to_owned());
+                }
+            }
+            let expansion = expansions.into_iter().collect::<Vec<_>>().join("\n");
+            if expansion.len() > MAX_SEARCH_EXPANSION_BYTES {
+                return Err(Error::InvalidInput(format!(
+                    "combined search expansion exceeds {MAX_SEARCH_EXPANSION_BYTES} UTF-8 bytes"
+                )));
+            }
+            let (vector, signature, norm) = match (profile.dimensions, projection.vector) {
+                (Some(dimensions), Some(values)) => {
+                    let encoded = encode_f32_vector(&values, dimensions)?;
+                    (
+                        Some(encoded.float_le),
+                        Some(encoded.signature),
+                        Some(encoded.norm),
+                    )
+                }
+                (Some(_), None) => {
+                    return Err(Error::InvalidInput(format!(
+                        "dense search profile {} requires a vector for every projection",
+                        profile.profile_id
+                    )));
+                }
+                (None, Some(_)) => {
+                    return Err(Error::InvalidInput(format!(
+                        "expansion-only search profile {} does not accept vectors",
+                        profile.profile_id
+                    )));
+                }
+                (None, None) => (None, None, None),
+            };
+            prepared.push(PreparedSearchProjection {
+                memory_id: projection.memory_id,
+                revision: projection.revision,
+                content_hash: projection.content_hash,
+                expansion,
+                vector,
+                signature,
+                norm,
+            });
+        }
+
+        let now = to_ms(Utc::now());
+        let scope_key = request.scope.key();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current_profile = load_search_profile(&transaction, &request.profile_id)?;
+        if current_profile.model_digest != profile.model_digest
+            || current_profile.dimensions != profile.dimensions
+        {
+            return Err(Error::Conflict(format!(
+                "search profile {} changed during registration",
+                request.profile_id
+            )));
+        }
+        let mut registered = 0;
+        let mut unchanged = 0;
+        let mut fts_rebuilds = Vec::new();
+        for projection in prepared {
+            let current = transaction
+                .query_row(
+                    "SELECT h.docid,h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted'",
+                    params![
+                        projection.memory_id.to_string(),
+                        request.scope.namespace,
+                        scope_key,
+                        request.scope.workspace_id,
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, u32>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((docid, head_revision, head_hash)) = current else {
+                return Err(Error::Conflict(format!(
+                    "memory {} is not a current non-retracted head in the authorized scope",
+                    projection.memory_id
+                )));
+            };
+            if head_revision != projection.revision || head_hash != projection.content_hash {
+                return Err(Error::Conflict(format!(
+                    "memory {} changed before its search projection was registered",
+                    projection.memory_id
+                )));
+            }
+            let existing = transaction
+                .query_row(
+                    "SELECT revision,content_hash,expansion,vector,signature,norm FROM search_projections WHERE profile_id=?1 AND memory_id=?2",
+                    params![request.profile_id, projection.memory_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<Vec<u8>>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<f64>>(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let expansion_changed = existing.as_ref().map_or(
+                !projection.expansion.is_empty(),
+                |(revision, content_hash, expansion, _, _, _)| {
+                    if *revision == projection.revision && content_hash == &projection.content_hash
+                    {
+                        expansion != &projection.expansion
+                    } else {
+                        !projection.expansion.is_empty()
+                    }
+                },
+            );
+            let identical = existing.as_ref().is_some_and(
+                |(revision, content_hash, expansion, vector, signature, norm)| {
+                    *revision == projection.revision
+                        && content_hash == &projection.content_hash
+                        && expansion == &projection.expansion
+                        && vector == &projection.vector
+                        && signature == &projection.signature
+                        && option_f64_bits_eq(*norm, projection.norm)
+                },
+            );
+            if identical {
+                unchanged += 1;
+                continue;
+            }
+            transaction.execute(
+                "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,vector,signature,norm,indexed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(profile_id,memory_id) DO UPDATE SET revision=excluded.revision,content_hash=excluded.content_hash,expansion=excluded.expansion,vector=excluded.vector,signature=excluded.signature,norm=excluded.norm,indexed_at_ms=excluded.indexed_at_ms",
+                params![
+                    request.profile_id,
+                    projection.memory_id.to_string(),
+                    projection.revision,
+                    projection.content_hash,
+                    projection.expansion,
+                    projection.vector,
+                    projection.signature,
+                    projection.norm,
+                    now,
+                ],
+            )?;
+            registered += 1;
+            if expansion_changed {
+                fts_rebuilds.push((projection.memory_id, docid));
+            }
+        }
+        if !fts_rebuilds.is_empty() {
+            let ids = fts_rebuilds
+                .iter()
+                .map(|(memory_id, _)| *memory_id)
+                .collect::<Vec<_>>();
+            let memories = load_memories(&transaction, &ids)?;
+            for (memory_id, docid) in fts_rebuilds {
+                let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
+                    kind: "memory",
+                    id: memory_id.to_string(),
+                })?;
+                rebuild_fts_from_memory(&transaction, docid, memory)?;
+            }
+        }
+        let receipt = SearchProjectionReceipt {
+            profile_id: request.profile_id,
+            registered,
+            unchanged,
+            database_seq: latest_sequence(&transaction)?,
+        };
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Reports current projection coverage for one exact authorized scope.
+    pub fn search_index_status(
+        &self,
+        profile_id: &str,
+        mut scope: Scope,
+    ) -> Result<SearchIndexStatus> {
+        normalize_repository(&mut scope.repository);
+        self.validate_scope(&scope)?;
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let profile = load_search_profile(&transaction, profile_id)?;
+        let scope_key = scope.key();
+        let eligible: i64 = transaction.query_row(
+            "SELECT count(*) FROM memory_heads h WHERE h.namespace=?1 AND h.scope_key=?2 AND h.workspace_id IS ?3 AND h.state!='retracted'",
+            params![scope.namespace, scope_key, scope.workspace_id],
+            |row| row.get(0),
+        )?;
+        let indexed: i64 = transaction.query_row(
+            "SELECT count(*) FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision JOIN search_projections p ON p.profile_id=?1 AND p.memory_id=h.memory_id AND p.revision=h.head_revision AND p.content_hash=r.content_hash WHERE h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted' AND (NOT ?5 OR p.vector IS NOT NULL)",
+            params![
+                profile_id,
+                scope.namespace,
+                scope_key,
+                scope.workspace_id,
+                profile.dimensions.is_some(),
+            ],
+            |row| row.get(0),
+        )?;
+        let stale: i64 = transaction.query_row(
+            "SELECT count(*) FROM search_projections p JOIN memory_heads h ON h.memory_id=p.memory_id JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE p.profile_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND (h.state='retracted' OR p.revision!=h.head_revision OR p.content_hash!=r.content_hash OR (?5 AND p.vector IS NULL))",
+            params![
+                profile_id,
+                scope.namespace,
+                scope_key,
+                scope.workspace_id,
+                profile.dimensions.is_some(),
+            ],
+            |row| row.get(0),
+        )?;
+        let status = SearchIndexStatus {
+            profile,
+            eligible: eligible.max(0) as u64,
+            indexed: indexed.max(0) as u64,
+            pending: eligible.saturating_sub(indexed).max(0) as u64,
+            stale: stale.max(0) as u64,
+        };
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Rebuilds deterministic aliases and FTS from canonical rows and current
+    /// registered projections.
+    pub fn rebuild_search_indexes(&self) -> Result<usize> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebuild_all_fts(&transaction)?;
+        let indexed: i64 =
+            transaction.query_row("SELECT count(*) FROM search_alias_state", [], |row| {
+                row.get(0)
+            })?;
+        transaction.commit()?;
+        Ok(indexed.max(0) as usize)
+    }
+
     /// Loads the current view of a logical memory, including evidence and code
     /// artifacts.
     pub fn get(&self, memory_id: MemoryId) -> Result<Memory> {
-        let connection = self.lock()?;
-        load_memory(&connection, memory_id)
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let memory = load_memory(&transaction, memory_id)?;
+        transaction.commit()?;
+        Ok(memory)
     }
 
     /// Loads every immutable revision and its cited source events and links.
     pub fn history(&self, memory_id: MemoryId) -> Result<MemoryHistory> {
-        let connection = self.lock()?;
-        let current = load_memory(&connection, memory_id)?;
-        let revision_numbers = connection
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let current = load_memory(&transaction, memory_id)?;
+        let revision_numbers = transaction
             .prepare_cached(
                 "SELECT revision FROM memory_revisions WHERE memory_id=?1 ORDER BY revision",
             )?
@@ -1004,7 +1470,7 @@ impl MemoryEngine {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let revisions = revision_numbers
             .into_iter()
-            .map(|revision| load_memory_revision(&connection, memory_id, revision))
+            .map(|revision| load_memory_revision(&transaction, memory_id, revision))
             .collect::<Result<Vec<_>>>()?;
         let mut event_ids = revisions
             .iter()
@@ -1016,7 +1482,7 @@ impl MemoryEngine {
                     .map(|evidence| evidence.event_id)
             })
             .collect::<BTreeSet<_>>();
-        let associated_events = connection
+        let associated_events = transaction
             .prepare_cached(
                 "SELECT event_id FROM event_memories WHERE memory_id=?1 ORDER BY event_id",
             )?
@@ -1025,20 +1491,22 @@ impl MemoryEngine {
         for event_id in associated_events {
             event_ids.insert(parse_event_id(&event_id)?);
         }
-        let links = load_memory_links(&connection, memory_id)?;
+        let links = load_memory_links(&transaction, memory_id)?;
         // Legacy stores associated a link-creation event only with its source.
         // Include the immutable link ledger directly so inbound provenance is
         // complete even before target-side event associations existed.
         event_ids.extend(links.iter().map(|link| link.created_event_id));
-        let events = load_events(&connection, &event_ids.into_iter().collect::<Vec<_>>())?;
-        let feedback = load_memory_feedback(&connection, memory_id)?;
-        Ok(MemoryHistory {
+        let events = load_events(&transaction, &event_ids.into_iter().collect::<Vec<_>>())?;
+        let feedback = load_memory_feedback(&transaction, memory_id)?;
+        let history = MemoryHistory {
             current,
             revisions,
             events,
             links,
             feedback,
-        })
+        };
+        transaction.commit()?;
+        Ok(history)
     }
 
     /// Records bounded retrieval feedback without altering factual confidence.
@@ -1139,6 +1607,14 @@ impl MemoryEngine {
             params![event_id.to_string(), request.memory_id.to_string()],
         )?;
         transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
+        transaction.execute(
+            "DELETE FROM search_alias_state WHERE memory_id=?1",
+            [request.memory_id.to_string()],
+        )?;
+        transaction.execute(
+            "DELETE FROM search_projections WHERE memory_id=?1",
+            [request.memory_id.to_string()],
+        )?;
         let receipt = WriteReceipt {
             event_id,
             memory_ids: vec![request.memory_id],
@@ -1875,6 +2351,24 @@ struct PreparedMemory {
     redaction_count: usize,
 }
 
+struct PreparedSearchProjection {
+    memory_id: MemoryId,
+    revision: u32,
+    content_hash: String,
+    expansion: String,
+    vector: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+    norm: Option<f64>,
+}
+
+fn option_f64_bits_eq(left: Option<f64>, right: Option<f64>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left.to_bits() == right.to_bits(),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
 struct SessionEvent {
     event_id: String,
     kind: String,
@@ -2426,14 +2920,22 @@ fn apply_link_lifecycle(
 
 fn rebuild_fts(
     transaction: &Transaction<'_>,
-    _memory_id: MemoryId,
+    memory_id: MemoryId,
     docid: i64,
-    _revision: u32,
+    revision: u32,
     request: &crate::RememberRequest,
 ) -> Result<()> {
+    let aliases = code_aliases(
+        &request.title,
+        &request.body,
+        &request.tags,
+        &request.entities,
+        &request.artifacts,
+    );
+    let expansions = load_search_expansions(transaction, memory_id, revision)?;
     transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
     transaction.execute(
-        "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths) VALUES(?1,?2,?3,?4,?5,?6)",
+        "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
         params![
             docid,
             request.title,
@@ -2455,7 +2957,154 @@ fn rebuild_fts(
                 ))
                 .collect::<Vec<_>>()
                 .join(" "),
+            aliases,
+            expansions,
         ],
+    )?;
+    transaction.execute(
+        "INSERT INTO search_alias_state(memory_id,revision,algorithm_version) VALUES(?1,?2,?3) ON CONFLICT(memory_id) DO UPDATE SET revision=excluded.revision,algorithm_version=excluded.algorithm_version",
+        params![memory_id.to_string(), revision, CODE_ALIAS_VERSION],
+    )?;
+    Ok(())
+}
+
+fn load_search_expansions(
+    connection: &Connection,
+    memory_id: MemoryId,
+    revision: u32,
+) -> Result<String> {
+    let mut statement = connection.prepare_cached(
+        "SELECT expansion FROM search_projections WHERE memory_id=?1 AND revision=?2 AND expansion!='' ORDER BY profile_id",
+    )?;
+    let expansions = statement.query_map(params![memory_id.to_string(), revision], |row| {
+        row.get::<_, String>(0)
+    })?;
+    let mut combined = String::new();
+    for expansion in expansions {
+        let expansion = expansion?;
+        let separator = usize::from(!combined.is_empty());
+        let Some(available) =
+            MAX_FTS_EXPANSION_BYTES.checked_sub(combined.len().saturating_add(separator))
+        else {
+            break;
+        };
+        if available == 0 {
+            break;
+        }
+        if separator != 0 {
+            combined.push(' ');
+        }
+        if expansion.len() <= available {
+            combined.push_str(&expansion);
+            continue;
+        }
+        let mut end = available;
+        while end > 0 && !expansion.is_char_boundary(end) {
+            end -= 1;
+        }
+        combined.push_str(&expansion[..end]);
+        break;
+    }
+    Ok(combined)
+}
+
+fn load_search_profile_optional(
+    connection: &Connection,
+    profile_id: &str,
+) -> Result<Option<SearchProfile>> {
+    let row = connection
+        .query_row(
+            "SELECT profile_id,model_digest,dimensions,signature_version,created_at_ms FROM search_profiles WHERE profile_id=?1",
+            [profile_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(profile_id, model_digest, dimensions, signature_version, created_at_ms)| {
+            let dimensions = dimensions
+                .map(|dimensions| {
+                    usize::try_from(dimensions)
+                        .map_err(|_| Error::Migration("invalid search profile dimension".into()))
+                })
+                .transpose()?;
+            let signature_version = u32::try_from(signature_version)
+                .map_err(|_| Error::Migration("invalid search signature version".into()))?;
+            if signature_version != VECTOR_SIGNATURE_VERSION {
+                return Err(Error::Migration(format!(
+                    "unsupported search signature version {signature_version}"
+                )));
+            }
+            Ok(SearchProfile {
+                profile_id,
+                model_digest,
+                dimensions,
+                signature_version,
+                created_at: from_ms(created_at_ms)?,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn load_search_profile(connection: &Connection, profile_id: &str) -> Result<SearchProfile> {
+    load_search_profile_optional(connection, profile_id)?.ok_or_else(|| Error::NotFound {
+        kind: "search profile",
+        id: profile_id.to_owned(),
+    })
+}
+
+fn rebuild_fts_from_memory(
+    transaction: &Transaction<'_>,
+    docid: i64,
+    memory: &Memory,
+) -> Result<()> {
+    let aliases = code_aliases(
+        &memory.title,
+        &memory.body,
+        &memory.tags,
+        &memory.entities,
+        &memory.artifacts,
+    );
+    let expansions = load_search_expansions(transaction, memory.memory_id, memory.revision)?;
+    transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
+    transaction.execute(
+        "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            docid,
+            memory.title,
+            memory.body,
+            memory.tags.join(" "),
+            memory
+                .entities
+                .iter()
+                .map(|entity| format!("{} {}", entity.canonical, entity.display))
+                .collect::<Vec<_>>()
+                .join(" "),
+            memory
+                .artifacts
+                .iter()
+                .map(|artifact| format!(
+                    "{} {}",
+                    artifact.path,
+                    artifact.symbol.as_deref().unwrap_or("")
+                ))
+                .collect::<Vec<_>>()
+                .join(" "),
+            aliases,
+            expansions,
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO search_alias_state(memory_id,revision,algorithm_version) VALUES(?1,?2,?3) ON CONFLICT(memory_id) DO UPDATE SET revision=excluded.revision,algorithm_version=excluded.algorithm_version",
+        params![memory.memory_id.to_string(), memory.revision, CODE_ALIAS_VERSION],
     )?;
     Ok(())
 }
@@ -3145,9 +3794,15 @@ fn collect_exact(
     if request.query.trim().len() < 2 {
         return Ok(());
     }
-    let mut statement = connection.prepare_cached(
-        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (instr(lower(r.title),lower(:query))>0 OR instr(lower(r.body),lower(:query))>0) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 80",
-    )?;
+    let fts_query =
+        safe_fts_query(&request.query).map(|query| format!("{{title body}} : ({query})"));
+    let indexed_sql = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :fts AND (instr(lower(r.title),lower(:query))>0 OR instr(lower(r.body),lower(:query))>0) ORDER BY bm25(memory_fts,4.0,1.0,2.5,3.0,3.5,2.0,0.8),h.memory_id LIMIT 512";
+    let fallback_sql = "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (:fts IS NULL OR :fts IS NOT NULL) AND (instr(lower(r.title),lower(:query))>0 OR instr(lower(r.body),lower(:query))>0) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 512";
+    let mut statement = connection.prepare_cached(if fts_query.is_some() {
+        indexed_sql
+    } else {
+        fallback_sql
+    })?;
     let ids = statement
         .query_map(
             named_params! {
@@ -3155,6 +3810,7 @@ fn collect_exact(
                 ":workspace": request.scope.workspace_id,
                 ":repo": request.scope.repo_id(),
                 ":query": request.query.trim(),
+                ":fts": fts_query,
                 ":include_superseded": eligibility.include_superseded,
                 ":all_kinds": eligibility.all_kinds,
                 ":kinds": eligibility.kinds_json,
@@ -3172,9 +3828,64 @@ fn collect_fts(
     eligibility: &CandidateEligibility,
     candidates: &mut HashMap<MemoryId, Candidate>,
 ) -> Result<()> {
-    let Some(query) = safe_fts_query(&request.query) else {
+    let Some(loose) = safe_fts_query(&request.query) else {
         return Ok(());
     };
+    let canonical_columns = "{title body tags entities paths}";
+    if let Some(strict) = safe_fts_strict_query(&request.query)
+        && strict.contains(" AND ")
+    {
+        collect_fts_channel(
+            connection,
+            request,
+            eligibility,
+            &format!("{canonical_columns} : ({strict})"),
+            RetrievalSignal::LexicalStrict,
+            candidates,
+        )?;
+        collect_fts_channel(
+            connection,
+            request,
+            eligibility,
+            &format!("aliases : ({strict})"),
+            RetrievalSignal::CodeAliasStrict,
+            candidates,
+        )?;
+    }
+    collect_fts_channel(
+        connection,
+        request,
+        eligibility,
+        &format!("{canonical_columns} : ({loose})"),
+        RetrievalSignal::Lexical,
+        candidates,
+    )?;
+    collect_fts_channel(
+        connection,
+        request,
+        eligibility,
+        &format!("aliases : ({loose})"),
+        RetrievalSignal::CodeAlias,
+        candidates,
+    )?;
+    collect_fts_channel(
+        connection,
+        request,
+        eligibility,
+        &format!("expansions : ({loose})"),
+        RetrievalSignal::SemanticExpansion,
+        candidates,
+    )
+}
+
+fn collect_fts_channel(
+    connection: &Connection,
+    request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    query: &str,
+    signal: RetrievalSignal,
+    candidates: &mut HashMap<MemoryId, Candidate>,
+) -> Result<()> {
     // CROSS JOIN fixes the virtual table as the outer loop. Otherwise SQLite
     // can probe the complete FTS index once per scoped memory head.
     let mut statement = connection.prepare_cached(FTS_CANDIDATE_SQL)?;
@@ -3193,7 +3904,7 @@ fn collect_fts(
             |row| row.get::<_, String>(0),
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    add_candidates(candidates, ids, RetrievalSignal::Lexical)
+    add_candidates(candidates, ids, signal)
 }
 
 fn collect_sparse(
@@ -3205,7 +3916,7 @@ fn collect_sparse(
 ) -> Result<()> {
     for term in terms.iter().take(8) {
         let mut statement = connection.prepare_cached(
-            "SELECT DISTINCT h.memory_id FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id=a.artifact_id JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (instr(lower(a.path),lower(:term))>0 OR lower(a.symbol)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
+            "SELECT DISTINCT h.memory_id FROM artifacts a JOIN memory_artifacts ma ON ma.artifact_id=a.artifact_id JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (instr(lower(a.path),lower(:term))>0 OR lower(a.symbol)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 256",
         )?;
         let ids = statement
             .query_map(
@@ -3225,7 +3936,7 @@ fn collect_sparse(
         add_candidates(candidates, ids, RetrievalSignal::Sparse)?;
 
         let mut tags = connection.prepare_cached(
-            "SELECT DISTINCT h.memory_id FROM memory_tags t JOIN memory_heads h ON h.memory_id=t.memory_id AND h.head_revision=t.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND t.normalized=:term ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
+            "SELECT DISTINCT h.memory_id FROM memory_tags t JOIN memory_heads h ON h.memory_id=t.memory_id AND h.head_revision=t.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND t.normalized=:term ORDER BY h.updated_seq DESC,h.memory_id LIMIT 256",
         )?;
         let ids = tags
             .query_map(
@@ -3259,7 +3970,7 @@ fn collect_entities(
     deduplicate_strings(&mut terms);
     for term in terms.into_iter().take(16) {
         let mut statement = connection.prepare_cached(
-            "SELECT DISTINCT h.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (e.canonical=lower(:term) OR lower(e.display)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 40",
+            "SELECT DISTINCT h.memory_id FROM entities e JOIN memory_entities me ON me.entity_id=e.entity_id JOIN memory_heads h ON h.memory_id=me.memory_id AND h.head_revision=me.revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND (e.canonical=lower(:term) OR lower(e.display)=lower(:term)) ORDER BY h.updated_seq DESC,h.memory_id LIMIT 256",
         )?;
         let ids = statement
             .query_map(
@@ -3291,7 +4002,7 @@ fn collect_error_fingerprint(
         return Ok(());
     };
     let mut statement = connection.prepare_cached(
-        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND json_extract(r.attributes_json,'$.error_fingerprint')=:fingerprint ORDER BY h.updated_seq DESC,h.memory_id LIMIT 60",
+        "SELECT h.memory_id FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND json_extract(r.attributes_json,'$.error_fingerprint')=:fingerprint ORDER BY h.updated_seq DESC,h.memory_id LIMIT 512",
     )?;
     let ids = statement
         .query_map(
@@ -3309,6 +4020,174 @@ fn collect_error_fingerprint(
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     add_candidates(candidates, ids, RetrievalSignal::ErrorFingerprint)
+}
+
+fn collect_dense(
+    connection: &Connection,
+    request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    candidates: &mut HashMap<MemoryId, Candidate>,
+) -> Result<()> {
+    collect_dense_with_exact_limit(
+        connection,
+        request,
+        eligibility,
+        candidates,
+        DENSE_EXACT_SCAN_LIMIT,
+    )
+}
+
+fn collect_dense_with_exact_limit(
+    connection: &Connection,
+    request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    candidates: &mut HashMap<MemoryId, Candidate>,
+    exact_scan_limit: usize,
+) -> Result<()> {
+    const ELIGIBLE: &str = " FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision CROSS JOIN search_projections p WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND p.profile_id=:profile AND p.memory_id=h.memory_id AND p.revision=h.head_revision AND p.content_hash=r.content_hash AND p.vector IS NOT NULL AND p.signature IS NOT NULL";
+    let Some(query) = request.hints.dense.as_ref() else {
+        return Ok(());
+    };
+    validate_bounded_text("dense query profile ID", &query.profile_id, false, 256)?;
+    if query
+        .min_similarity
+        .is_some_and(|minimum| !minimum.is_finite() || !(-1.0..=1.0).contains(&minimum))
+    {
+        return Err(Error::InvalidInput(
+            "dense minimum similarity must be finite and between -1 and 1".into(),
+        ));
+    }
+    let profile = load_search_profile(connection, &query.profile_id)?;
+    let dimensions = profile.dimensions.ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "search profile {} is expansion-only and cannot score a dense query",
+            profile.profile_id
+        ))
+    })?;
+    let encoded_query = encode_f32_vector(&query.vector, dimensions)?;
+    let decoded_query = decode_f32_vector(&encoded_query.float_le, dimensions)?;
+    let minimum = query.min_similarity.map_or(0.0, f64::from);
+
+    macro_rules! dense_params {
+        () => {
+            named_params! {
+            ":profile": query.profile_id,
+            ":namespace": request.scope.namespace,
+            ":workspace": request.scope.workspace_id,
+            ":repo": request.scope.repo_id(),
+            ":include_superseded": eligibility.include_superseded,
+            ":all_kinds": eligibility.all_kinds,
+            ":kinds": eligibility.kinds_json,
+            ":as_of": eligibility.as_of_ms,
+            }
+        };
+    }
+    let count_sql = format!("SELECT count(*){ELIGIBLE}");
+    let count: i64 = connection.query_row(&count_sql, dense_params!(), |row| row.get(0))?;
+    if count <= 0 {
+        return Ok(());
+    }
+
+    let rows = if count as usize <= exact_scan_limit {
+        let sql = format!(
+            "SELECT p.memory_id,p.vector,p.signature,p.norm{ELIGIBLE} ORDER BY p.memory_id"
+        );
+        connection
+            .prepare(&sql)?
+            .query_map(dense_params!(), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        // Random-hyperplane signatures are a portable angular prefilter only. Hard scope,
+        // lifecycle, kind, and validity predicates run before this bounded
+        // shortlist; exact cosine always determines the final channel order.
+        let sql = format!("SELECT p.memory_id,p.signature{ELIGIBLE} ORDER BY p.memory_id");
+        let mut shortlist = BinaryHeap::with_capacity(DENSE_BINARY_SHORTLIST + 1);
+        let mut statement = connection.prepare(&sql)?;
+        let mut signatures = statement.query(dense_params!())?;
+        while let Some(row) = signatures.next()? {
+            let memory_id = row.get::<_, String>(0)?;
+            let signature = row.get::<_, Vec<u8>>(1)?;
+            let Ok(memory_id) = parse_memory_id(&memory_id) else {
+                continue;
+            };
+            let Ok(distance) = hamming_distance(&encoded_query.signature, &signature) else {
+                continue;
+            };
+            let entry = (distance, memory_id);
+            if shortlist.len() < DENSE_BINARY_SHORTLIST {
+                shortlist.push(entry);
+            } else if shortlist.peek().is_some_and(|worst| entry < *worst) {
+                shortlist.pop();
+                shortlist.push(entry);
+            }
+        }
+        let ids = shortlist
+            .into_iter()
+            .map(|(_, memory_id)| memory_id)
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = sql_placeholders(ids.len());
+        let sql = format!(
+            "SELECT memory_id,vector,signature,norm FROM search_projections WHERE profile_id=? AND memory_id IN ({placeholders}) ORDER BY memory_id"
+        );
+        let values = std::iter::once(SqlValue::Text(query.profile_id.clone()))
+            .chain(
+                ids.into_iter()
+                    .map(|memory_id| SqlValue::Text(memory_id.to_string())),
+            )
+            .collect::<Vec<_>>();
+        connection
+            .prepare(&sql)?
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, f64>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+
+    let mut scores = Vec::with_capacity(rows.len());
+    for (memory_id, vector, signature, stored_norm) in rows {
+        let Ok(memory_id) = parse_memory_id(&memory_id) else {
+            continue;
+        };
+        let Ok(vector) = decode_f32_vector(&vector, dimensions) else {
+            continue;
+        };
+        if stored_norm.to_bits() != vector.norm.to_bits()
+            || validate_signature_width(&signature).is_err()
+        {
+            continue;
+        }
+        let Ok(similarity) = cosine_similarity(&decoded_query, &vector) else {
+            continue;
+        };
+        if similarity >= minimum {
+            scores.push((memory_id, similarity));
+        }
+    }
+    rank_by_cosine(&mut scores)?;
+    add_candidates(
+        candidates,
+        scores
+            .into_iter()
+            .take(512)
+            .map(|(memory_id, _)| memory_id.to_string())
+            .collect(),
+        RetrievalSignal::DenseVector,
+    )
 }
 
 fn collect_recent(
@@ -3936,26 +4815,45 @@ fn json_to_sql(value: &Value) -> Result<SqlValue> {
 
 fn rebuild_all_fts(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM memory_fts", [])?;
-    transaction.execute_batch(
-        r"
-        INSERT INTO memory_fts(rowid,title,body,tags,entities,paths)
-        SELECT h.docid,
-               r.title,
-               r.body,
-               coalesce((SELECT group_concat(t.tag, ' ') FROM memory_tags t
-                         WHERE t.memory_id=h.memory_id AND t.revision=h.head_revision), ''),
-               coalesce((SELECT group_concat(e.canonical || ' ' || e.display, ' ')
-                         FROM memory_entities me JOIN entities e ON e.entity_id=me.entity_id
-                         WHERE me.memory_id=h.memory_id AND me.revision=h.head_revision), ''),
-               coalesce((SELECT group_concat(a.path || ' ' || a.symbol, ' ')
-                         FROM memory_artifacts ma JOIN artifacts a ON a.artifact_id=ma.artifact_id
-                         WHERE ma.memory_id=h.memory_id AND ma.revision=h.head_revision), '')
-        FROM memory_heads h
-        JOIN memory_revisions r
-          ON r.memory_id=h.memory_id AND r.revision=h.head_revision
-        WHERE h.state != 'retracted';
-        ",
-    )?;
+    transaction.execute("DELETE FROM search_alias_state", [])?;
+    let heads = transaction
+        .prepare_cached(
+            "SELECT memory_id,docid FROM memory_heads WHERE state!='retracted' ORDER BY memory_id",
+        )?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for chunk in heads.chunks(256) {
+        let ids = chunk
+            .iter()
+            .map(|(memory_id, _)| parse_memory_id(memory_id))
+            .collect::<Result<Vec<_>>>()?;
+        let memories = load_memories(transaction, &ids)?;
+        for ((_, docid), memory_id) in chunk.iter().zip(ids) {
+            let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
+                kind: "memory",
+                id: memory_id.to_string(),
+            })?;
+            rebuild_fts_from_memory(transaction, *docid, memory)?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_search_indexes(connection: &mut Connection) -> Result<()> {
+    let incomplete: bool =
+        connection.query_row(ALIAS_INCOMPLETE_SQL, [CODE_ALIAS_VERSION], |row| row.get(0))?;
+    if !incomplete {
+        return Ok(());
+    }
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let still_incomplete: bool =
+        transaction.query_row(ALIAS_INCOMPLETE_SQL, [CODE_ALIAS_VERSION], |row| row.get(0))?;
+    if still_incomplete {
+        rebuild_all_fts(&transaction)?;
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -3980,7 +4878,10 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CheckpointAttempt, CheckpointDecision, FeedbackSignal, RememberRequest};
+    use crate::{
+        CheckpointAttempt, CheckpointDecision, FeedbackSignal, RememberRequest,
+        SearchProjectionInput,
+    };
     use std::{hint::black_box, time::Instant};
 
     #[test]
@@ -4218,6 +5119,331 @@ mod tests {
         assert_eq!(pack.hits.len(), 1);
         assert!(pack.estimated_tokens <= 80);
         assert!(pack.rendered.contains("cargo clean"));
+    }
+
+    #[test]
+    fn background_expansions_are_redacted_cas_safe_and_rebuildable() {
+        let engine = engine();
+        let scope = repo_workspace_scope("semantic", "workspace-a", "session-one");
+        let mut request = remember_request(
+            "Guard lifetime repair",
+            "Confine MutexGuard to an inner block and release it before await.",
+        );
+        request.kind = MemoryKind::Procedure;
+        request.scope = scope.clone();
+        let memory_id = engine.remember(request).unwrap().memory_ids[0];
+
+        let profile = engine
+            .register_search_profile(SearchProfileRegistration {
+                profile_id: "expansion-v1".into(),
+                model_digest: "generator-config-digest-v1".into(),
+                dimensions: None,
+            })
+            .unwrap();
+        assert_eq!(profile.dimensions, None);
+        assert!(
+            engine
+                .register_search_profile(SearchProfileRegistration {
+                    profile_id: "expansion-v1".into(),
+                    model_digest: "different-generator".into(),
+                    dimensions: None,
+                })
+                .is_err()
+        );
+
+        let pending = engine
+            .pending_search_documents("expansion-v1", scope.clone(), 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let source = &pending[0];
+        let expansion_inputs = vec![
+            "launch cleanup after the task suspends".into(),
+            "api_key=verysecretvalue".into(),
+        ];
+        let projection = SearchProjectionInput {
+            memory_id,
+            revision: source.revision,
+            content_hash: source.content_hash.clone(),
+            expansions: expansion_inputs.clone(),
+            vector: None,
+        };
+        let receipt = engine
+            .register_search_projections(RegisterSearchProjectionsRequest {
+                scope: scope.clone(),
+                profile_id: "expansion-v1".into(),
+                projections: vec![projection.clone()],
+            })
+            .unwrap();
+        assert_eq!(receipt.registered, 1);
+        let repeated = engine
+            .register_search_projections(RegisterSearchProjectionsRequest {
+                scope: scope.clone(),
+                profile_id: "expansion-v1".into(),
+                projections: vec![projection.clone()],
+            })
+            .unwrap();
+        assert_eq!(repeated.registered, 0);
+        assert_eq!(repeated.unchanged, 1);
+
+        let connection = engine.lock().unwrap();
+        let stored: String = connection
+            .query_row(
+                "SELECT expansion FROM search_projections WHERE profile_id='expansion-v1' AND memory_id=?1",
+                [memory_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!stored.contains("verysecretvalue"));
+        drop(connection);
+
+        let pack = engine
+            .recall(RecallRequest {
+                query: "What change lets us launch cleanup after the task suspends?".into(),
+                scope: scope.clone(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert_eq!(pack.hits[0].memory.memory_id, memory_id);
+        assert!(
+            pack.hits[0]
+                .signals
+                .contains(&RetrievalSignal::SemanticExpansion)
+        );
+        let status = engine
+            .search_index_status("expansion-v1", scope.clone())
+            .unwrap();
+        assert_eq!(
+            (
+                status.eligible,
+                status.indexed,
+                status.pending,
+                status.stale
+            ),
+            (1, 1, 0, 0)
+        );
+
+        let mut revision = remember_request(
+            "Guard lifetime repair",
+            "Drop the guard explicitly before spawning the cleanup future.",
+        );
+        revision.memory_id = Some(memory_id);
+        revision.kind = MemoryKind::Procedure;
+        revision.scope = scope.clone();
+        engine.remember(revision).unwrap();
+        assert!(
+            engine
+                .register_search_projections(RegisterSearchProjectionsRequest {
+                    scope: scope.clone(),
+                    profile_id: "expansion-v1".into(),
+                    projections: vec![projection.clone()],
+                })
+                .is_err()
+        );
+        let status = engine
+            .search_index_status("expansion-v1", scope.clone())
+            .unwrap();
+        assert_eq!(
+            (
+                status.eligible,
+                status.indexed,
+                status.pending,
+                status.stale
+            ),
+            (1, 0, 1, 1)
+        );
+        let updated_source = engine
+            .pending_search_documents("expansion-v1", scope.clone(), 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(updated_source.revision, 2);
+        engine
+            .register_search_projections(RegisterSearchProjectionsRequest {
+                scope: scope.clone(),
+                profile_id: "expansion-v1".into(),
+                projections: vec![SearchProjectionInput {
+                    memory_id,
+                    revision: updated_source.revision,
+                    content_hash: updated_source.content_hash,
+                    expansions: expansion_inputs,
+                    vector: None,
+                }],
+            })
+            .unwrap();
+        let revised_pack = engine
+            .recall(RecallRequest {
+                query: "launch cleanup after the task suspends".into(),
+                scope: scope.clone(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert!(
+            revised_pack.hits[0]
+                .signals
+                .contains(&RetrievalSignal::SemanticExpansion)
+        );
+
+        let snapshot = engine.export_jsonl().unwrap();
+        assert!(!snapshot.contains("search_profiles"));
+        assert!(!snapshot.contains("search_projections"));
+        assert!(!snapshot.contains("verysecretvalue"));
+    }
+
+    #[test]
+    fn dense_vectors_rank_exact_cosine_inside_hard_scope() {
+        let engine = engine();
+        let scope = repo_workspace_scope("dense", "workspace-a", "session-one");
+        let other_scope = repo_workspace_scope("dense", "workspace-b", "session-two");
+        let mut target = remember_request("Target", "Completely unrelated canonical wording");
+        target.scope = scope.clone();
+        let target_id = engine.remember(target).unwrap().memory_ids[0];
+        let mut distractor = remember_request("Distractor", "Another unrelated memory");
+        distractor.scope = scope.clone();
+        let distractor_id = engine.remember(distractor).unwrap().memory_ids[0];
+        let mut isolated = remember_request("Private", "Must never cross workspaces");
+        isolated.scope = other_scope;
+        let isolated_id = engine.remember(isolated).unwrap().memory_ids[0];
+
+        engine
+            .register_search_profile(SearchProfileRegistration {
+                profile_id: "dense-3d-v1".into(),
+                model_digest: "fixed-test-vectors".into(),
+                dimensions: Some(3),
+            })
+            .unwrap();
+        let pending = engine
+            .pending_search_documents("dense-3d-v1", scope.clone(), 10)
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .all(|document| document.memory_id != isolated_id)
+        );
+        let isolated_source = {
+            let connection = engine.lock().unwrap();
+            connection
+                .query_row(
+                    "SELECT h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1",
+                    [isolated_id.to_string()],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+        };
+        assert!(
+            engine
+                .register_search_projections(RegisterSearchProjectionsRequest {
+                    scope: scope.clone(),
+                    profile_id: "dense-3d-v1".into(),
+                    projections: vec![SearchProjectionInput {
+                        memory_id: isolated_id,
+                        revision: isolated_source.0,
+                        content_hash: isolated_source.1,
+                        expansions: Vec::new(),
+                        vector: Some(vec![1.0, 0.0, 0.0]),
+                    }],
+                })
+                .is_err()
+        );
+        let projection = |memory_id, vector| {
+            let source = pending
+                .iter()
+                .find(|document| document.memory_id == memory_id)
+                .unwrap();
+            SearchProjectionInput {
+                memory_id,
+                revision: source.revision,
+                content_hash: source.content_hash.clone(),
+                expansions: Vec::new(),
+                vector: Some(vector),
+            }
+        };
+        engine
+            .register_search_projections(RegisterSearchProjectionsRequest {
+                scope: scope.clone(),
+                profile_id: "dense-3d-v1".into(),
+                projections: vec![
+                    projection(target_id, vec![1.0, 0.0, 0.0]),
+                    projection(distractor_id, vec![0.0, 1.0, 0.0]),
+                ],
+            })
+            .unwrap();
+
+        let pack = engine
+            .recall(RecallRequest {
+                query: "semantic vector query".into(),
+                scope: scope.clone(),
+                hints: crate::ContextHints {
+                    dense: Some(crate::DenseQuery {
+                        profile_id: "dense-3d-v1".into(),
+                        vector: vec![1.0, 0.0, 0.0],
+                        min_similarity: Some(0.5),
+                    }),
+                    ..crate::ContextHints::default()
+                },
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert_eq!(pack.hits[0].memory.memory_id, target_id);
+        assert!(pack.hits[0].signals.contains(&RetrievalSignal::DenseVector));
+        assert!(
+            pack.hits
+                .iter()
+                .all(|hit| hit.memory.memory_id != isolated_id)
+        );
+
+        let approximate_request = RecallRequest {
+            query: "semantic vector query".into(),
+            scope,
+            as_of: Some(Utc::now()),
+            hints: crate::ContextHints {
+                dense: Some(crate::DenseQuery {
+                    profile_id: "dense-3d-v1".into(),
+                    vector: vec![1.0, 0.0, 0.0],
+                    min_similarity: Some(0.5),
+                }),
+                ..crate::ContextHints::default()
+            },
+            ..RecallRequest::default()
+        };
+        let eligibility = CandidateEligibility::new(&approximate_request).unwrap();
+        let connection = engine.lock().unwrap();
+        let mut approximate_candidates = HashMap::new();
+        collect_dense_with_exact_limit(
+            &connection,
+            &approximate_request,
+            &eligibility,
+            &mut approximate_candidates,
+            1,
+        )
+        .unwrap();
+        assert_eq!(approximate_candidates.len(), 1);
+        assert!(approximate_candidates.contains_key(&target_id));
+    }
+
+    #[test]
+    fn deterministic_code_aliases_improve_runtime_error_recall() {
+        let engine = engine();
+        let mut relevant = remember_request(
+            "Listener collision",
+            "For EADDRINUSE, terminate the orphan listener or bind port zero.",
+        );
+        relevant.kind = MemoryKind::Procedure;
+        let relevant_id = engine.remember(relevant).unwrap().memory_ids[0];
+        let mut distractor = remember_request(
+            "Listener permission",
+            "For EACCES, choose an unprivileged port.",
+        );
+        distractor.kind = MemoryKind::Procedure;
+        engine.remember(distractor).unwrap();
+
+        let pack = engine
+            .recall(RecallRequest {
+                query: "startup port is already occupied".into(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert_eq!(pack.hits[0].memory.memory_id, relevant_id);
+        assert!(pack.hits[0].signals.contains(&RetrievalSignal::CodeAlias));
     }
 
     #[test]
@@ -5280,7 +6506,7 @@ mod tests {
     fn sparse_channel_prefers_recent_matches_before_its_limit() {
         let engine = engine();
         let mut newest = None;
-        for index in 0..45 {
+        for index in 0..300 {
             let mut request = remember_request(&format!("Sparse {index}"), "unrelated body");
             request.tags = vec!["symbol_key".into()];
             newest = Some(engine.remember(request).unwrap().memory_ids[0]);
@@ -5295,7 +6521,7 @@ mod tests {
         let connection = engine.lock().unwrap();
         let mut candidates = HashMap::new();
         collect_sparse(&connection, &request, &eligibility, &terms, &mut candidates).unwrap();
-        assert_eq!(candidates.len(), 40);
+        assert_eq!(candidates.len(), 256);
         assert!(candidates.contains_key(&newest.unwrap()));
     }
 

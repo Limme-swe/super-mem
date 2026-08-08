@@ -12,7 +12,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::{Durability, EngineOptions, Error, Result};
 
-pub(crate) const SCHEMA_VERSION: u32 = 4;
+pub(crate) const SCHEMA_VERSION: u32 = 5;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
@@ -119,6 +119,9 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
         }
         if current < 4 {
             migrate_v4(connection)?;
+        }
+        if current < 5 {
+            migrate_v5(connection)?;
         }
         Ok(())
     })();
@@ -550,6 +553,239 @@ fn migrate_v4(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v5(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            -- Exact diagnostic lookup is a first-class retrieval channel. The
+            -- partial expression index stays derived from canonical revision
+            -- attributes and avoids scanning every current revision.
+            CREATE INDEX memory_revisions_error_fingerprint
+                ON memory_revisions(
+                    json_extract(attributes_json,'$.error_fingerprint'),
+                    memory_id,
+                    revision
+                )
+                WHERE json_extract(attributes_json,'$.error_fingerprint') IS NOT NULL;
+
+            -- Background enrichment and coverage reporting use exact durable
+            -- scopes. Unlike the canonical-key index, this covers every live
+            -- head and also satisfies pending-work ordering without sorting
+            -- unrelated memories from the same namespace.
+            CREATE INDEX memory_heads_search_scope
+                ON memory_heads(
+                    namespace,
+                    scope_key,
+                    workspace_id,
+                    updated_seq,
+                    memory_id
+                )
+                WHERE state!='retracted';
+
+            -- Alias text lives in contentless FTS. This small derived marker
+            -- makes missing, revised, or algorithm-outdated alias projections
+            -- detectable without treating generated terms as snapshot truth.
+            CREATE TABLE search_alias_state (
+                memory_id          TEXT PRIMARY KEY,
+                revision           INTEGER NOT NULL
+                    CHECK(revision > 0),
+                algorithm_version  INTEGER NOT NULL
+                    CHECK(algorithm_version > 0),
+                FOREIGN KEY(memory_id, revision)
+                    REFERENCES memory_revisions(memory_id, revision)
+                    ON DELETE CASCADE
+            );
+
+            -- Profiles describe immutable, reproducible search generators.
+            -- They contain no provider secret or machine-local model path.
+            CREATE TABLE search_profiles (
+                profile_id         TEXT PRIMARY KEY
+                    CHECK(length(profile_id) BETWEEN 1 AND 256),
+                model_digest       TEXT NOT NULL
+                    CHECK(length(model_digest) BETWEEN 1 AND 256),
+                dimensions         INTEGER
+                    CHECK(dimensions IS NULL OR
+                          (typeof(dimensions)='integer' AND
+                           dimensions BETWEEN 1 AND 4096)),
+                signature_version  INTEGER NOT NULL DEFAULT 1
+                    CHECK(typeof(signature_version)='integer' AND
+                          signature_version=1),
+                created_at_ms      INTEGER NOT NULL
+                    CHECK(typeof(created_at_ms)='integer')
+            );
+
+            CREATE TRIGGER search_profiles_immutable
+            BEFORE UPDATE ON search_profiles
+            BEGIN
+                SELECT RAISE(ABORT, 'search profiles are immutable');
+            END;
+
+            -- Search projections are disposable derivatives of one current
+            -- canonical memory revision. Expansion-only profiles leave the
+            -- vector triplet NULL. Dense profiles store exact little-endian
+            -- f32 bytes, a deterministic 128-bit random-hyperplane signature,
+            -- and a finite positive norm. A later revision replaces the row
+            -- for the same profile and memory instead of accumulating stale
+            -- vectors in the hot index.
+            CREATE TABLE search_projections (
+                profile_id         TEXT NOT NULL,
+                memory_id          TEXT NOT NULL,
+                revision           INTEGER NOT NULL
+                    CHECK(revision > 0),
+                content_hash       TEXT NOT NULL
+                    CHECK(length(content_hash)=64 AND
+                          content_hash NOT GLOB '*[^0-9a-f]*'),
+                expansion          TEXT NOT NULL DEFAULT ''
+                    CHECK(length(expansion) <= 262144),
+                vector             BLOB,
+                signature          BLOB,
+                norm               REAL,
+                indexed_at_ms      INTEGER NOT NULL
+                    CHECK(typeof(indexed_at_ms)='integer'),
+                PRIMARY KEY(profile_id, memory_id),
+                FOREIGN KEY(profile_id) REFERENCES search_profiles(profile_id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY(memory_id, revision)
+                    REFERENCES memory_revisions(memory_id, revision)
+                    ON DELETE CASCADE,
+                CHECK(
+                    (vector IS NULL AND signature IS NULL AND norm IS NULL) OR
+                    (typeof(vector)='blob' AND length(vector) > 0 AND
+                     typeof(signature)='blob' AND length(signature) > 0 AND
+                     typeof(norm) IN ('real','integer') AND
+                     norm > 0.0 AND norm < 1.0e308)
+                )
+            );
+            CREATE INDEX search_projections_source
+                ON search_projections(memory_id, revision, profile_id, content_hash);
+            CREATE INDEX search_projections_profile_revision
+                ON search_projections(profile_id, revision, content_hash, memory_id);
+
+            -- Registration is a compare-and-swap against the current head.
+            -- Running inference never holds a database lock; these triggers
+            -- reject its result if the memory changed while it was in flight.
+            CREATE TRIGGER search_projections_current_insert
+            BEFORE INSERT ON search_projections
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM memory_heads h
+                JOIN memory_revisions r
+                  ON r.memory_id=h.memory_id AND r.revision=h.head_revision
+                WHERE h.memory_id=NEW.memory_id
+                  AND h.head_revision=NEW.revision
+                  AND r.content_hash=NEW.content_hash
+                  AND h.state!='retracted'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'search projection source is not current');
+            END;
+
+            CREATE TRIGGER search_projections_current_update
+            BEFORE UPDATE ON search_projections
+            WHEN NOT EXISTS (
+                SELECT 1
+                FROM memory_heads h
+                JOIN memory_revisions r
+                  ON r.memory_id=h.memory_id AND r.revision=h.head_revision
+                WHERE h.memory_id=NEW.memory_id
+                  AND h.head_revision=NEW.revision
+                  AND r.content_hash=NEW.content_hash
+                  AND h.state!='retracted'
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'search projection source is not current');
+            END;
+
+            -- SQLite CHECK constraints cannot reference another table. These
+            -- companion triggers bind dense payload sizes to the immutable
+            -- profile dimension on both insert and replacement.
+            CREATE TRIGGER search_projections_vector_insert
+            BEFORE INSERT ON search_projections
+            WHEN NEW.vector IS NOT NULL AND NOT EXISTS (
+                SELECT 1
+                FROM search_profiles p
+                WHERE p.profile_id=NEW.profile_id
+                  AND p.dimensions IS NOT NULL
+                  AND length(NEW.vector)=p.dimensions*4
+                  AND length(NEW.signature)=16
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'search projection vector or signature shape mismatch');
+            END;
+
+            CREATE TRIGGER search_projections_vector_update
+            BEFORE UPDATE ON search_projections
+            WHEN NEW.vector IS NOT NULL AND NOT EXISTS (
+                SELECT 1
+                FROM search_profiles p
+                WHERE p.profile_id=NEW.profile_id
+                  AND p.dimensions IS NOT NULL
+                  AND length(NEW.vector)=p.dimensions*4
+                  AND length(NEW.signature)=16
+            )
+            BEGIN
+                SELECT RAISE(ABORT, 'search projection vector or signature shape mismatch');
+            END;
+
+            -- FTS remains a contentless, rebuildable projection. Aliases are
+            -- deterministic code-oriented terms; expansions are generated off
+            -- the critical path and never become canonical memory evidence.
+            DROP TABLE memory_fts;
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                title,
+                body,
+                tags,
+                entities,
+                paths,
+                aliases,
+                expansions,
+                tokenize = 'unicode61 remove_diacritics 2',
+                content = '',
+                contentless_delete = 1
+            );
+            INSERT INTO memory_fts(
+                rowid,title,body,tags,entities,paths,aliases,expansions
+            )
+            SELECT h.docid,
+                   r.title,
+                   r.body,
+                   coalesce((SELECT group_concat(tag, ' ') FROM (
+                       SELECT t.tag AS tag FROM memory_tags t
+                       WHERE t.memory_id=h.memory_id
+                         AND t.revision=h.head_revision
+                       ORDER BY t.normalized,t.tag
+                   )), ''),
+                   coalesce((SELECT group_concat(entity, ' ') FROM (
+                       SELECT e.canonical || ' ' || e.display AS entity
+                       FROM memory_entities me
+                       JOIN entities e ON e.entity_id=me.entity_id
+                       WHERE me.memory_id=h.memory_id
+                         AND me.revision=h.head_revision
+                       ORDER BY e.kind,e.canonical,e.display,e.entity_id
+                   )), ''),
+                   coalesce((SELECT group_concat(path, ' ') FROM (
+                       SELECT a.path || ' ' || a.symbol AS path
+                       FROM memory_artifacts ma
+                       JOIN artifacts a ON a.artifact_id=ma.artifact_id
+                       WHERE ma.memory_id=h.memory_id
+                         AND ma.revision=h.head_revision
+                       ORDER BY a.repo_id,a.path,a.symbol,a.content_hash,
+                                a.git_oid,a.language,a.artifact_id
+                   )), ''),
+                   '',
+                   ''
+            FROM memory_heads h
+            JOIN memory_revisions r
+              ON r.memory_id=h.memory_id AND r.revision=h.head_revision
+            WHERE h.state!='retracted';
+
+            PRAGMA user_version=5;
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -691,6 +927,247 @@ mod tests {
                 "updated_seq",
                 "memory_id"
             ]
+        );
+    }
+
+    #[test]
+    fn v4_migration_adds_constrained_rebuildable_search_projections() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        migrate_v1(&connection).unwrap();
+        migrate_v2(&connection).unwrap();
+        migrate_v3(&connection).unwrap();
+        migrate_v4(&connection).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                INSERT INTO events(
+                    seq,event_id,namespace,kind,scope_json,content,
+                    attributes_json,trust,occurred_at_ms,ingested_at_ms,
+                    content_hash,redaction_count
+                ) VALUES(
+                    1,'018f0000-0000-7000-8000-000000000101','default',
+                    'explicit_memory','{"namespace":"default"}','source',
+                    '{}','explicit',1,1,
+                    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',0
+                );
+                INSERT INTO memory_heads(
+                    docid,memory_id,namespace,scope_key,kind,state,
+                    head_revision,importance,confidence,trust,created_at_ms,
+                    updated_at_ms,created_seq,updated_seq
+                ) VALUES(
+                    1,'018f0000-0000-7000-8000-000000000102','default',
+                    'scope','procedure','active',1,0.8,0.9,'explicit',1,1,1,1
+                );
+                INSERT INTO memory_revisions(
+                    memory_id,revision,title,body,attributes_json,scope_json,
+                    content_hash,recorded_at_ms,recorded_seq
+                ) VALUES(
+                    '018f0000-0000-7000-8000-000000000102',1,
+                    'Dense migration','semantic searchable needle',
+                    '{"error_fingerprint":"rustc:E0277"}',
+                    '{"namespace":"default"}',
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    1,1
+                );
+                INSERT INTO memory_fts(rowid,title,body,tags,entities,paths)
+                VALUES(1,'Dense migration','semantic searchable needle','','','');
+                "#,
+            )
+            .unwrap();
+
+        migrate_v5(&connection).unwrap();
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let fts_columns = connection
+            .prepare("PRAGMA table_info(memory_fts)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            fts_columns,
+            [
+                "title",
+                "body",
+                "tags",
+                "entities",
+                "paths",
+                "aliases",
+                "expansions"
+            ]
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'needle'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM search_alias_state", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0,
+            "legacy heads must be detected as needing alias backfill"
+        );
+        assert!(connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='index' AND name='memory_revisions_error_fingerprint'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok());
+        let fingerprint_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT memory_id FROM memory_revisions WHERE json_extract(attributes_json,'$.error_fingerprint')=?1",
+            )
+            .unwrap()
+            .query_map(["rustc:E0277"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(fingerprint_plan.contains("memory_revisions_error_fingerprint"));
+        let pending_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT memory_id FROM memory_heads WHERE namespace=?1 AND scope_key=?2 AND workspace_id IS ?3 AND state!='retracted' ORDER BY updated_seq,memory_id LIMIT 10",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params!["default", "scope", Option::<String>::None],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        assert!(pending_plan.contains("memory_heads_search_scope"));
+        let expansion_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT expansion FROM search_projections WHERE memory_id=?1 AND revision=?2 AND expansion!='' ORDER BY profile_id",
+            )
+            .unwrap()
+            .query_map(
+                rusqlite::params!["018f0000-0000-7000-8000-000000000102", 1],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            expansion_plan
+                .iter()
+                .any(|detail| detail.contains("search_projections_source")),
+            "expected source index in query plan: {expansion_plan:?}"
+        );
+        assert!(
+            expansion_plan
+                .iter()
+                .all(|detail| !detail.contains("USE TEMP B-TREE")),
+            "source lookup should stream profile order: {expansion_plan:?}"
+        );
+
+        connection
+            .execute(
+                "INSERT INTO search_alias_state(memory_id,revision,algorithm_version) VALUES(?1,1,1)",
+                ["018f0000-0000-7000-8000-000000000102"],
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE search_alias_state SET revision=2 WHERE memory_id=?1",
+                    ["018f0000-0000-7000-8000-000000000102"],
+                )
+                .is_err()
+        );
+
+        connection
+            .execute_batch(
+                r"
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('dense-v1','digest-v1',3,10);
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('expansion-v1','digest-v1',NULL,10);
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'dense-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'likely semantic query',zeroblob(12),zeroblob(16),1.0,11
+                );
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'expansion-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'another likely query',NULL,NULL,NULL,11
+                );
+                ",
+            )
+            .unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE search_profiles SET model_digest='changed' WHERE profile_id='dense-v1'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE search_projections SET vector=zeroblob(8) WHERE profile_id='dense-v1'",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(connection
+            .execute(
+                "UPDATE search_projections SET signature=zeroblob(1) WHERE profile_id='dense-v1'",
+                [],
+            )
+            .is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE search_projections SET content_hash=?1 WHERE profile_id='dense-v1'",
+                    ["cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"],
+                )
+                .is_err()
+        );
+        assert!(connection
+            .execute(
+                "INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms) VALUES('bad-dim','digest',0,12)",
+                [],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "INSERT INTO search_profiles(profile_id,model_digest,dimensions,signature_version,created_at_ms) VALUES('future-signature','digest',3,2,12)",
+                [],
+            )
+            .is_err());
+        assert!(
+            connection
+                .execute(
+                    "UPDATE search_projections SET signature=NULL WHERE profile_id='dense-v1'",
+                    [],
+                )
+                .is_err()
         );
     }
 

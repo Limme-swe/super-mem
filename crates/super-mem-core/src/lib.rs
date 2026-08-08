@@ -22,6 +22,7 @@ mod git;
 mod ranking;
 mod redaction;
 mod schema;
+mod search;
 mod types;
 
 pub use applicability::classify_applicability;

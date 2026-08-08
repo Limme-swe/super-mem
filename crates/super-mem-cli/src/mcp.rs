@@ -21,9 +21,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use super_mem_core::{
     Applicability, ArtifactRef, CheckpointAttempt, CheckpointDecision, CheckpointOutcome,
-    CheckpointRequest, ContextHints, FeedbackRequest, FeedbackSignal, Memory, MemoryEngine,
-    MemoryKind, ObserveRequest, RecallRequest, RememberRequest, RepositoryContext, RetractRequest,
-    Scope, TrustLevel, canonical_path_digest, classify_applicability, discover_repository,
+    CheckpointRequest, ContextHints, DenseQuery, FeedbackRequest, FeedbackSignal, Memory,
+    MemoryEngine, MemoryKind, ObserveRequest, RecallRequest, RememberRequest, RepositoryContext,
+    RetractRequest, Scope, TrustLevel, canonical_path_digest, classify_applicability,
+    discover_repository,
 };
 
 use crate::app::{
@@ -137,6 +138,20 @@ impl MemoryServer {
         if arguments.query.trim().is_empty() {
             return tool_error("query must not be empty");
         }
+        if arguments.dense_profile.is_some() != arguments.dense_vector.is_some()
+            || (arguments.dense_min_similarity.is_some() && arguments.dense_profile.is_none())
+        {
+            return tool_error(
+                "dense_profile and dense_vector must be provided together; dense_min_similarity requires both",
+            );
+        }
+        if arguments
+            .dense_vector
+            .as_ref()
+            .is_some_and(|vector| vector.is_empty() || vector.len() > 4_096)
+        {
+            return tool_error("dense_vector must contain between 1 and 4096 components");
+        }
         let result = self
             .run_read_blocking(move |engine, policy| {
                 let scope = policy.current_scope(arguments.session_id.clone())?;
@@ -153,7 +168,11 @@ impl MemoryServer {
             })
             .await;
         match result {
-            Ok(pack) => tool_text(context_envelope(&pack.rendered)),
+            Ok(pack) => tool_text(format!(
+                "query_id: {}\n{}",
+                pack.query_id,
+                context_envelope(&pack.rendered)
+            )),
             Err(error) => tool_error(error),
         }
     }
@@ -607,6 +626,15 @@ struct MemoryContextArgs {
     /// Exact code symbols, crates, services, people, or other entity identities to boost.
     #[serde(default)]
     entities: Vec<String>,
+    /// Registered profile that produced `dense_vector`.
+    #[serde(default)]
+    dense_profile: Option<String>,
+    /// Optional caller-generated dense query vector; Super Mem never invokes a model.
+    #[serde(default)]
+    dense_vector: Option<Vec<f32>>,
+    /// Optional minimum cosine similarity for dense candidates.
+    #[serde(default)]
+    dense_min_similarity: Option<f32>,
     /// Repository-relative files whose current fingerprints should guide recall.
     #[serde(default)]
     files: Vec<String>,
@@ -617,6 +645,14 @@ struct MemoryContextArgs {
 
 impl MemoryContextArgs {
     fn into_recall_request(self, scope: Scope, artifacts: Vec<ArtifactRef>) -> RecallRequest {
+        let dense = self
+            .dense_profile
+            .zip(self.dense_vector)
+            .map(|(profile_id, vector)| DenseQuery {
+                profile_id,
+                vector,
+                min_similarity: self.dense_min_similarity,
+            });
         RecallRequest {
             query: self.query,
             scope,
@@ -629,6 +665,7 @@ impl MemoryContextArgs {
                 error_fingerprint: self.error_fingerprint,
                 entities: self.entities,
                 artifacts,
+                dense,
             },
             ..RecallRequest::default()
         }
@@ -1037,6 +1074,9 @@ mod tests {
                 include_superseded: false,
                 error_fingerprint: None,
                 entities: Vec::new(),
+                dense_profile: None,
+                dense_vector: None,
+                dense_min_similarity: None,
                 files: Vec::new(),
                 session_id: None,
             }))
@@ -1192,6 +1232,9 @@ mod tests {
                 include_superseded: false,
                 error_fingerprint: None,
                 entities: Vec::new(),
+                dense_profile: None,
+                dense_vector: None,
+                dense_min_similarity: None,
                 files: Vec::new(),
                 session_id: None,
             }))
@@ -1199,7 +1242,53 @@ mod tests {
         assert_ne!(recalled.is_error, Some(true));
         let result = serde_json::to_string(&recalled).unwrap();
         assert!(result.contains("silver-lantern"));
+        assert!(result.contains("query_id: "));
         assert_eq!(result.matches("<super-mem-context>").count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dense_context_arguments_fail_closed_before_blocking_work() {
+        let server = MemoryServer::new(
+            MemoryEngine::open_in_memory(EngineOptions::default()).unwrap(),
+            policy(),
+        );
+        let threshold_only = server
+            .memory_context(Parameters(MemoryContextArgs {
+                query: "invalid dense request".into(),
+                limit: None,
+                token_budget: None,
+                include_stale: false,
+                include_divergent: false,
+                include_superseded: false,
+                error_fingerprint: None,
+                entities: Vec::new(),
+                dense_profile: None,
+                dense_vector: None,
+                dense_min_similarity: Some(0.2),
+                files: Vec::new(),
+                session_id: None,
+            }))
+            .await;
+        assert_eq!(threshold_only.is_error, Some(true));
+
+        let oversized = server
+            .memory_context(Parameters(MemoryContextArgs {
+                query: "oversized dense request".into(),
+                limit: None,
+                token_budget: None,
+                include_stale: false,
+                include_divergent: false,
+                include_superseded: false,
+                error_fingerprint: None,
+                entities: Vec::new(),
+                dense_profile: Some("profile".into()),
+                dense_vector: Some(vec![1.0; 4_097]),
+                dense_min_similarity: None,
+                files: Vec::new(),
+                session_id: None,
+            }))
+            .await;
+        assert_eq!(oversized.is_error, Some(true));
     }
 
     #[tokio::test(flavor = "current_thread")]

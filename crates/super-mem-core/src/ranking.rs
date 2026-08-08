@@ -7,12 +7,17 @@ use chrono::{DateTime, Utc};
 use crate::{Applicability, Memory, MemoryKind, MemoryState, RecallHit, RetrievalSignal};
 
 const RRF_K: f64 = 60.0;
-const SIGNAL_COUNT: usize = 7;
+const SIGNAL_COUNT: usize = 12;
 const SIGNALS: [RetrievalSignal; SIGNAL_COUNT] = [
     RetrievalSignal::Exact,
     RetrievalSignal::ErrorFingerprint,
     RetrievalSignal::ArtifactVerified,
+    RetrievalSignal::DenseVector,
+    RetrievalSignal::LexicalStrict,
     RetrievalSignal::Lexical,
+    RetrievalSignal::CodeAliasStrict,
+    RetrievalSignal::CodeAlias,
+    RetrievalSignal::SemanticExpansion,
     RetrievalSignal::Sparse,
     RetrievalSignal::Entity,
     RetrievalSignal::Recency,
@@ -52,6 +57,14 @@ impl Candidate {
 }
 
 pub(crate) fn safe_fts_query(query: &str) -> Option<String> {
+    fts_terms(query, 24).map(|terms| terms.join(" OR "))
+}
+
+pub(crate) fn safe_fts_strict_query(query: &str) -> Option<String> {
+    fts_terms(query, 8).map(|terms| terms.join(" AND "))
+}
+
+fn fts_terms(query: &str, maximum: usize) -> Option<Vec<String>> {
     let mut terms = Vec::new();
     let mut current = String::new();
     for character in query.chars() {
@@ -63,13 +76,12 @@ pub(crate) fn safe_fts_query(query: &str) -> Option<String> {
         } else {
             push_term(&mut terms, &mut current);
         }
-        if terms.len() >= 24 {
+        if terms.len() >= maximum {
             break;
         }
     }
     push_term(&mut terms, &mut current);
-    terms.truncate(24);
-    terms.dedup();
+    terms.truncate(maximum);
     if terms.is_empty() {
         None
     } else {
@@ -77,8 +89,7 @@ pub(crate) fn safe_fts_query(query: &str) -> Option<String> {
             terms
                 .into_iter()
                 .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
-                .collect::<Vec<_>>()
-                .join(" OR "),
+                .collect(),
         )
     }
 }
@@ -127,6 +138,11 @@ pub(crate) fn score_candidate(
         reasons.push(match signal {
             RetrievalSignal::Exact => "exact_text".to_owned(),
             RetrievalSignal::Lexical => "lexical_match".to_owned(),
+            RetrievalSignal::LexicalStrict => "all_lexical_terms".to_owned(),
+            RetrievalSignal::CodeAlias => "code_alias_match".to_owned(),
+            RetrievalSignal::CodeAliasStrict => "all_code_alias_terms".to_owned(),
+            RetrievalSignal::SemanticExpansion => "semantic_expansion".to_owned(),
+            RetrievalSignal::DenseVector => "dense_vector".to_owned(),
             RetrievalSignal::Sparse => "identifier_or_artifact".to_owned(),
             RetrievalSignal::Entity => "entity_match".to_owned(),
             RetrievalSignal::Recency => "recent_in_scope".to_owned(),
@@ -158,7 +174,11 @@ pub(crate) fn score_candidate(
 fn source_weight(signal: RetrievalSignal) -> f64 {
     match signal {
         RetrievalSignal::Exact => 1.35,
-        RetrievalSignal::Lexical => 1.00,
+        RetrievalSignal::Lexical | RetrievalSignal::DenseVector => 1.00,
+        RetrievalSignal::LexicalStrict => 1.12,
+        RetrievalSignal::CodeAlias => 0.86,
+        RetrievalSignal::CodeAliasStrict => 0.98,
+        RetrievalSignal::SemanticExpansion => 0.78,
         RetrievalSignal::Sparse => 0.82,
         RetrievalSignal::Entity => 0.72,
         RetrievalSignal::Recency => 0.20,
@@ -172,10 +192,15 @@ fn signal_order(signal: RetrievalSignal) -> u8 {
         RetrievalSignal::Exact => 0,
         RetrievalSignal::ErrorFingerprint => 1,
         RetrievalSignal::ArtifactVerified => 2,
-        RetrievalSignal::Lexical => 3,
-        RetrievalSignal::Sparse => 4,
-        RetrievalSignal::Entity => 5,
-        RetrievalSignal::Recency => 6,
+        RetrievalSignal::DenseVector => 3,
+        RetrievalSignal::LexicalStrict => 4,
+        RetrievalSignal::Lexical => 5,
+        RetrievalSignal::CodeAliasStrict => 6,
+        RetrievalSignal::CodeAlias => 7,
+        RetrievalSignal::SemanticExpansion => 8,
+        RetrievalSignal::Sparse => 9,
+        RetrievalSignal::Entity => 10,
+        RetrievalSignal::Recency => 11,
     }
 }
 
