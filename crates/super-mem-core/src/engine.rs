@@ -575,12 +575,19 @@ impl MemoryEngine {
                     .get("error_fingerprint")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let group_identity = checkpoint_attempt_group_identity(
+                    reason,
+                    &event,
+                    &action,
+                    fingerprint.as_deref(),
+                );
                 promoted_attempts.push(AutomaticCheckpointAttempt {
                     action: action.clone(),
                     result: result.clone(),
                     succeeded,
                     fingerprint,
                     reason,
+                    group_identity,
                 });
                 if reason == CheckpointPromotionReason::Verification {
                     let verification = format!("{action}: {result}");
@@ -2474,6 +2481,7 @@ struct AutomaticCheckpointAttempt {
     succeeded: bool,
     fingerprint: Option<String>,
     reason: CheckpointPromotionReason,
+    group_identity: String,
 }
 
 struct CheckpointAttemptGroup {
@@ -2552,11 +2560,8 @@ fn coalesce_checkpoint_attempts(
 ) -> Vec<crate::CheckpointAttempt> {
     let mut groups = BTreeMap::<String, CheckpointAttemptGroup>::new();
     for (order, attempt) in attempts.into_iter().enumerate() {
-        let canonical_key = checkpoint_attempt_canonical_key(
-            attempt.reason,
-            &attempt.action,
-            attempt.fingerprint.as_deref(),
-        );
+        let canonical_key =
+            checkpoint_attempt_canonical_key(attempt.reason, &attempt.group_identity);
         let group = groups
             .entry(canonical_key.clone())
             .or_insert_with(|| CheckpointAttemptGroup {
@@ -2656,24 +2661,42 @@ fn coalesced_checkpoint_result(group: &CheckpointAttemptGroup) -> String {
     }
 }
 
-fn checkpoint_attempt_canonical_key(
-    reason: CheckpointPromotionReason,
-    action: &str,
-    fingerprint: Option<&str>,
-) -> String {
+fn checkpoint_attempt_canonical_key(reason: CheckpointPromotionReason, identity: &str) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"super-mem:checkpoint-attempt-key:v2\0");
-    let identity = if reason == CheckpointPromotionReason::FailedExecution {
-        fingerprint.unwrap_or(action)
-    } else {
-        action
-    };
     for part in [reason.as_str(), identity] {
         let normalized = part.split_whitespace().collect::<Vec<_>>().join(" ");
         hasher.update(&(normalized.len() as u64).to_le_bytes());
         hasher.update(normalized.as_bytes());
     }
     format!("auto:{}:v2:{}", reason.as_str(), hasher.finalize().to_hex())
+}
+
+fn checkpoint_attempt_group_identity(
+    reason: CheckpointPromotionReason,
+    event: &SessionEvent,
+    action: &str,
+    fingerprint: Option<&str>,
+) -> String {
+    if reason == CheckpointPromotionReason::FailedExecution
+        && let Some(fingerprint) = fingerprint
+    {
+        return format!("diagnostic:{fingerprint}");
+    }
+    if event
+        .attributes
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(|command| !command.trim().is_empty())
+    {
+        return format!("action:{action}");
+    }
+    // Some adapters can mark a result as verification but cannot pass the
+    // command without exposing it in argv. Their tool name alone (often just
+    // `Bash`) is not a safe grouping key: unrelated tests would collapse.
+    // Preserve those events independently until the adapter has a structured
+    // stdin event envelope.
+    format!("event:{}", event.event_id)
 }
 
 fn session_evidence_relation(event: &SessionEvent) -> &'static str {
@@ -6686,6 +6709,34 @@ mod tests {
         assert_eq!(
             classify_checkpoint_event(&event),
             Some(CheckpointPromotionReason::ExplicitSalience)
+        );
+
+        let mut adapter_event = SessionEvent {
+            event_id: "tool-call-one".into(),
+            kind: EventKind::ToolResult.as_str().into(),
+            content: "tests passed".into(),
+            attributes: BTreeMap::from([
+                ("tool_name".into(), json!("Bash")),
+                ("succeeded".into(), json!(true)),
+                ("verification".into(), json!(true)),
+            ]),
+        };
+        let first = checkpoint_attempt_group_identity(
+            CheckpointPromotionReason::Verification,
+            &adapter_event,
+            "Bash",
+            None,
+        );
+        adapter_event.event_id = "tool-call-two".into();
+        let second = checkpoint_attempt_group_identity(
+            CheckpointPromotionReason::Verification,
+            &adapter_event,
+            "Bash",
+            None,
+        );
+        assert_ne!(
+            first, second,
+            "a bare tool name must not merge unrelated runs"
         );
     }
 
