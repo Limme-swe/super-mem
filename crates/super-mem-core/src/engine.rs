@@ -20,13 +20,13 @@ use serde_json::{Value, json};
 
 use crate::{
     Applicability, ArtifactProjectionStatus, ArtifactRef, CheckpointOutcome, CheckpointRequest,
-    ContextItem, ContextPack, ContextSection, EngineOptions, EntityRef, Error, Event, EventId,
-    EventKind, EvidenceRef, FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory,
-    MemoryFeedback, MemoryHistory, MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState,
-    ObserveReceipt, ObserveRequest, PendingSearchDocument, QueryId, RecallHit, RecallRequest,
-    RegisterSearchProjectionsRequest, RepositoryContext, Result, RetractRequest, RetrievalSignal,
-    Scope, SearchIndexStatus, SearchProfile, SearchProfileRegistration, SearchProjectionReceipt,
-    Status, TrustLevel, WriteReceipt,
+    ContextItem, ContextPack, ContextSection, DatabaseDiagnostics, EngineOptions, EntityRef, Error,
+    Event, EventId, EventKind, EvidenceRef, FeedbackRequest, GitRelation, ImportReceipt, LinkId,
+    Memory, MemoryFeedback, MemoryHistory, MemoryId, MemoryKind, MemoryLink, MemoryRevision,
+    MemoryState, ObserveReceipt, ObserveRequest, PendingSearchDocument, QueryId, RecallHit,
+    RecallRequest, RegisterSearchProjectionsRequest, RepositoryContext, Result, RetractRequest,
+    RetrievalSignal, Scope, SearchIndexStatus, SearchProfile, SearchProfileRegistration,
+    SearchProjectionReceipt, Status, TrustLevel, WriteReceipt,
     applicability::{
         ArtifactFingerprint, ArtifactFingerprintSet, artifact_fingerprint,
         classify_applicability_fingerprints_with_relation, fingerprint_artifacts,
@@ -34,7 +34,10 @@ use crate::{
     artifacts::materialize_current_artifacts,
     ranking::{Candidate, safe_fts_query, safe_fts_strict_query, score_candidate, select_mmr},
     redaction::Redactor,
-    schema::{SCHEMA_VERSION, initialize, rebuild_artifact_fingerprints},
+    schema::{
+        SCHEMA_VERSION, initialize, inspect_application_invariants, inspect_schema_manifest,
+        rebuild_artifact_fingerprints,
+    },
     search::{
         VECTOR_SIGNATURE_VERSION, code_aliases, cosine_similarity, decode_f32_vector,
         encode_f32_vector, hamming_distance, rank_by_cosine, validate_signature_width,
@@ -1603,6 +1606,7 @@ impl MemoryEngine {
         status.degraded = status.missing != 0 || status.corrupt != 0 || status.orphaned != 0;
         drop(rows);
         drop(statement);
+
         transaction.commit()?;
         Ok(status)
     }
@@ -1833,6 +1837,108 @@ impl MemoryEngine {
             retracted_memories: count("SELECT count(*) FROM memory_heads WHERE state='retracted'")?,
             database_bytes: page_count.max(0).saturating_mul(page_size.max(0)) as u64,
             durability: self.options.durability,
+        })
+    }
+
+    /// Runs explicit bounded integrity checks and probes writer availability.
+    ///
+    /// This operation can wait up to the configured busy timeout when another
+    /// process owns `SQLite`'s writer lock. It never commits canonical changes.
+    pub fn database_diagnostics(&self) -> Result<DatabaseDiagnostics> {
+        const MAX_QUICK_CHECK_FINDINGS: usize = 32;
+        const MAX_FINDING_BYTES: usize = 1_024;
+
+        let connection = self.lock()?;
+        let mut statement = connection.prepare("PRAGMA quick_check(33)")?;
+        let mut rows = statement.query([])?;
+        let mut quick_check_findings = Vec::new();
+        let mut quick_check_ok = true;
+        let mut quick_check_total = 0_usize;
+        while let Some(row) = rows.next()? {
+            let finding = row.get::<_, String>(0)?;
+            if finding == "ok" {
+                continue;
+            }
+            quick_check_ok = false;
+            quick_check_total = quick_check_total.saturating_add(1);
+            if quick_check_findings.len() < MAX_QUICK_CHECK_FINDINGS {
+                quick_check_findings.push(truncate_utf8_bytes(&finding, MAX_FINDING_BYTES));
+            }
+        }
+        let quick_check_truncated = quick_check_total > MAX_QUICK_CHECK_FINDINGS;
+        drop(rows);
+        drop(statement);
+
+        let mut statement =
+            connection.prepare("SELECT 1 FROM pragma_foreign_key_check LIMIT 33")?;
+        let mut rows = statement.query([])?;
+        let mut foreign_key_violations = 0_u64;
+        while rows.next()?.is_some() {
+            foreign_key_violations = foreign_key_violations.saturating_add(1);
+        }
+        let foreign_key_violations_truncated =
+            foreign_key_violations > MAX_QUICK_CHECK_FINDINGS as u64;
+        foreign_key_violations = foreign_key_violations.min(MAX_QUICK_CHECK_FINDINGS as u64);
+        drop(rows);
+        drop(statement);
+
+        let (schema_manifest_ok, schema_manifest_findings, schema_manifest_truncated) =
+            inspect_schema_manifest(&connection, SCHEMA_VERSION, MAX_QUICK_CHECK_FINDINGS)?;
+        let (
+            application_invariants_ok,
+            application_invariant_findings,
+            application_invariant_findings_truncated,
+        ) = inspect_application_invariants(&connection, SCHEMA_VERSION, MAX_QUICK_CHECK_FINDINGS)?;
+
+        let (writer_lock_available, writer_lock_error) =
+            match connection.execute_batch("BEGIN IMMEDIATE;") {
+                Ok(()) => {
+                    let rollback = connection.execute_batch("ROLLBACK;");
+                    match rollback {
+                        Ok(()) if connection.is_autocommit() => (true, None),
+                        Ok(()) => (
+                            false,
+                            Some("writer probe did not return to autocommit mode".into()),
+                        ),
+                        Err(error) => {
+                            let _ = connection.execute_batch("ROLLBACK;");
+                            (
+                                false,
+                                Some(truncate_utf8_bytes(&error.to_string(), MAX_FINDING_BYTES)),
+                            )
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = connection.execute_batch("ROLLBACK;");
+                    (
+                        false,
+                        Some(truncate_utf8_bytes(&error.to_string(), MAX_FINDING_BYTES)),
+                    )
+                }
+            };
+        let healthy = quick_check_ok
+            && foreign_key_violations == 0
+            && schema_manifest_ok
+            && application_invariants_ok
+            && writer_lock_available;
+        Ok(DatabaseDiagnostics {
+            quick_check_ok,
+            quick_check_findings,
+            quick_check_truncated,
+            foreign_key_violations,
+            foreign_key_violations_truncated,
+            schema_manifest_ok,
+            schema_current: true,
+            schema_manifest_findings,
+            schema_manifest_truncated,
+            application_invariants_ok,
+            application_invariant_findings,
+            application_invariant_findings_truncated,
+            writer_lock_checked: true,
+            writer_lock_available,
+            writer_lock_error,
+            healthy,
         })
     }
 
@@ -2535,6 +2641,17 @@ fn redact_string_field(engine: &MemoryEngine, field: &mut String, count: &mut us
     let (safe, replacements) = engine.redact_text(field);
     *field = safe;
     *count += replacements;
+}
+
+fn truncate_utf8_bytes(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 struct PreparedMemory {
@@ -5903,6 +6020,59 @@ mod tests {
 
     fn engine() -> MemoryEngine {
         MemoryEngine::open_in_memory(EngineOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn database_diagnostics_reports_integrity_and_foreign_key_damage() {
+        let engine = engine();
+        let healthy = engine.database_diagnostics().unwrap();
+        assert!(healthy.quick_check_ok);
+        assert!(healthy.quick_check_findings.is_empty());
+        assert_eq!(healthy.foreign_key_violations, 0);
+        assert!(healthy.writer_lock_available);
+        assert!(healthy.healthy);
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     INSERT INTO feedback(memory_id,signal,created_at_ms)
+                     VALUES('missing-memory','used',0);
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+        }
+        let damaged = engine.database_diagnostics().unwrap();
+        assert!(damaged.quick_check_ok);
+        assert_eq!(damaged.foreign_key_violations, 1);
+        assert!(damaged.writer_lock_available);
+        assert!(!damaged.healthy);
+    }
+
+    #[test]
+    fn database_diagnostics_reports_a_busy_writer_without_committing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("memory.sqlite3");
+        let options = EngineOptions {
+            busy_timeout_ms: 10,
+            ..EngineOptions::default()
+        };
+        let engine = MemoryEngine::open(&database, options).unwrap();
+        let locking_connection = Connection::open(&database).unwrap();
+        locking_connection
+            .execute_batch("BEGIN IMMEDIATE;")
+            .unwrap();
+
+        let diagnostics = engine.database_diagnostics().unwrap();
+        assert!(diagnostics.quick_check_ok);
+        assert_eq!(diagnostics.foreign_key_violations, 0);
+        assert!(!diagnostics.writer_lock_available);
+        assert!(diagnostics.writer_lock_error.is_some());
+        assert!(!diagnostics.healthy);
+
+        locking_connection.execute_batch("ROLLBACK;").unwrap();
+        assert!(engine.database_diagnostics().unwrap().healthy);
     }
 
     fn as_legacy_v1_snapshot(snapshot: &str) -> String {

@@ -1237,6 +1237,73 @@ pub struct Status {
     pub durability: Durability,
 }
 
+/// Explicit database-integrity and writer-availability diagnostics.
+///
+/// Unlike [`Status`], this performs `SQLite` integrity work and is intended for
+/// an operator-invoked health check rather than a hot path.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct DatabaseDiagnostics {
+    /// Whether `SQLite`'s bounded quick check returned only `ok`.
+    pub quick_check_ok: bool,
+    /// Bounded `SQLite` quick-check findings. Empty when the check passed.
+    pub quick_check_findings: Vec<String>,
+    /// Whether more quick-check findings may exist beyond the reported bound.
+    pub quick_check_truncated: bool,
+    /// Canonical foreign-key violations visible to the current connection.
+    pub foreign_key_violations: u64,
+    /// Whether more foreign-key violations exist beyond the reported bound.
+    pub foreign_key_violations_truncated: bool,
+    /// Whether all required schema objects match the stored schema version.
+    pub schema_manifest_ok: bool,
+    /// Whether the store is already at this binary's current schema version.
+    pub schema_current: bool,
+    /// Bounded missing or changed required schema objects.
+    pub schema_manifest_findings: Vec<String>,
+    /// Whether more schema findings exist beyond the reported bound.
+    pub schema_manifest_truncated: bool,
+    /// Whether canonical cross-table relationships required by reads hold.
+    #[serde(default)]
+    pub application_invariants_ok: bool,
+    /// Bounded names of failed canonical relationship checks.
+    #[serde(default)]
+    pub application_invariant_findings: Vec<String>,
+    /// Whether more application-invariant findings exist beyond the bound.
+    #[serde(default)]
+    pub application_invariant_findings_truncated: bool,
+    /// Whether the inspector attempted a writer-lock probe.
+    pub writer_lock_checked: bool,
+    /// Whether the probe verified effective write access and writer-lock
+    /// availability without committing canonical data. False when access or
+    /// lock verification failed or was skipped.
+    pub writer_lock_available: bool,
+    /// Bounded access or lock error when the writer probe failed.
+    pub writer_lock_error: Option<String>,
+    /// True only when every integrity and availability check passed.
+    pub healthy: bool,
+}
+
+/// Non-creating database status returned by an explicit operator inspection.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct DatabaseInspection {
+    /// Stored schema version observed without running migrations.
+    pub schema_version: u32,
+    /// Latest immutable event sequence.
+    pub database_seq: i64,
+    /// Total immutable events.
+    pub events: u64,
+    /// Active or contested memories.
+    pub active_memories: u64,
+    /// Superseded memories.
+    pub superseded_memories: u64,
+    /// Retracted memories.
+    pub retracted_memories: u64,
+    /// Current `SQLite` page storage in bytes, excluding WAL.
+    pub database_bytes: u64,
+    /// Integrity and writer-availability diagnostics.
+    pub diagnostics: DatabaseDiagnostics,
+}
+
 /// Result of restoring a full JSON Lines snapshot into an empty database.
 #[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
 pub struct ImportReceipt {

@@ -126,6 +126,32 @@ The model-facing surface has four tools:
 
 Database status, import/export, and physical purge remain CLI operations.
 
+Run an explicit local health check after installing an adapter or when capture
+appears silent:
+
+~~~sh
+supermem --json doctor --cwd /absolute/path/to/repository
+~~~
+
+`doctor` requires an initialized store and never creates, migrates, checkpoints,
+recovers, or changes its journal mode. It pins the audited database identity,
+checks writer access with native file locks, and inspects only a stable copy.
+Unix uses a mode-`0600` temporary file; Windows uses an in-memory copy capped at
+512 MiB so database contents never inherit a temporary-directory ACL. An
+abruptly killed Unix process can leave its private copy in the OS temporary
+directory. Copying and SQLite work share a five-second deadline, SQLite value
+sizes are capped, and integrity includes canonical cross-table relationships in
+addition to quick-check, foreign-key, and exact-schema checks. Live WAL state
+and rollback journals are reported without letting SQLite open the source
+because even a read-only SQLite connection can rewrite shared-memory state.
+File aliases and Unix permissions are checked, Git subprocesses have a
+two-second aggregate deadline and bounded output, and scope environment values
+are redacted. A machine-local identity digest makes path exchange observations
+correlatable without emitting raw device/file IDs. It exits nonzero when a
+required check fails.
+The JSON report still contains machine-local paths and a credential-free
+repository probe, so review it before sharing it outside the machine.
+
 The CLI exposes the same history as JSON:
 
 ~~~sh

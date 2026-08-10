@@ -6,6 +6,16 @@ Notable changes are recorded here. Versioning follows Semantic Versioning. Befor
 
 ### Added
 
+- Fail-closed, non-creating `supermem doctor` diagnostics for a versioned schema
+  manifest, bounded SQLite/FK and canonical-relationship integrity,
+  writer-lock availability, database and sidecar alias safety, binary identity,
+  redacted scope environment, and deadline/output-bounded Git probes. A pinned
+  source identity, descriptor-owned SQLite lock protocol, and immutable private
+  snapshot keep live WAL and rollback-journal evidence from being opened,
+  checkpointed, recovered, chmodded, or migrated by diagnostics. SQLite
+  inspection has a shared five-second work deadline and value-size limits;
+  Windows holds its capped snapshot in memory, uses 128-bit local file IDs, and
+  does not inherit temporary-directory permissions.
 - Deterministic, bounded code aliases for compound identifiers, paths, symbols, and a conservative coding/error concept lexicon.
 - Optional immutable search profiles for background document expansions and caller-generated dense vectors, without model calls or downloads in memory writes or recall.
 - `supermem index add-profile`, `list-profiles`, `activate`, `deactivate`, `remove-profile`, `pending`, `register`, `status`, and `rebuild` operator commands, plus optional dense-query inputs for CLI and MCP recall.

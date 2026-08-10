@@ -1,13 +1,23 @@
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::{
+    ffi::{OsStrExt, OsStringExt},
+    fs::MetadataExt,
+    process::CommandExt,
+};
 #[cfg(windows)]
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 use std::{
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs::{self, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
-    process::{Command as ProcessCommand, Stdio},
+    process::{Child, Command as ProcessCommand, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, anyhow, bail};
@@ -20,7 +30,7 @@ use super_mem_core::{
     EventKind, FeedbackRequest, FeedbackSignal, MemoryEngine, MemoryId, MemoryKind, ObserveRequest,
     QueryId, RecallRequest, RegisterSearchProjectionsRequest, RememberRequest, RetractRequest,
     Scope, SearchProfileRegistration, SearchProjectionInput, TrustLevel, capture_artifact_paths,
-    capture_changed_artifacts, discover_repository,
+    capture_changed_artifacts, database_file_identity, inspect_database_at_identity,
 };
 use uuid::Uuid;
 
@@ -56,7 +66,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             let engine = open_engine(&database)?;
             let status = engine.status()?;
             print_value(
-                &json!({ "database": database, "status": status }),
+                &json!({ "database": path_diagnostic(&database), "status": status }),
                 cli.json,
                 format!(
                     "initialized {} (schema {})",
@@ -452,22 +462,108 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             }
         },
         Command::Doctor(arguments) => {
-            let engine = open_engine(&database)?;
-            let status = engine.status()?;
+            const WRITER_PROBE_TIMEOUT_MS: u64 = 250;
+
             let cwd = arguments
                 .cwd
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let repository = discover_repository(&cwd).ok().flatten();
+            let (repository, repository_ok) = repository_diagnostics(&cwd);
+            let (binary, binary_ok) = binary_diagnostics();
+            let database_files_before = database_file_diagnostics(&database, true);
+            let (database_inspection, database_inspection_error) = if database_files_before.ok {
+                match database_files_before.main_identity.as_ref() {
+                    Some(identity) => match inspect_database_at_identity(
+                        &database,
+                        WRITER_PROBE_TIMEOUT_MS,
+                        identity,
+                    ) {
+                        Ok(inspection) => (Some(inspection), None),
+                        Err(error) => (None, Some(bounded_diagnostic(&error.to_string()))),
+                    },
+                    None => (
+                        None,
+                        Some("database preflight did not capture a main-file identity".into()),
+                    ),
+                }
+            } else {
+                (None, None)
+            };
+            let database_files_after = database_file_diagnostics(&database, true);
+            let database_files_unchanged =
+                database_files_before.stamps == database_files_after.stamps;
+            let mut issues = Vec::new();
+            if database_inspection
+                .as_ref()
+                .is_some_and(|inspection| !inspection.diagnostics.healthy)
+            {
+                issues.push("database_integrity_or_writer_lock");
+            }
+            if database_inspection
+                .as_ref()
+                .is_some_and(|inspection| !inspection.diagnostics.schema_current)
+            {
+                issues.push("database_migration_required");
+            }
+            if database_files_before.main_missing {
+                issues.push("database_missing");
+            }
+            if !database_files_before.security_ok || !database_files_after.security_ok {
+                issues.push("database_file_security");
+            }
+            if database_files_before.ok && database_inspection.is_none() {
+                if database_inspection_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("recovery is required"))
+                {
+                    issues.push("database_recovery_required");
+                } else if database_inspection_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("live WAL state"))
+                {
+                    issues.push("database_live_wal");
+                } else {
+                    issues.push("database_inspection");
+                }
+            }
+            if !database_files_unchanged {
+                issues.push("database_changed_during_inspection");
+            }
+            if !repository_ok {
+                issues.push("repository_discovery");
+            }
+            if !binary_ok {
+                issues.push("binary_resolution");
+            }
+            let ok = issues.is_empty();
             let report = json!({
-                "ok": true,
-                "database": database,
-                "status": status,
+                "ok": ok,
+                "issues": &issues,
+                "database": {
+                    "path": path_diagnostic(&database),
+                    "opened_read_only": database_inspection.is_some(),
+                    "inspection": database_inspection,
+                    "inspection_error": database_inspection_error,
+                    "files": {
+                        "before": database_files_before.report,
+                        "after": database_files_after.report,
+                        "unchanged": database_files_unchanged,
+                    },
+                },
+                "binary": binary,
+                "scope_environment": scope_environment_diagnostics(),
                 "repository": repository,
                 "mcp": { "transport": "stdio", "tools": mcp::TOOL_NAMES },
-                "future_daemon": "not enabled; adapters use bounded synchronous CLI calls"
             });
-            print_value(&report, cli.json, format!("ok: {}", database.display()))?;
+            let human = if ok {
+                format!("ok: {}", database.display())
+            } else {
+                format!("degraded: {} ({})", database.display(), issues.join(", "))
+            };
+            print_value(&report, cli.json, human)?;
+            if !ok {
+                bail!("doctor detected: {}", issues.join(", "));
+            }
         }
         Command::Export(arguments) => {
             let engine = open_engine(&database)?;
@@ -478,7 +574,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                 }
                 export_private_file(&engine, &output)?;
                 if cli.json {
-                    write_json(&json!({ "output": output }))?;
+                    write_json(&json!({ "output": path_diagnostic(&output) }))?;
                 } else {
                     println!("exported {}", output.display());
                 }
@@ -506,7 +602,7 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
             }
             purge_database(&database)?;
             print_value(
-                &json!({ "purged": database }),
+                &json!({ "purged": path_diagnostic(&database) }),
                 cli.json,
                 format!("purged {}", database.display()),
             )?;
@@ -537,6 +633,904 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn scope_environment_diagnostics() -> serde_json::Value {
+    json!({
+        "namespace_source": if std::env::var_os("SUPER_MEM_NAMESPACE").is_some() { "environment" } else { "default" },
+        "workspace_set": std::env::var_os("SUPER_MEM_WORKSPACE").is_some(),
+        "database_override_set": std::env::var_os("SUPER_MEM_DB").is_some(),
+        "values_redacted": true,
+    })
+}
+
+struct DatabaseFileSnapshot {
+    report: serde_json::Value,
+    ok: bool,
+    security_ok: bool,
+    main_missing: bool,
+    main_identity: Option<super_mem_core::DatabaseFileIdentity>,
+    stamps: Vec<(String, String)>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn database_file_diagnostics(database: &Path, require_main: bool) -> DatabaseFileSnapshot {
+    let paths = [
+        ("main", database.to_path_buf(), require_main),
+        ("wal", sidecar(database, "-wal"), false),
+        ("shm", sidecar(database, "-shm"), false),
+        ("journal", sidecar(database, "-journal"), false),
+    ];
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut all_ok = true;
+    let mut security_ok = true;
+    let mut total_bytes = 0_u64;
+    let mut main_missing = false;
+    let mut main_identity = None;
+    let mut stamps = Vec::with_capacity(paths.len());
+    for (kind, path, required) in paths {
+        let path_safety = doctor_path_safety(&path);
+        let (path_safe, path_safety_error) = match path_safety {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(bounded_diagnostic(&error.to_string()))),
+        };
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) => {
+                let identity = (kind == "main")
+                    .then(|| database_file_identity(&path, &metadata))
+                    .transpose()
+                    .ok()
+                    .flatten();
+                let identity_digest = identity
+                    .as_ref()
+                    .map(super_mem_core::DatabaseFileIdentity::diagnostic_digest);
+                if kind == "main" {
+                    main_identity = identity;
+                }
+                let regular_file = metadata.is_file();
+                let link_like = metadata_is_link_like(&metadata);
+                let links = if link_like {
+                    Err(anyhow!(
+                        "link-like entries are not opened for hard-link inspection"
+                    ))
+                } else {
+                    hard_link_count(&path, &metadata)
+                };
+                let (hard_links, hard_links_ok, hard_link_error) = match links {
+                    Ok(count) => (Some(count), count == 1, None),
+                    Err(error) => (None, false, Some(bounded_diagnostic(&error.to_string()))),
+                };
+                let private_permissions = private_file_permissions(&metadata);
+                let permissions_ok = private_permissions.unwrap_or(true);
+                let (content_plausible, content_error) = if kind == "wal" && regular_file {
+                    match wal_structure_plausible(&path, &metadata) {
+                        Ok(plausible) => (Some(plausible), None),
+                        Err(error) => (Some(false), Some(bounded_diagnostic(&error.to_string()))),
+                    }
+                } else {
+                    (None, None)
+                };
+                let content_ok = content_plausible.unwrap_or(true);
+                let ok = path_safe
+                    && regular_file
+                    && !link_like
+                    && hard_links_ok
+                    && permissions_ok
+                    && content_ok;
+                all_ok &= ok;
+                security_ok &= ok;
+                total_bytes = total_bytes.saturating_add(metadata.len());
+                stamps.push((
+                    kind.into(),
+                    format!(
+                        "{}|safe={path_safe}|link={link_like}|links={hard_links:?}|private={private_permissions:?}|plausible={content_plausible:?}|ok={ok}",
+                        if link_like {
+                            "link-like".into()
+                        } else {
+                            metadata_stamp(&path, &metadata)
+                        }
+                    ),
+                ));
+                entries.push(json!({
+                    "kind": kind,
+                    "path": path_diagnostic(&path),
+                    "present": true,
+                    "bytes": metadata.len(),
+                    "regular_file": regular_file,
+                    "link_like": link_like,
+                    "path_components_safe": path_safe,
+                    "path_safety_error": path_safety_error,
+                    "identity_digest": identity_digest,
+                    "hard_links": hard_links,
+                    "hard_link_error": hard_link_error,
+                    "private_permissions": private_permissions,
+                    "permissions_verified": private_permissions.is_some(),
+                    "content_plausible": content_plausible,
+                    "content_error": content_error,
+                    "ok": ok,
+                }));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !required => {
+                all_ok &= path_safe;
+                security_ok &= path_safe;
+                stamps.push((kind.into(), format!("absent|safe={path_safe}")));
+                entries.push(json!({
+                    "kind": kind,
+                    "path": path_diagnostic(&path),
+                    "present": false,
+                    "path_components_safe": path_safe,
+                    "path_safety_error": path_safety_error,
+                    "ok": path_safe,
+                }));
+            }
+            Err(error) => {
+                all_ok = false;
+                security_ok &= path_safe && error.kind() == io::ErrorKind::NotFound;
+                main_missing |= kind == "main" && error.kind() == io::ErrorKind::NotFound;
+                stamps.push((
+                    kind.into(),
+                    format!("error:{:?}|safe={path_safe}", error.kind()),
+                ));
+                entries.push(json!({
+                    "kind": kind,
+                    "path": path_diagnostic(&path),
+                    "present": false,
+                    "path_components_safe": path_safe,
+                    "path_safety_error": path_safety_error,
+                    "error": bounded_diagnostic(&error.to_string()),
+                    "ok": false,
+                }));
+            }
+        }
+    }
+    DatabaseFileSnapshot {
+        report: json!({
+            "ok": all_ok,
+            "security_ok": security_ok,
+            "total_bytes_including_sidecars": total_bytes,
+            "entries": entries,
+        }),
+        ok: all_ok,
+        security_ok,
+        main_missing,
+        main_identity,
+        stamps,
+    }
+}
+
+fn wal_structure_plausible(path: &Path, expected: &fs::Metadata) -> anyhow::Result<bool> {
+    let length = expected.len();
+    if length == 0 {
+        return Ok(true);
+    }
+    if length < 32 {
+        return Ok(false);
+    }
+    let mut header = [0_u8; 32];
+    let mut file = open_readonly_nofollow(path)
+        .with_context(|| format!("open WAL header for {}", path.display()))?;
+    let opened = file
+        .metadata()
+        .with_context(|| format!("inspect opened WAL {}", path.display()))?;
+    if !same_metadata_identity(expected, &opened) || !opened.is_file() {
+        bail!("WAL identity changed while it was opened");
+    }
+    file.read_exact(&mut header)
+        .with_context(|| format!("read WAL header for {}", path.display()))?;
+    let magic = u32::from_be_bytes(header[0..4].try_into().expect("four-byte WAL magic"));
+    if !matches!(magic, 0x377f_0682 | 0x377f_0683) {
+        return Ok(false);
+    }
+    let raw_page_size =
+        u32::from_be_bytes(header[8..12].try_into().expect("four-byte WAL page size"));
+    let page_size = if raw_page_size == 1 {
+        65_536_u64
+    } else {
+        u64::from(raw_page_size)
+    };
+    if !(512..=65_536).contains(&page_size) || !page_size.is_power_of_two() {
+        return Ok(false);
+    }
+    Ok((length - 32).is_multiple_of(page_size + 24))
+}
+
+#[cfg(unix)]
+fn metadata_stamp(_path: &Path, metadata: &fs::Metadata) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.mode(),
+        metadata.nlink()
+    )
+}
+
+#[cfg(windows)]
+fn metadata_stamp(path: &Path, metadata: &fs::Metadata) -> String {
+    let identity = windows_file_identity(path)
+        .map(|(volume, file)| format!("{volume}:{file:02x?}"))
+        .unwrap_or_else(|error| {
+            format!("identity-error:{}", bounded_diagnostic(&error.to_string()))
+        });
+    format!(
+        "{identity}:{}:{}:{}:{}",
+        metadata.file_attributes(),
+        metadata.file_size(),
+        metadata.creation_time(),
+        metadata.last_write_time()
+    )
+}
+
+#[cfg(not(any(unix, windows)))]
+fn metadata_stamp(_path: &Path, metadata: &fs::Metadata) -> String {
+    format!("{}:{:?}", metadata.len(), metadata.modified().ok())
+}
+
+#[cfg(unix)]
+fn same_metadata_identity(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    first.dev() == second.dev() && first.ino() == second.ino()
+}
+
+#[cfg(not(unix))]
+fn same_metadata_identity(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    first.len() == second.len() && first.modified().ok() == second.modified().ok()
+}
+
+#[cfg(unix)]
+fn open_readonly_nofollow(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    options.open(path)
+}
+
+#[cfg(not(unix))]
+fn open_readonly_nofollow(path: &Path) -> io::Result<fs::File> {
+    fs::File::open(path)
+}
+
+#[cfg(any(unix, windows))]
+fn doctor_path_safety(path: &Path) -> anyhow::Result<()> {
+    validate_purge_path(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn doctor_path_safety(path: &Path) -> anyhow::Result<()> {
+    bail!(
+        "cannot verify symbolic links, reparse points, and hard links for {} on this platform",
+        path.display()
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps, clippy::verbose_bit_mask)]
+fn private_file_permissions(metadata: &fs::Metadata) -> Option<bool> {
+    Some(metadata.mode() & 0o077 == 0)
+}
+
+#[cfg(not(unix))]
+fn private_file_permissions(_metadata: &fs::Metadata) -> Option<bool> {
+    None
+}
+
+#[allow(clippy::too_many_lines)]
+fn repository_diagnostics(cwd: &Path) -> (serde_json::Value, bool) {
+    const GIT_OUTPUT_LIMIT: usize = 64 * 1_024;
+    const REMOTE_OUTPUT_LIMIT: usize = 8 * 1_024;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let version = match run_git_probe(None, &["--version"], deadline, GIT_OUTPUT_LIMIT) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => return repository_exit_failure(cwd, "version", &output),
+        Err(error) => return repository_probe_failure(cwd, "version", &error),
+    };
+    drop(version);
+
+    let root_output = match run_git_probe(
+        Some(cwd),
+        &["rev-parse", "--show-toplevel"],
+        deadline,
+        GIT_OUTPUT_LIMIT,
+    ) {
+        Ok(output) => output,
+        Err(error) => return repository_probe_failure(cwd, "root", &error),
+    };
+    if !root_output.status.success() {
+        return match git_marker_above(cwd) {
+            Ok(false) => (
+                json!({
+                    "ok": true,
+                    "state": "not_repository",
+                    "cwd": path_diagnostic(cwd),
+                }),
+                true,
+            ),
+            Ok(true) => repository_exit_failure(cwd, "root", &root_output),
+            Err(error) => (
+                json!({
+                    "ok": false,
+                    "state": "repository_error",
+                    "cwd": path_diagnostic(cwd),
+                    "stage": "marker",
+                    "error": bounded_diagnostic(&error.to_string()),
+                }),
+                false,
+            ),
+        };
+    }
+    let root = match git_path_from_output(&root_output.stdout) {
+        Ok(path) => path,
+        Err(error) => return repository_value_failure(cwd, "root", &error),
+    };
+    let common_output = match run_git_probe(
+        Some(&root),
+        &["rev-parse", "--git-common-dir"],
+        deadline,
+        GIT_OUTPUT_LIMIT,
+    ) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => return repository_exit_failure(cwd, "common_dir", &output),
+        Err(error) => return repository_probe_failure(cwd, "common_dir", &error),
+    };
+    let common_raw = match git_path_from_output(&common_output.stdout) {
+        Ok(path) => path,
+        Err(error) => return repository_value_failure(cwd, "common_dir", &error),
+    };
+    let common_dir = if common_raw.is_absolute() {
+        common_raw
+    } else {
+        root.join(common_raw)
+    };
+    let common_dir = common_dir.canonicalize().unwrap_or(common_dir);
+
+    let status_output = match run_git_probe(
+        Some(&root),
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "-z",
+            "--untracked-files=no",
+        ],
+        deadline,
+        GIT_OUTPUT_LIMIT,
+    ) {
+        Ok(output) if output.status.success() => output,
+        Ok(output) => return repository_exit_failure(cwd, "status", &output),
+        Err(error) => return repository_probe_failure(cwd, "status", &error),
+    };
+    let (branch, head_oid, dirty) = parse_bounded_git_status(&status_output.stdout);
+
+    let remote_output = match run_git_probe(
+        Some(&root),
+        &["config", "--get", "remote.origin.url"],
+        deadline,
+        REMOTE_OUTPUT_LIMIT,
+    ) {
+        Ok(output) if output.status.success() || output.status.code() == Some(1) => output,
+        Ok(output) => return repository_exit_failure(cwd, "remote", &output),
+        Err(error) => return repository_probe_failure(cwd, "remote", &error),
+    };
+    let remote_present = if remote_output.status.success() {
+        let value = match std::str::from_utf8(trim_ascii_line_end(&remote_output.stdout)) {
+            Ok(value) => value,
+            Err(error) => return repository_value_failure(cwd, "remote", &error),
+        };
+        !value.trim().is_empty()
+    } else {
+        false
+    };
+    (
+        json!({
+            "ok": true,
+            "state": "repository",
+            "cwd": path_diagnostic(cwd),
+            "probe": {
+                "root": path_diagnostic(&root),
+                "common_dir": path_diagnostic(&common_dir),
+                "branch_present": branch.is_some(),
+                "head_present": head_oid.is_some(),
+                "remote_present": remote_present,
+                "tracked_changes_present": dirty,
+                "engine_context_equivalence_checked": false,
+            },
+        }),
+        true,
+    )
+}
+
+struct GitProbeOutput {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    _stderr: Vec<u8>,
+}
+
+enum GitProbeError {
+    Spawn(io::Error),
+    Timeout,
+    OutputLimit,
+    Io(io::Error),
+}
+
+fn run_git_probe(
+    cwd: Option<&Path>,
+    arguments: &[&str],
+    deadline: Instant,
+    output_limit: usize,
+) -> Result<GitProbeOutput, GitProbeError> {
+    if Instant::now() >= deadline {
+        return Err(GitProbeError::Timeout);
+    }
+    let mut command = ProcessCommand::new("git");
+    command
+        .args(arguments)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn().map_err(GitProbeError::Spawn)?;
+    let child_id = child.id();
+    let overflow = Arc::new(AtomicBool::new(false));
+    let stdout_reader = bounded_pipe_reader(
+        child.stdout.take().expect("piped Git stdout"),
+        output_limit,
+        Arc::clone(&overflow),
+    );
+    let stderr_reader = bounded_pipe_reader(
+        child.stderr.take().expect("piped Git stderr"),
+        output_limit.min(4 * 1_024),
+        Arc::clone(&overflow),
+    );
+    let status = loop {
+        if overflow.load(Ordering::Acquire) {
+            terminate_child(&mut child);
+            let _ = join_pipe_readers(
+                stdout_reader,
+                stderr_reader,
+                Instant::now() + Duration::from_millis(100),
+            );
+            return Err(GitProbeError::OutputLimit);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = join_pipe_readers(
+                    stdout_reader,
+                    stderr_reader,
+                    Instant::now() + Duration::from_millis(100),
+                );
+                return Err(GitProbeError::Io(error));
+            }
+            Ok(None) if Instant::now() >= deadline => {
+                terminate_child(&mut child);
+                let _ = join_pipe_readers(
+                    stdout_reader,
+                    stderr_reader,
+                    Instant::now() + Duration::from_millis(100),
+                );
+                return Err(GitProbeError::Timeout);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    if !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+        terminate_process_group(child_id);
+    }
+    let (stdout, stderr) = join_pipe_readers(stdout_reader, stderr_reader, deadline)?;
+    if overflow.load(Ordering::Acquire) {
+        return Err(GitProbeError::OutputLimit);
+    }
+    Ok(GitProbeOutput {
+        status,
+        stdout,
+        _stderr: stderr,
+    })
+}
+
+fn join_pipe_readers(
+    stdout: thread::JoinHandle<io::Result<Vec<u8>>>,
+    stderr: thread::JoinHandle<io::Result<Vec<u8>>>,
+    deadline: Instant,
+) -> Result<(Vec<u8>, Vec<u8>), GitProbeError> {
+    while (!stdout.is_finished() || !stderr.is_finished()) && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(2));
+    }
+    if !stdout.is_finished() || !stderr.is_finished() {
+        return Err(GitProbeError::Timeout);
+    }
+    let stdout = stdout
+        .join()
+        .map_err(|_| GitProbeError::Io(io::Error::other("Git stdout reader panicked")))?
+        .map_err(GitProbeError::Io)?;
+    let stderr = stderr
+        .join()
+        .map_err(|_| GitProbeError::Io(io::Error::other("Git stderr reader panicked")))?
+        .map_err(GitProbeError::Io)?;
+    Ok((stdout, stderr))
+}
+
+fn bounded_pipe_reader(
+    mut input: impl Read + Send + 'static,
+    limit: usize,
+    overflow: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut output = Vec::with_capacity(limit.min(8 * 1_024));
+        let mut buffer = [0_u8; 8 * 1_024];
+        loop {
+            let read = input.read(&mut buffer)?;
+            if read == 0 {
+                return Ok(output);
+            }
+            let remaining = limit.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+            if read > remaining {
+                overflow.store(true, Ordering::Release);
+            }
+        }
+    })
+}
+
+#[allow(unsafe_code)]
+fn terminate_child(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id();
+        if let Ok(pid) = i32::try_from(pid) {
+            // SAFETY: a negative PID targets only the process group created
+            // specifically for this Git probe. Failure is followed by the
+            // standard direct-child kill fallback.
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn terminate_process_group(pid: u32) {
+    if let Ok(pid) = i32::try_from(pid) {
+        // SAFETY: this process group was created only for the bounded probe.
+        let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_pid: u32) {}
+
+fn repository_probe_failure(
+    cwd: &Path,
+    stage: &str,
+    error: &GitProbeError,
+) -> (serde_json::Value, bool) {
+    let (failure_state, message) = match error {
+        GitProbeError::Spawn(error) if error.kind() == io::ErrorKind::NotFound => {
+            ("git_unavailable", bounded_diagnostic(&error.to_string()))
+        }
+        GitProbeError::Spawn(error) | GitProbeError::Io(error) => {
+            ("git_error", bounded_diagnostic(&error.to_string()))
+        }
+        GitProbeError::Timeout => (
+            "git_timeout",
+            "Git probe exceeded its two-second total deadline".into(),
+        ),
+        GitProbeError::OutputLimit => (
+            "git_output_limit",
+            "Git probe exceeded its bounded output allowance".into(),
+        ),
+    };
+    (
+        json!({
+            "ok": false,
+            "state": failure_state,
+            "cwd": path_diagnostic(cwd),
+            "stage": stage,
+            "error": message,
+        }),
+        false,
+    )
+}
+
+fn repository_exit_failure(
+    cwd: &Path,
+    stage: &str,
+    output: &GitProbeOutput,
+) -> (serde_json::Value, bool) {
+    (
+        json!({
+            "ok": false,
+            "state": "repository_error",
+            "cwd": path_diagnostic(cwd),
+            "stage": stage,
+            "exit_code": output.status.code(),
+        }),
+        false,
+    )
+}
+
+fn repository_value_failure(
+    cwd: &Path,
+    stage: &str,
+    error: &impl std::fmt::Display,
+) -> (serde_json::Value, bool) {
+    (
+        json!({
+            "ok": false,
+            "state": "repository_error",
+            "cwd": path_diagnostic(cwd),
+            "stage": stage,
+            "error": bounded_diagnostic(&error.to_string()),
+        }),
+        false,
+    )
+}
+
+fn git_path_from_output(output: &[u8]) -> anyhow::Result<PathBuf> {
+    let output = strip_git_path_terminator(output);
+    if output.is_empty() || output.contains(&0) {
+        bail!("Git returned an empty or NUL-containing path");
+    }
+    #[cfg(unix)]
+    return Ok(PathBuf::from(OsString::from_vec(output.to_vec())));
+    #[cfg(not(unix))]
+    return Ok(PathBuf::from(
+        std::str::from_utf8(output).context("Git path was not valid UTF-8")?,
+    ));
+}
+
+fn strip_git_path_terminator(value: &[u8]) -> &[u8] {
+    let value = value.strip_suffix(b"\n").unwrap_or(value);
+    #[cfg(not(unix))]
+    let value = value.strip_suffix(b"\r").unwrap_or(value);
+    value
+}
+
+fn trim_ascii_line_end(mut value: &[u8]) -> &[u8] {
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b'\r' | b'\n'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
+}
+
+fn parse_bounded_git_status(output: &[u8]) -> (Option<String>, Option<String>, bool) {
+    let mut branch = None;
+    let mut head_oid = None;
+    let mut dirty = false;
+    for record in output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+    {
+        if let Some(value) = record.strip_prefix(b"# branch.head ") {
+            if value != b"(detached)" {
+                branch = std::str::from_utf8(value).ok().map(str::to_owned);
+            }
+        } else if let Some(value) = record.strip_prefix(b"# branch.oid ") {
+            if (7..=64).contains(&value.len()) && value.iter().all(u8::is_ascii_hexdigit) {
+                head_oid = std::str::from_utf8(value).ok().map(str::to_owned);
+            }
+        } else if !record.starts_with(b"# ") {
+            dirty = true;
+        }
+    }
+    (branch, head_oid, dirty)
+}
+
+fn git_marker_above(cwd: &Path) -> anyhow::Result<bool> {
+    let mut cursor = cwd
+        .canonicalize()
+        .with_context(|| format!("resolve doctor cwd {}", cwd.display()))?;
+    if !cursor.is_dir() {
+        bail!("doctor cwd {} is not a directory", cwd.display());
+    }
+    loop {
+        match fs::symlink_metadata(cursor.join(".git")) {
+            Ok(_) => return Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("inspect {}", cursor.display()));
+            }
+        }
+        if !cursor.pop() {
+            return Ok(false);
+        }
+    }
+}
+
+fn binary_diagnostics() -> (serde_json::Value, bool) {
+    let current_exe = std::env::current_exe();
+    let path_exe = find_supermem_on_path();
+    let same_binary = current_exe
+        .as_ref()
+        .ok()
+        .zip(path_exe.as_ref())
+        .and_then(|(current, path)| same_file(current, path).ok());
+    let ok = same_binary == Some(true);
+    let report = json!({
+        "ok": ok,
+        "version": env!("CARGO_PKG_VERSION"),
+        "current_executable": current_exe.as_ref().ok().map(|path| path_diagnostic(path)),
+        "current_executable_error": current_exe.err().map(|error| bounded_diagnostic(&error.to_string())),
+        "path_executable": path_exe.as_deref().map(path_diagnostic),
+        "path_resolves_to_current": same_binary,
+    });
+    (report, ok)
+}
+
+#[cfg(unix)]
+fn same_file(first: &Path, second: &Path) -> anyhow::Result<bool> {
+    let first = fs::metadata(first).with_context(|| format!("inspect {}", first.display()))?;
+    let second = fs::metadata(second).with_context(|| format!("inspect {}", second.display()))?;
+    Ok(first.dev() == second.dev() && first.ino() == second.ino())
+}
+
+#[cfg(windows)]
+fn same_file(first: &Path, second: &Path) -> anyhow::Result<bool> {
+    Ok(windows_file_identity(first)? == windows_file_identity(second)?)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn same_file(first: &Path, second: &Path) -> anyhow::Result<bool> {
+    Ok(first.canonicalize()? == second.canonicalize()?)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_file_identity(path: &Path) -> anyhow::Result<(u64, [u8; 16])> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+    };
+
+    let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut information = MaybeUninit::<FILE_ID_INFO>::uninit();
+    // SAFETY: `file` owns a valid handle and the OS initializes the pointed-to
+    // structure on success, which is checked before `assume_init`.
+    let succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            information.as_mut_ptr().cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .expect("FILE_ID_INFO fits in a Windows API length"),
+        )
+    };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error()).context("read Windows file identity");
+    }
+    // SAFETY: the successful call initialized every field.
+    let information = unsafe { information.assume_init() };
+    Ok((
+        information.VolumeSerialNumber,
+        information.FileId.Identifier,
+    ))
+}
+
+fn find_supermem_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    #[cfg(windows)]
+    let names = {
+        let extensions = std::env::var_os("PATHEXT")
+            .map(|value| {
+                value
+                    .to_string_lossy()
+                    .split(';')
+                    .filter(|item| !item.is_empty())
+                    .map(|item| format!("supermem{item}"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["supermem.exe".into(), "supermem.cmd".into()]);
+        extensions
+    };
+    #[cfg(not(windows))]
+    let names = vec!["supermem".to_owned()];
+
+    for directory in std::env::split_paths(&path) {
+        for name in &names {
+            let candidate = directory.join(name);
+            let Ok(metadata) = fs::metadata(&candidate) else {
+                continue;
+            };
+            if executable_file(&metadata) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn executable_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && metadata.mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn executable_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file()
+}
+
+fn bounded_diagnostic(value: &str) -> String {
+    const MAX_BYTES: usize = 1_024;
+    let value = value.trim();
+    if value.len() <= MAX_BYTES {
+        return value.to_owned();
+    }
+    let mut end = MAX_BYTES;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn path_diagnostic(path: &Path) -> serde_json::Value {
+    if let Some(value) = path.to_str() {
+        return json!(value);
+    }
+    json!({
+        "display_lossy": path.to_string_lossy(),
+        "native_encoding": native_path_encoding(),
+        "native_hex": native_os_hex(path.as_os_str()),
+    })
+}
+
+#[cfg(unix)]
+fn native_path_encoding() -> &'static str {
+    "unix_bytes"
+}
+
+#[cfg(windows)]
+fn native_path_encoding() -> &'static str {
+    "windows_utf16le"
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_path_encoding() -> &'static str {
+    "platform_native_lossy"
+}
+
+#[cfg(unix)]
+fn native_os_hex(value: &OsStr) -> String {
+    hex_encode(value.as_bytes())
+}
+
+#[cfg(windows)]
+fn native_os_hex(value: &OsStr) -> String {
+    let bytes = value
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    hex_encode(&bytes)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn native_os_hex(value: &OsStr) -> String {
+    hex_encode(value.to_string_lossy().as_bytes())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 pub(crate) fn capture_scope_artifacts(

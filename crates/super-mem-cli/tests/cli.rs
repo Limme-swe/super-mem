@@ -16,6 +16,15 @@ use tempfile::TempDir;
 
 fn command(database: &Path) -> Command {
     let mut command = Command::cargo_bin("supermem").expect("binary");
+    let binary_directory = Path::new(command.get_program())
+        .parent()
+        .expect("test binary directory")
+        .to_path_buf();
+    let mut path = vec![binary_directory];
+    if let Some(existing) = std::env::var_os("PATH") {
+        path.extend(std::env::split_paths(&existing));
+    }
+    command.env("PATH", std::env::join_paths(path).expect("test PATH"));
     command.arg("--db").arg(database);
     command
 }
@@ -43,6 +52,25 @@ fn init_git_repository(repository: &Path) {
         repository,
         &["commit", "--allow-empty", "--quiet", "-m", "initial"],
     );
+}
+
+#[cfg(unix)]
+fn command_with_fake_git(database: &Path, directory: &Path, script: &str) -> Command {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fs::create_dir_all(directory).unwrap();
+    let git = directory.join("git");
+    fs::write(&git, script).unwrap();
+    fs::set_permissions(&git, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let mut command = Command::cargo_bin("supermem").expect("binary");
+    let binary = Path::new(command.get_program()).to_path_buf();
+    let path_binary = directory.join("supermem");
+    if !path_binary.exists() && fs::hard_link(&binary, &path_binary).is_err() {
+        symlink(&binary, &path_binary).unwrap();
+    }
+    command.env("PATH", directory).arg("--db").arg(database);
+    command
 }
 
 #[test]
@@ -98,6 +126,645 @@ fn artifact_projection_status_is_available_without_a_search_profile() {
                 .and(predicate::str::contains("\"orphaned\": 0"))
                 .and(predicate::str::contains("\"degraded\": false")),
         );
+}
+
+#[test]
+fn doctor_reports_database_and_repository_health_explicitly() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    command(&database).arg("init").assert().success();
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", repository.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"ok\": true")
+                .and(predicate::str::contains("\"healthy\": true"))
+                .and(predicate::str::contains("\"state\": \"repository\""))
+                .and(predicate::str::contains("\"writer_lock_available\": true")),
+        );
+}
+
+#[test]
+fn doctor_accepts_a_relative_database_path_without_creating_an_alias() {
+    let temp = TempDir::new().unwrap();
+    init_git_repository(temp.path());
+    let relative_database = Path::new("memory.sqlite3");
+    command(relative_database)
+        .current_dir(temp.path())
+        .arg("init")
+        .assert()
+        .success();
+
+    command(relative_database)
+        .current_dir(temp.path())
+        .args(["--json", "doctor", "--cwd", "."])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"ok\": true")
+                .and(predicate::str::contains("\"healthy\": true")),
+        );
+    assert!(temp.path().join(relative_database).is_file());
+}
+
+#[test]
+fn doctor_fails_closed_when_git_metadata_is_broken() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("broken-repository");
+    command(&database).arg("init").assert().success();
+    fs::create_dir_all(&repository).unwrap();
+    fs::write(repository.join(".git"), "gitdir: missing\n").unwrap();
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", repository.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("\"ok\": false")
+                .and(predicate::str::contains("\"state\": \"repository_error\""))
+                .and(predicate::str::contains("repository_discovery")),
+        )
+        .stderr(predicate::str::contains("repository_discovery"));
+}
+
+#[test]
+fn doctor_reports_when_git_is_not_on_path() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let empty_path = temp.path().join("empty-path");
+    fs::create_dir(&empty_path).unwrap();
+    command(&database).arg("init").assert().success();
+
+    command(&database)
+        .env("PATH", &empty_path)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("\"state\": \"git_unavailable\"")
+                .and(predicate::str::contains("repository_discovery")),
+        );
+}
+
+#[test]
+fn doctor_does_not_create_a_missing_database() {
+    let temp = TempDir::new().unwrap();
+    let parent = temp.path().join("missing-parent");
+    let database = parent.join("memory.sqlite3");
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_missing")
+                .and(predicate::str::contains("\"opened_read_only\": false")),
+        );
+    assert!(!parent.exists());
+}
+
+#[test]
+fn doctor_reports_malformed_database_as_json() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    fs::write(&database, b"not a sqlite database").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_inspection")
+                .and(predicate::str::contains("\"inspection_error\":")),
+        );
+}
+
+#[test]
+fn doctor_reports_writer_contention_without_normal_open() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database).arg("init").assert().success();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let started = Instant::now();
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_integrity_or_writer_lock")
+                .and(predicate::str::contains("\"writer_lock_available\": false")),
+        );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "doctor exceeded its bounded writer probe"
+    );
+    connection.execute_batch("ROLLBACK;").unwrap();
+}
+
+#[test]
+fn doctor_surfaces_canonical_foreign_key_damage() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database).arg("init").assert().success();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             INSERT INTO feedback(memory_id,signal,created_at_ms)
+             VALUES('missing-memory','used',0);",
+        )
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    drop(connection);
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("\"foreign_key_violations\": 1").and(
+                predicate::str::contains("database_integrity_or_writer_lock"),
+            ),
+        );
+}
+
+#[test]
+fn doctor_surfaces_a_head_whose_current_revision_is_missing() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database)
+        .args(["remember", "--body", "The current revision must exist."])
+        .assert()
+        .success();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF;
+             DELETE FROM memory_revision_metadata;
+             DELETE FROM memory_revisions;
+             PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode=DELETE;",
+        )
+        .unwrap();
+    drop(connection);
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("\"application_invariants_ok\": false")
+                .and(predicate::str::contains(
+                    "memory_head_without_head_revision",
+                ))
+                .and(predicate::str::contains(
+                    "database_integrity_or_writer_lock",
+                )),
+        );
+}
+
+#[test]
+fn doctor_surfaces_a_head_behind_its_latest_revision() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    for body in ["The first revision.", "The corrected revision."] {
+        command(&database)
+            .args([
+                "remember",
+                "--body",
+                body,
+                "--canonical-key",
+                "doctor-stale-head",
+                "--cwd",
+            ])
+            .arg(temp.path())
+            .assert()
+            .success();
+    }
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "UPDATE memory_heads SET head_revision=1;
+             PRAGMA wal_checkpoint(TRUNCATE);
+             PRAGMA journal_mode=DELETE;",
+        )
+        .unwrap();
+    drop(connection);
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("\"application_invariants_ok\": false")
+                .and(predicate::str::contains("memory_head_revision_not_latest"))
+                .and(predicate::str::contains(
+                    "database_integrity_or_writer_lock",
+                )),
+        );
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn doctor_rejects_a_hard_linked_database() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database).arg("init").assert().success();
+    fs::hard_link(&database, temp.path().join("database-alias.sqlite3")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    let before = fs::read(&database).unwrap();
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_file_security")
+                .and(predicate::str::contains("\"hard_links\": 2")),
+        );
+    assert_eq!(fs::read(&database).unwrap(), before);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_does_not_open_a_database_through_a_parent_symlink() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let temp = TempDir::new().unwrap();
+    let target_directory = temp.path().join("target");
+    fs::create_dir(&target_directory).unwrap();
+    let target_database = target_directory.join("memory.sqlite3");
+    command(&target_database).arg("init").assert().success();
+    fs::set_permissions(&target_database, fs::Permissions::from_mode(0o640)).unwrap();
+    let before = fs::read(&target_database).unwrap();
+    let alias = temp.path().join("database-alias");
+    symlink(&target_directory, &alias).unwrap();
+    let alias_database = alias.join("memory.sqlite3");
+
+    command(&alias_database)
+        .args(["--json", "doctor", "--cwd", temp.path().to_str().unwrap()])
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_file_security")
+                .and(predicate::str::contains("\"path_components_safe\": false")),
+        );
+    assert_eq!(fs::read(&target_database).unwrap(), before);
+    assert_eq!(
+        fs::metadata(&target_database).unwrap().permissions().mode() & 0o777,
+        0o640
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_bounds_hung_git_and_terminates_its_process_group() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database).arg("init").assert().success();
+    let fake_bin = temp.path().join("fake-bin");
+    let started = Instant::now();
+
+    command_with_fake_git(&database, &fake_bin, "#!/bin/sh\n/bin/sleep 30 &\nwait\n")
+        .args(["--json", "doctor", "--cwd"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"state\": \"git_timeout\""));
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let started = Instant::now();
+    command_with_fake_git(&database, &fake_bin, "#!/bin/sh\n/bin/sleep 30 &\nexit 0\n")
+        .args(["--json", "doctor", "--cwd"])
+        .arg(temp.path())
+        .assert()
+        .failure();
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a descendant retaining Git pipes blocked doctor"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_rejects_oversized_git_output_without_echoing_it() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database).arg("init").assert().success();
+    let repository = temp.path().join("repository");
+    fs::create_dir_all(repository.join(".git")).unwrap();
+    let oversized = temp.path().join("oversized-remote");
+    fs::write(&oversized, vec![b'a'; 16 * 1_024 * 1_024]).unwrap();
+    let script = format!(
+        "#!/bin/sh\ncase \"$1 $2\" in\n  '--version ') echo 'git version test' ;;\n  'rev-parse --show-toplevel') echo '{}' ;;\n  'rev-parse --git-common-dir') echo '.git' ;;\n  'status --porcelain=v2') printf '# branch.oid 0123456789012345678901234567890123456789\\0# branch.head main\\0' ;;\n  'config --get') exec /bin/cat '{}' ;;\n  *) exit 2 ;;\nesac\n",
+        repository.display(),
+        oversized.display()
+    );
+    let output = command_with_fake_git(&database, &temp.path().join("fake-bin"), &script)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.len() < 128 * 1_024);
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["repository"]["state"], "git_output_limit");
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn doctor_serializes_non_utf8_paths_as_valid_json() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().unwrap();
+    let original = temp.path().join("memory.sqlite3");
+    command(&original).arg("init").assert().success();
+    let database = temp.path().join(std::ffi::OsString::from_vec(
+        b"memory-\xff.sqlite3".to_vec(),
+    ));
+    fs::rename(&original, &database).unwrap();
+    let cwd = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"cwd-\xfe".to_vec()));
+    fs::create_dir(&cwd).unwrap();
+
+    let output = command(&database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&cwd)
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["database"]["path"]["native_encoding"], "unix_bytes");
+    assert_eq!(report["repository"]["cwd"]["native_encoding"], "unix_bytes");
+}
+
+#[test]
+fn doctor_redacts_scope_environment_values() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    git(
+        &repository,
+        &["checkout", "-b", "ghp_branch_DO_NOT_ECHO_123456789"],
+    );
+    command(&database).arg("init").assert().success();
+
+    let output = command(&database)
+        .env("SUPER_MEM_NAMESPACE", "ghp_namespace_secret")
+        .env("SUPER_MEM_WORKSPACE", "sk-workspace-secret")
+        .env("SUPER_MEM_DB", "/tmp/password=database-secret")
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(!stdout.contains("ghp_namespace_secret"));
+    assert!(!stdout.contains("sk-workspace-secret"));
+    assert!(!stdout.contains("database-secret"));
+    assert!(!stdout.contains("DO_NOT_ECHO"));
+    assert!(stdout.contains("\"values_redacted\": true"));
+}
+
+#[test]
+fn doctor_never_emits_git_remote_credentials_or_paths() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    command(&database).arg("init").assert().success();
+
+    for remote in [
+        "https://example.test/org/ghp_DO_NOT_ECHO_123456789/repo.git?auth=secret",
+        "git@example.test:org/scp_secret_DO_NOT_ECHO/repo.git",
+        "/tmp/local_secret_DO_NOT_ECHO/repo.git",
+    ] {
+        git(&repository, &["config", "remote.origin.url", remote]);
+        let output = command(&database)
+            .args(["--json", "doctor", "--cwd"])
+            .arg(&repository)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(!stdout.contains("DO_NOT_ECHO"));
+        assert!(!stdout.contains("auth=secret"));
+        assert!(stdout.contains("\"remote_present\": true"));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_preserves_invalid_and_live_sqlite_sidecars() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = TempDir::new().unwrap();
+    let invalid_database = temp.path().join("invalid-wal.sqlite3");
+    command(&invalid_database).arg("init").assert().success();
+    let invalid_wal = Path::new(&format!("{}-wal", invalid_database.display())).to_path_buf();
+    fs::write(&invalid_wal, vec![0_u8; 4_096]).unwrap();
+    fs::set_permissions(&invalid_wal, fs::Permissions::from_mode(0o600)).unwrap();
+    let invalid_before = fs::read(&invalid_wal).unwrap();
+    command(&invalid_database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("database_file_security"));
+    assert_eq!(fs::read(&invalid_wal).unwrap(), invalid_before);
+
+    let live_database = temp.path().join("live-wal.sqlite3");
+    command(&live_database).arg("init").assert().success();
+    let connection = rusqlite::Connection::open(&live_database).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_autocheckpoint=0; CREATE TABLE doctor_live(value); INSERT INTO doctor_live VALUES(1);")
+        .unwrap();
+    let live_wal = Path::new(&format!("{}-wal", live_database.display())).to_path_buf();
+    let live_shm = Path::new(&format!("{}-shm", live_database.display())).to_path_buf();
+    let wal_before = fs::read(&live_wal).unwrap();
+    let shm_before = fs::read(&live_shm).unwrap();
+    command(&live_database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("database_live_wal"));
+    assert_eq!(fs::read(&live_wal).unwrap(), wal_before);
+    assert_eq!(fs::read(&live_shm).unwrap(), shm_before);
+    drop(connection);
+
+    let journal_database = temp.path().join("hot-journal.sqlite3");
+    command(&journal_database).arg("init").assert().success();
+    let connection = rusqlite::Connection::open(&journal_database).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    drop(connection);
+    let journal = Path::new(&format!("{}-journal", journal_database.display())).to_path_buf();
+    fs::write(&journal, b"preserve crash evidence").unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let database_before = fs::read(&journal_database).unwrap();
+    let journal_before = fs::read(&journal).unwrap();
+    command(&journal_database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(temp.path())
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("database_recovery_required"));
+    assert_eq!(fs::read(&journal_database).unwrap(), database_before);
+    assert_eq!(fs::read(&journal).unwrap(), journal_before);
+}
+
+#[test]
+fn doctor_does_not_change_delete_journal_mode_or_database_bytes() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("repository");
+    init_git_repository(&repository);
+    command(&database).arg("init").assert().success();
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+        .unwrap();
+    drop(connection);
+    let before = fs::read(&database).unwrap();
+
+    command(&database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .assert()
+        .success();
+    assert_eq!(fs::read(&database).unwrap(), before);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0))
+            .unwrap(),
+        "delete"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(unsafe_code)]
+fn doctor_fails_closed_for_an_unwritable_store_or_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        // Root legitimately bypasses mode-bit write denial. CI exercises this
+        // regression as its ordinary unprivileged runner account.
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    let repository = temp.path().join("repository");
+    let store = temp.path().join("store");
+    let database = store.join("memory.sqlite3");
+    init_git_repository(&repository);
+    fs::create_dir(&store).unwrap();
+    command(&database).arg("init").assert().success();
+    let before = fs::read(&database).unwrap();
+
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o400)).unwrap();
+    command(&database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_integrity_or_writer_lock")
+                .and(predicate::str::contains("database is not writable")),
+        );
+    assert_eq!(fs::read(&database).unwrap(), before);
+
+    fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o500)).unwrap();
+    command(&database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .assert()
+        .failure()
+        .stdout(
+            predicate::str::contains("database_integrity_or_writer_lock").and(
+                predicate::str::contains("parent does not grant effective write"),
+            ),
+        );
+    assert_eq!(fs::read(&database).unwrap(), before);
+    fs::set_permissions(&store, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_preserves_a_repository_root_ending_in_newline() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    let repository = temp.path().join("repository\n");
+    init_git_repository(&repository);
+    command(&database).arg("init").assert().success();
+
+    let output = command(&database)
+        .args(["--json", "doctor", "--cwd"])
+        .arg(&repository)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["repository"]["probe"]["root"],
+        repository.canonicalize().unwrap().to_str().unwrap()
+    );
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn init_serializes_a_non_utf8_database_path_without_panicking() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let temp = TempDir::new().unwrap();
+    let database = temp
+        .path()
+        .join(std::ffi::OsString::from_vec(b"init-\xff.sqlite3".to_vec()));
+    let output = command(&database)
+        .args(["--json", "init"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["database"]["native_encoding"], "unix_bytes");
 }
 
 #[test]
