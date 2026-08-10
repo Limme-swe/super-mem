@@ -380,7 +380,9 @@ pub enum IndexCommand {
     Register(IndexRegisterArgs),
     /// Show profile coverage in one exact namespace/workspace/repository scope.
     Status(IndexStatusArgs),
-    /// Rebuild deterministic aliases and FTS from canonical rows.
+    /// Verify derived artifact fingerprint coverage in one exact scope.
+    ArtifactStatus(IndexArtifactStatusArgs),
+    /// Rebuild deterministic aliases, artifact fingerprints, and FTS.
     Rebuild,
 }
 
@@ -438,6 +440,12 @@ pub struct IndexStatusArgs {
     pub scope: ScopeArgs,
     #[arg(long)]
     pub profile_id: String,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexArtifactStatusArgs {
+    #[command(flatten)]
+    pub scope: ScopeArgs,
 }
 
 #[derive(Clone, Debug, Default, Args)]

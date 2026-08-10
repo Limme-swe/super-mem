@@ -73,6 +73,31 @@ fn help_exposes_the_complete_surface() {
                 .and(predicate::str::contains("--namespace"))
                 .and(predicate::str::contains("--workspace")),
         );
+
+    Command::cargo_bin("supermem")
+        .unwrap()
+        .args(["index", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("artifact-status"));
+}
+
+#[test]
+fn artifact_projection_status_is_available_without_a_search_profile() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database)
+        .args(["--json", "index", "artifact-status"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("\"referenced\": 0")
+                .and(predicate::str::contains("\"canonical\": 0"))
+                .and(predicate::str::contains("\"projected\": 0"))
+                .and(predicate::str::contains("\"valid\": 0"))
+                .and(predicate::str::contains("\"orphaned\": 0"))
+                .and(predicate::str::contains("\"degraded\": false")),
+        );
 }
 
 #[test]

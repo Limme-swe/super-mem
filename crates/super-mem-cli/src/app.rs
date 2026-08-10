@@ -421,6 +421,26 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                     ),
                 )?;
             }
+            IndexCommand::ArtifactStatus(arguments) => {
+                let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
+                let status = engine.artifact_projection_status(scope)?;
+                print_value(
+                    &status,
+                    cli.json,
+                    format!(
+                        "artifact fingerprints valid={}/{} referenced={} projected={} missing={} corrupt={} orphaned={} unverifiable={} degraded={}",
+                        status.valid,
+                        status.canonical,
+                        status.referenced,
+                        status.projected,
+                        status.missing,
+                        status.corrupt,
+                        status.orphaned,
+                        status.unverifiable,
+                        status.degraded
+                    ),
+                )?;
+            }
             IndexCommand::Rebuild => {
                 let engine = open_engine(&database)?;
                 let indexed = engine.rebuild_search_indexes()?;
