@@ -136,13 +136,21 @@ Scope and lifecycle eligibility are applied before either path. Final dense-chan
 
 Canonical events, memories, revisions, evidence, links, and feedback remain SQLite truth. FTS rows, alias-version markers, fixed-width artifact fingerprints, search profiles and activation state, expansions, vectors, and random-hyperplane signatures are derived search state.
 
+Verify artifact fingerprint coverage independently of semantic search profiles:
+
+~~~sh
+supermem index artifact-status --cwd .
+~~~
+
+The check streams distinct artifact references attached to current non-retracted memories in the authorized scope and recomputes the expected fixed-width bytes. It reports referenced, canonical, projected, valid, missing, corrupt, orphaned, and unverifiable counts plus a `degraded` flag. A valid unverifiable row is the explicit null marker for an artifact without a content hash; it is coverage, not proof of applicability. An orphaned reference means canonical artifact metadata is missing, so derived index repair cannot reconstruct it.
+
 Rebuild deterministic aliases, artifact fingerprints, and both canonical and expansion FTS rows from current canonical heads and registered projections with:
 
 ~~~sh
 supermem index rebuild
 ~~~
 
-Opening a database also detects missing or old alias projections and rebuilds them. `rebuild` does not call a model or create missing background projections.
+Opening a database also detects missing or old alias projections and rebuilds them. `rebuild` repairs missing or corrupt artifact fingerprint rows from canonical artifact metadata; it cannot repair orphaned canonical references, call a model, or create missing background projections.
 
 JSONL snapshots intentionally exclude search profiles, activation state, and projections. After importing a snapshot, register the desired profiles again and regenerate their pending projections. A raw filesystem backup of the SQLite database is different: it may contain this derived state.
 

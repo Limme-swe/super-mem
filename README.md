@@ -111,7 +111,7 @@ Stale records require `--include-stale`. Descendant and diverged records are hid
 
 SQLite memory rows are canonical. FTS, deterministic aliases, fixed-width artifact fingerprints, and optional search projections are derived state. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Default recall does not depend on network access or an embedding model; optional dense vectors are generated and supplied by the caller.
 
-See [Search indexing](docs/search-indexing.md) for the background `pending`/`register` workflow, immutable profile activation and removal, dense-vector scoring, rebuilds, snapshot behavior, and evaluation limits.
+See [Search indexing](docs/search-indexing.md) for the background `pending`/`register` workflow, immutable profile activation and removal, artifact projection integrity checks, dense-vector scoring, rebuilds, snapshot behavior, and evaluation limits.
 
 ## MCP tools
 

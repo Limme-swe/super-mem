@@ -934,6 +934,36 @@ pub struct SearchIndexStatus {
     pub stale: u64,
 }
 
+/// Integrity and coverage of the rebuildable artifact fingerprint projection.
+///
+/// Counts cover distinct artifact IDs attached to the current non-retracted
+/// memory revisions in one authorized scope. An explicit null projection for
+/// an artifact without a content hash is valid and included in
+/// `unverifiable`; a referenced ID without canonical metadata is `orphaned`.
+#[derive(Clone, Debug, Default, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArtifactProjectionStatus {
+    /// Distinct artifact IDs attached to current non-retracted memory revisions.
+    pub referenced: u64,
+    /// Canonical artifacts that should have one derived projection row.
+    pub canonical: u64,
+    /// Referenced artifact IDs with a projection row, whether valid or corrupt.
+    pub projected: u64,
+    /// Projection rows that exactly match their canonical artifact metadata.
+    pub valid: u64,
+    /// Canonical artifacts without a projection row.
+    pub missing: u64,
+    /// Projection rows whose marker or fingerprint bytes do not match canonical data.
+    pub corrupt: u64,
+    /// Current artifact references whose canonical artifact metadata is missing.
+    pub orphaned: u64,
+    /// Canonical artifacts without a content hash and therefore without an
+    /// applicability content fingerprint. A valid projection uses a null marker.
+    pub unverifiable: u64,
+    /// Whether explicit index repair is needed.
+    pub degraded: bool,
+}
+
 /// Request for a compiled context pack.
 #[derive(Clone, Debug, Default, JsonSchema, Serialize, Deserialize)]
 #[serde(default)]

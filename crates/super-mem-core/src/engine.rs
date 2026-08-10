@@ -19,14 +19,14 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 
 use crate::{
-    Applicability, ArtifactRef, CheckpointOutcome, CheckpointRequest, ContextItem, ContextPack,
-    ContextSection, EngineOptions, EntityRef, Error, Event, EventId, EventKind, EvidenceRef,
-    FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory, MemoryFeedback, MemoryHistory,
-    MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState, ObserveReceipt, ObserveRequest,
-    PendingSearchDocument, QueryId, RecallHit, RecallRequest, RegisterSearchProjectionsRequest,
-    RepositoryContext, Result, RetractRequest, RetrievalSignal, Scope, SearchIndexStatus,
-    SearchProfile, SearchProfileRegistration, SearchProjectionReceipt, Status, TrustLevel,
-    WriteReceipt,
+    Applicability, ArtifactProjectionStatus, ArtifactRef, CheckpointOutcome, CheckpointRequest,
+    ContextItem, ContextPack, ContextSection, EngineOptions, EntityRef, Error, Event, EventId,
+    EventKind, EvidenceRef, FeedbackRequest, GitRelation, ImportReceipt, LinkId, Memory,
+    MemoryFeedback, MemoryHistory, MemoryId, MemoryKind, MemoryLink, MemoryRevision, MemoryState,
+    ObserveReceipt, ObserveRequest, PendingSearchDocument, QueryId, RecallHit, RecallRequest,
+    RegisterSearchProjectionsRequest, RepositoryContext, Result, RetractRequest, RetrievalSignal,
+    Scope, SearchIndexStatus, SearchProfile, SearchProfileRegistration, SearchProjectionReceipt,
+    Status, TrustLevel, WriteReceipt,
     applicability::{
         ArtifactFingerprint, ArtifactFingerprintSet, artifact_fingerprint,
         classify_applicability_fingerprints_with_relation, fingerprint_artifacts,
@@ -65,6 +65,10 @@ const MMR_MAX_POOL: usize = 512;
 // this per-memory cap keeps the 1,024-candidate oversample below a fixed bound.
 const MAX_STAGED_ARTIFACT_FINGERPRINTS: usize = MAX_COLLECTION_ITEMS;
 const ALIAS_INCOMPLETE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL LIMIT 1)";
+// Materialize only distinct integer IDs. The outer projection must remain
+// unordered so SQLite can stream attacker-sized artifact metadata instead of
+// retaining it in a temporary sorter.
+const ARTIFACT_PROJECTION_STATUS_SQL: &str = "WITH current_artifacts(artifact_id) AS MATERIALIZED (SELECT ma.artifact_id FROM memory_heads h INDEXED BY memory_heads_search_scope JOIN memory_artifacts ma ON ma.memory_id=h.memory_id AND ma.revision=h.head_revision WHERE h.namespace=?1 AND h.scope_key=?2 AND h.workspace_id IS ?3 AND h.state!='retracted' GROUP BY ma.artifact_id) SELECT a.artifact_id,a.repo_id,a.path,a.symbol,a.content_hash,f.artifact_id,f.identity,f.content FROM current_artifacts current LEFT JOIN artifacts a ON a.artifact_id=current.artifact_id LEFT JOIN artifact_fingerprints f ON f.artifact_id=current.artifact_id";
 // Snapshot schema is independent from SQLite's user_version. Version 2 adds
 // immutable per-revision metadata and link provenance; version 1 remains
 // accepted for restore.
@@ -1534,6 +1538,71 @@ impl MemoryEngine {
             pending: eligible.saturating_sub(indexed).max(0) as u64,
             stale: stale.max(0) as u64,
         };
+        transaction.commit()?;
+        Ok(status)
+    }
+
+    /// Verifies fixed-width artifact projection coverage for one exact scope.
+    ///
+    /// This is an explicit integrity operation rather than part of recall. It
+    /// streams canonical artifact metadata and recomputes each expected digest
+    /// without retaining attacker-sized paths or symbols across rows.
+    pub fn artifact_projection_status(&self, mut scope: Scope) -> Result<ArtifactProjectionStatus> {
+        normalize_repository(&mut scope.repository);
+        self.validate_scope(&scope)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let scope_key = scope.key();
+        let mut statement = transaction.prepare(ARTIFACT_PROJECTION_STATUS_SQL)?;
+        let mut rows = statement.query(params![scope.namespace, scope_key, scope.workspace_id])?;
+        let mut status = ArtifactProjectionStatus::default();
+        while let Some(row) = rows.next()? {
+            let canonical_id = row.get::<_, Option<i64>>(0)?;
+            let projected_id = row.get::<_, Option<i64>>(5)?;
+            status.referenced = status.referenced.saturating_add(1);
+            if projected_id.is_some() {
+                status.projected = status.projected.saturating_add(1);
+            }
+            if canonical_id.is_none() {
+                status.orphaned = status.orphaned.saturating_add(1);
+                continue;
+            }
+            status.canonical = status.canonical.saturating_add(1);
+            let repo_id = row.get::<_, String>(1)?;
+            let path = row.get::<_, String>(2)?;
+            let symbol = row.get::<_, String>(3)?;
+            let content_hash = row.get::<_, String>(4)?;
+            let identity = row.get_ref(6)?;
+            let content = row.get_ref(7)?;
+            if content_hash.is_empty() {
+                status.unverifiable = status.unverifiable.saturating_add(1);
+            }
+            if projected_id.is_none() {
+                status.missing = status.missing.saturating_add(1);
+                continue;
+            }
+            let valid = if content_hash.is_empty() {
+                matches!(identity, ValueRef::Null) && matches!(content, ValueRef::Null)
+            } else {
+                let (expected_identity, expected_content) = artifact_fingerprint(
+                    &repo_id,
+                    &path,
+                    (!symbol.is_empty()).then_some(symbol.as_str()),
+                    &content_hash,
+                )
+                .digests();
+                matches!(identity, ValueRef::Blob(bytes) if bytes == expected_identity)
+                    && matches!(content, ValueRef::Blob(bytes) if bytes == expected_content)
+            };
+            if valid {
+                status.valid = status.valid.saturating_add(1);
+            } else {
+                status.corrupt = status.corrupt.saturating_add(1);
+            }
+        }
+        status.degraded = status.missing != 0 || status.corrupt != 0 || status.orphaned != 0;
+        drop(rows);
+        drop(statement);
         transaction.commit()?;
         Ok(status)
     }
@@ -6212,11 +6281,46 @@ mod tests {
             content_hash: Some("second-hash".into()),
             ..first_artifact.clone()
         };
+        let unverifiable_artifact = ArtifactRef {
+            path: "src/unverifiable.rs".into(),
+            content_hash: None,
+            ..first_artifact.clone()
+        };
         let mut request = remember_request("Projection gap", "derived coverage must fail closed");
         request.scope = repo_scope("projection-gap", "write-session");
         request.scope.repository.as_mut().unwrap().dirty_hash = Some("1111111111111111".into());
-        request.artifacts = vec![first_artifact.clone(), second_artifact.clone()];
+        request.artifacts = vec![
+            first_artifact.clone(),
+            second_artifact.clone(),
+            unverifiable_artifact,
+        ];
         let memory_id = engine.remember(request).unwrap().memory_ids[0];
+        let mut other_scope = remember_request("Other projection", "must remain scope isolated");
+        other_scope.scope = repo_scope("projection-other", "write-session");
+        other_scope.artifacts = vec![ArtifactRef {
+            repo_id: "projection-other".into(),
+            path: "src/other.rs".into(),
+            content_hash: Some("other-hash".into()),
+            ..ArtifactRef::default()
+        }];
+        engine.remember(other_scope).unwrap();
+        let healthy = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                healthy.referenced,
+                healthy.canonical,
+                healthy.projected,
+                healthy.valid,
+                healthy.missing,
+                healthy.corrupt,
+                healthy.orphaned,
+                healthy.unverifiable,
+                healthy.degraded,
+            ),
+            (3, 3, 3, 3, 0, 0, 0, 1, false)
+        );
 
         {
             let connection = engine.lock().unwrap();
@@ -6236,6 +6340,23 @@ mod tests {
             );
             assert!(!staged[&memory_id].applicability_artifacts.complete);
         }
+        let missing = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                missing.referenced,
+                missing.canonical,
+                missing.projected,
+                missing.valid,
+                missing.missing,
+                missing.corrupt,
+                missing.orphaned,
+                missing.unverifiable,
+                missing.degraded,
+            ),
+            (3, 3, 2, 2, 1, 0, 0, 1, true)
+        );
 
         let mut current_scope = repo_scope("projection-gap", "recall-session");
         current_scope.repository.as_mut().unwrap().dirty_hash = Some("2222222222222222".into());
@@ -6260,6 +6381,23 @@ mod tests {
         assert!(!hit.signals.contains(&RetrievalSignal::ArtifactVerified));
 
         engine.rebuild_search_indexes().unwrap();
+        let repaired_status = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                repaired_status.referenced,
+                repaired_status.canonical,
+                repaired_status.projected,
+                repaired_status.valid,
+                repaired_status.missing,
+                repaired_status.corrupt,
+                repaired_status.orphaned,
+                repaired_status.unverifiable,
+                repaired_status.degraded,
+            ),
+            (3, 3, 3, 3, 0, 0, 0, 1, false)
+        );
         let connection = engine.lock().unwrap();
         let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
         assert_eq!(
@@ -6309,6 +6447,23 @@ mod tests {
             );
             assert!(!staged[&memory_id].applicability_artifacts.complete);
         }
+        let corrupt_status = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                corrupt_status.referenced,
+                corrupt_status.canonical,
+                corrupt_status.projected,
+                corrupt_status.valid,
+                corrupt_status.missing,
+                corrupt_status.corrupt,
+                corrupt_status.orphaned,
+                corrupt_status.unverifiable,
+                corrupt_status.degraded,
+            ),
+            (3, 3, 3, 2, 0, 1, 0, 1, true)
+        );
         let corrupted = engine
             .recall(RecallRequest {
                 query: "projection gap".into(),
@@ -6328,6 +6483,106 @@ mod tests {
             .unwrap();
         assert_eq!(hit.applicability, Applicability::Stale);
         assert!(!hit.signals.contains(&RetrievalSignal::ArtifactVerified));
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE artifact_fingerprints SET identity=zeroblob(32),content=zeroblob(32) WHERE artifact_id=(SELECT artifact_id FROM artifacts WHERE path='src/first.rs')",
+                    [],
+                )
+                .unwrap();
+        }
+        let wrong_digest = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                wrong_digest.referenced,
+                wrong_digest.canonical,
+                wrong_digest.projected,
+                wrong_digest.valid,
+                wrong_digest.missing,
+                wrong_digest.corrupt,
+                wrong_digest.orphaned,
+                wrong_digest.unverifiable,
+            ),
+            (3, 3, 3, 2, 0, 1, 0, 1)
+        );
+        assert!(wrong_digest.degraded);
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE artifact_fingerprints SET identity=printf('%032d',0),content=printf('%032d',0) WHERE artifact_id=(SELECT artifact_id FROM artifacts WHERE path='src/first.rs')",
+                    [],
+                )
+                .unwrap();
+        }
+        let wrong_storage_type = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (wrong_storage_type.valid, wrong_storage_type.corrupt),
+            (2, 1)
+        );
+        assert!(wrong_storage_type.degraded);
+
+        engine.rebuild_search_indexes().unwrap();
+        assert!(
+            !engine
+                .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+                .unwrap()
+                .degraded
+        );
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     DELETE FROM artifact_fingerprints
+                     WHERE artifact_id=(SELECT artifact_id FROM artifacts WHERE path='src/unverifiable.rs');
+                     DELETE FROM artifacts WHERE path='src/unverifiable.rs';
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+            assert_eq!(
+                connection
+                    .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap(),
+                1
+            );
+        }
+        let orphaned = engine
+            .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+            .unwrap();
+        assert_eq!(
+            (
+                orphaned.referenced,
+                orphaned.canonical,
+                orphaned.projected,
+                orphaned.valid,
+                orphaned.missing,
+                orphaned.corrupt,
+                orphaned.orphaned,
+                orphaned.unverifiable,
+                orphaned.degraded,
+            ),
+            (3, 2, 2, 2, 0, 0, 1, 0, true)
+        );
+        engine.rebuild_search_indexes().unwrap();
+        assert_eq!(
+            engine
+                .artifact_projection_status(repo_scope("projection-gap", "status-session"))
+                .unwrap()
+                .orphaned,
+            1,
+            "derived rebuild cannot invent missing canonical artifact metadata"
+        );
     }
 
     #[test]
@@ -6481,6 +6736,24 @@ mod tests {
             },
         ];
         let memory_id = source.remember(request).unwrap().memory_ids[0];
+        let source_scope = repo_scope("identity-rebuild", "status");
+        let healthy = source
+            .artifact_projection_status(source_scope.clone())
+            .unwrap();
+        assert_eq!(
+            (
+                healthy.referenced,
+                healthy.canonical,
+                healthy.projected,
+                healthy.valid,
+                healthy.missing,
+                healthy.corrupt,
+                healthy.orphaned,
+                healthy.unverifiable,
+                healthy.degraded,
+            ),
+            (2, 2, 2, 2, 0, 0, 0, 1, false)
+        );
         let (expected_identity, expected_content) = artifact_fingerprint(
             "identity-rebuild",
             "src/identity.rs",
@@ -6524,7 +6797,30 @@ mod tests {
                     if message.contains("non-32-byte digest")
             ));
         }
+        let malformed = source
+            .artifact_projection_status(source_scope.clone())
+            .unwrap();
+        assert_eq!(
+            (
+                malformed.referenced,
+                malformed.canonical,
+                malformed.projected,
+                malformed.valid,
+                malformed.missing,
+                malformed.corrupt,
+                malformed.orphaned,
+                malformed.unverifiable,
+                malformed.degraded,
+            ),
+            (2, 2, 2, 1, 0, 1, 0, 1, true)
+        );
         source.rebuild_search_indexes().unwrap();
+        assert!(
+            !source
+                .artifact_projection_status(source_scope.clone())
+                .unwrap()
+                .degraded
+        );
         assert_eq!(
             source
                 .lock()
@@ -6540,6 +6836,21 @@ mod tests {
         assert!(!snapshot.contains("artifact_fingerprints"));
         let mut restored = engine();
         restored.import_jsonl(&snapshot).unwrap();
+        let restored_status = restored.artifact_projection_status(source_scope).unwrap();
+        assert_eq!(
+            (
+                restored_status.referenced,
+                restored_status.canonical,
+                restored_status.projected,
+                restored_status.valid,
+                restored_status.missing,
+                restored_status.corrupt,
+                restored_status.orphaned,
+                restored_status.unverifiable,
+                restored_status.degraded,
+            ),
+            (2, 2, 2, 2, 0, 0, 0, 1, false)
+        );
         let connection = restored.lock().unwrap();
         let stored = connection
             .query_row(
@@ -9046,6 +9357,44 @@ mod tests {
                 .iter()
                 .any(|detail| detail.contains("INTEGER PRIMARY KEY")),
             "memory heads should be point-looked-up by FTS rowid: {details:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_projection_status_is_scope_driven_without_a_metadata_sort() {
+        assert!(
+            !ARTIFACT_PROJECTION_STATUS_SQL
+                .to_ascii_uppercase()
+                .contains("ORDER BY"),
+            "artifact metadata must stream after the fixed-width ID set is materialized"
+        );
+        let engine = engine();
+        let scope = Scope::default();
+        let connection = engine.lock().unwrap();
+        let mut statement = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {ARTIFACT_PROJECTION_STATUS_SQL}"
+            ))
+            .unwrap();
+        let details = statement
+            .query_map(
+                params![scope.namespace, scope.key(), scope.workspace_id],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("memory_heads_search_scope")),
+            "artifact health must start from the exact authorized scope: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("TEMP B-TREE FOR ORDER BY")),
+            "attacker-sized artifact metadata must not enter a sorter: {details:?}"
         );
     }
 
