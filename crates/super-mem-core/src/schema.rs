@@ -8,11 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 
-use crate::{Durability, EngineOptions, Error, Result};
+use crate::{Durability, EngineOptions, Error, Result, applicability::artifact_fingerprint};
 
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
@@ -122,6 +122,9 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
         }
         if current < 5 {
             migrate_v5(connection)?;
+        }
+        if current < 6 {
+            migrate_v6(connection)?;
         }
         Ok(())
     })();
@@ -786,6 +789,153 @@ fn migrate_v5(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v6(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            -- Generator identity remains immutable, while operators can
+            -- disable a profile without deleting expensive derived data.
+            CREATE TABLE search_profile_state (
+                profile_id         TEXT PRIMARY KEY,
+                active             INTEGER NOT NULL DEFAULT 1
+                    CHECK(active IN (0,1)),
+                FOREIGN KEY(profile_id) REFERENCES search_profiles(profile_id)
+                    ON DELETE CASCADE
+            );
+            INSERT INTO search_profile_state(profile_id,active)
+            SELECT profile_id,1 FROM search_profiles;
+            CREATE TRIGGER search_profiles_create_state
+            AFTER INSERT ON search_profiles
+            BEGIN
+                INSERT INTO search_profile_state(profile_id,active)
+                VALUES(NEW.profile_id,1);
+            END;
+
+            -- Expansion text is indexed per immutable profile projection.
+            -- Keeping one FTS row per projection prevents alphabetically
+            -- earlier profiles from consuming a shared per-memory byte cap.
+            CREATE VIRTUAL TABLE search_expansion_fts USING fts5(
+                expansion,
+                tokenize = 'unicode61 remove_diacritics 2',
+                content = '',
+                contentless_delete = 1
+            );
+            INSERT INTO search_expansion_fts(rowid,expansion)
+            SELECT rowid,expansion
+            FROM search_projections
+            WHERE expansion!='';
+
+            CREATE TRIGGER search_projections_expansion_insert
+            AFTER INSERT ON search_projections
+            WHEN NEW.expansion!=''
+            BEGIN
+                INSERT INTO search_expansion_fts(rowid,expansion)
+                VALUES(NEW.rowid,NEW.expansion);
+            END;
+            CREATE TRIGGER search_projections_expansion_update
+            AFTER UPDATE OF expansion ON search_projections
+            BEGIN
+                DELETE FROM search_expansion_fts WHERE rowid=OLD.rowid;
+                INSERT INTO search_expansion_fts(rowid,expansion)
+                SELECT NEW.rowid,NEW.expansion WHERE NEW.expansion!='';
+            END;
+            CREATE TRIGGER search_projections_expansion_delete
+            BEFORE DELETE ON search_projections
+            WHEN OLD.expansion!=''
+            BEGIN
+                DELETE FROM search_expansion_fts WHERE rowid=OLD.rowid;
+            END;
+
+            CREATE INDEX memory_link_revisions_target
+                ON memory_link_revisions(
+                    target_memory_id,
+                    source_memory_id,
+                    source_revision,
+                    weight DESC,
+                    relation
+                );
+
+            -- Historical checkpoint retries reconstruct whether an outcome
+            -- was retracted at their original sequence boundary without
+            -- scanning unrelated event associations.
+            CREATE INDEX event_memories_memory
+                ON event_memories(memory_id,event_id);
+
+            -- Historical checkpoint retries start from the bounded automatic
+            -- command keys, then join the exact revision at their sequence
+            -- boundary. Keep this separate from the current-head canonical
+            -- index used by ordinary checkpoints.
+            CREATE INDEX memory_revision_metadata_checkpoint
+                ON memory_revision_metadata(
+                    kind,
+                    canonical_key,
+                    memory_id,
+                    revision
+                )
+                WHERE canonical_key IS NOT NULL;
+
+            -- Canonical artifact metadata can contain multi-KiB paths,
+            -- symbols, and hashes. This rebuildable fixed-width projection
+            -- lets recall stage and deduplicate applicability material without
+            -- repeatedly transferring or sorting those strings.
+            CREATE TABLE artifact_fingerprints (
+                artifact_id       INTEGER PRIMARY KEY
+                    REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                identity          BLOB CHECK(identity IS NULL OR length(identity)=32),
+                content           BLOB CHECK(content IS NULL OR length(content)=32),
+                CHECK((identity IS NULL)=(content IS NULL))
+            );
+            CREATE INDEX artifact_fingerprints_identity
+                ON artifact_fingerprints(identity,artifact_id);
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    rebuild_artifact_fingerprints(connection)?;
+    connection
+        .execute_batch("PRAGMA user_version=6;")
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
+/// Rebuilds fixed-width artifact applicability fingerprints from canonical rows.
+///
+/// Rows are read and hashed one at a time so migration and snapshot restore do
+/// not retain or sort a corpus of attacker-controlled paths and symbols.
+pub(crate) fn rebuild_artifact_fingerprints(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM artifact_fingerprints", [])?;
+    let mut artifacts = connection.prepare(
+        "SELECT artifact_id,repo_id,path,symbol,content_hash FROM artifacts ORDER BY artifact_id",
+    )?;
+    let mut insert = connection.prepare(
+        "INSERT INTO artifact_fingerprints(artifact_id,identity,content) VALUES(?1,?2,?3)",
+    )?;
+    let mut rows = artifacts.query([])?;
+    while let Some(row) = rows.next()? {
+        let artifact_id = row.get::<_, i64>(0)?;
+        let repo_id = row.get::<_, String>(1)?;
+        let path = row.get::<_, String>(2)?;
+        let symbol = row.get::<_, String>(3)?;
+        let content_hash = row.get::<_, String>(4)?;
+        if content_hash.is_empty() {
+            insert.execute(params![
+                artifact_id,
+                Option::<&[u8]>::None,
+                Option::<&[u8]>::None
+            ])?;
+        } else {
+            let (identity, content) = artifact_fingerprint(
+                &repo_id,
+                &path,
+                (!symbol.is_empty()).then_some(symbol.as_str()),
+                &content_hash,
+            )
+            .digests();
+            insert.execute(params![artifact_id, &identity[..], &content[..]])?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -931,7 +1081,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_migration_adds_constrained_rebuildable_search_projections() {
+    fn v4_database_upgrades_through_search_profile_lifecycle() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         migrate_v1(&connection).unwrap();
@@ -977,6 +1127,45 @@ mod tests {
             .unwrap();
 
         migrate_v5(&connection).unwrap();
+        // Seed v5 derived search state before v6 exists so this exercises the
+        // lifecycle and FTS backfill, not merely the post-migration triggers.
+        connection
+            .execute_batch(
+                r"
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('dense-v1','digest-v1',3,10);
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('expansion-v1','digest-v1',NULL,10);
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'dense-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'likely semantic query',zeroblob(12),zeroblob(16),1.0,11
+                );
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'expansion-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'another likely query',NULL,NULL,NULL,11
+                );
+                INSERT INTO artifacts(
+                    artifact_id,namespace,repo_id,path,symbol,content_hash,
+                    git_oid,language
+                ) VALUES(
+                    41,'default','repo','src/migration.rs','migrate',
+                    'artifact-hash','','rust'
+                ),(
+                    42,'default','repo','src/unverifiable.rs','',
+                    '','','rust'
+                );
+                ",
+            )
+            .unwrap();
+        migrate_v6(&connection).unwrap();
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -1012,6 +1201,13 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='search_expansion_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok());
         assert_eq!(
             connection
                 .query_row("SELECT count(*) FROM search_alias_state", [], |row| {
@@ -1020,6 +1216,56 @@ mod tests {
                 .unwrap(),
             0,
             "legacy heads must be detected as needing alias backfill"
+        );
+        let (stored_identity, stored_content) = connection
+            .query_row(
+                "SELECT identity,content FROM artifact_fingerprints WHERE artifact_id=41",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap();
+        let (expected_identity, expected_content) = crate::applicability::artifact_fingerprint(
+            "repo",
+            "src/migration.rs",
+            Some("migrate"),
+            "artifact-hash",
+        )
+        .digests();
+        assert_eq!(stored_identity, expected_identity);
+        assert_eq!(stored_content, expected_content);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM artifact_fingerprints WHERE artifact_id=42 AND identity IS NULL AND content IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "migration must retain a coverage marker for unverifiable artifacts"
+        );
+        connection
+            .execute("DELETE FROM artifacts WHERE artifact_id=41", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM artifact_fingerprints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1,
+            "derived artifact fingerprints must follow canonical row deletion"
+        );
+        connection
+            .execute("DELETE FROM artifacts WHERE artifact_id=42", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM artifact_fingerprints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
         );
         assert!(connection
             .query_row(
@@ -1093,32 +1339,74 @@ mod tests {
                 .is_err()
         );
 
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_profile_state WHERE active=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
         connection
-            .execute_batch(
-                r"
-                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
-                VALUES('dense-v1','digest-v1',3,10);
-                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
-                VALUES('expansion-v1','digest-v1',NULL,10);
-                INSERT INTO search_projections(
-                    profile_id,memory_id,revision,content_hash,expansion,
-                    vector,signature,norm,indexed_at_ms
-                ) VALUES(
-                    'dense-v1','018f0000-0000-7000-8000-000000000102',1,
-                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                    'likely semantic query',zeroblob(12),zeroblob(16),1.0,11
-                );
-                INSERT INTO search_projections(
-                    profile_id,memory_id,revision,content_hash,expansion,
-                    vector,signature,norm,indexed_at_ms
-                ) VALUES(
-                    'expansion-v1','018f0000-0000-7000-8000-000000000102',1,
-                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                    'another likely query',NULL,NULL,NULL,11
-                );
-                ",
+            .execute(
+                "UPDATE search_projections SET expansion='' WHERE profile_id='expansion-v1'",
+                [],
             )
             .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        connection
+            .execute(
+                "UPDATE search_projections SET expansion='another likely query restored' WHERE profile_id='expansion-v1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "DELETE FROM search_profiles WHERE profile_id='expansion-v1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
         assert!(
             connection
                 .execute(

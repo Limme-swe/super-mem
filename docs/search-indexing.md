@@ -28,7 +28,7 @@ The default path needs only the release binary and SQLite. It has no network dep
 
 ## Background projection workflow
 
-A search profile identifies one immutable generator configuration. `model_digest` should cover the model or expansion rules, tokenizer, preprocessing, vector dimensions, and similarity convention. super-mem records this value but does not verify an external model installation. Reuse the same profile only for byte-for-byte compatible generation. Dense queries can select a new profile when the generator changes; expansion profiles are additive, as described below.
+A search profile identifies one immutable generator configuration. `model_digest` should cover the model or expansion rules, tokenizer, preprocessing, vector dimensions, and similarity convention. super-mem records this value but does not verify an external model installation. Reuse the same profile only for byte-for-byte compatible generation. A newly registered profile is active. Active expansion profiles are additive; an inactive profile keeps its projections but contributes no retrieval candidates.
 
 Register an expansion-only profile by omitting dimensions:
 
@@ -48,6 +48,16 @@ supermem index add-profile \
 ~~~
 
 Repeating an identical registration is safe. An existing profile cannot be updated with a different digest or dimension count.
+
+List profiles and change their database-wide activation state with:
+
+~~~sh
+supermem index list-profiles
+supermem index deactivate --profile-id query-expansion-v1
+supermem index activate --profile-id query-expansion-v1
+~~~
+
+Activation never changes canonical memories. It controls both expansion and dense retrieval for that profile.
 
 Fetch current documents that need enrichment. Index administration uses one exact namespace, workspace, and repository scope; the usual `--cwd`, `--namespace`, `--workspace`, and `--repo-id` scope options apply.
 
@@ -80,7 +90,7 @@ supermem index register \
   projections.jsonl
 ~~~
 
-Omit the input path, or use `-`, to read from standard input. Registration is atomic and idempotent for byte-identical records. Each record is a compare-and-swap against the current memory revision and content hash. If the memory changed while the worker was running, the batch is rejected instead of attaching stale generated data.
+Omit the input path, or use `-`, to read from standard input. Registration is atomic and idempotent for byte-identical records. Each record is a compare-and-swap against the current memory revision and content hash. If the memory changed while the worker was running, the batch is rejected instead of attaching stale generated data. If the same immutable profile produces different bytes for the same memory revision and content hash, registration is rejected; use a new profile ID for a changed generator.
 
 Check coverage with:
 
@@ -88,7 +98,15 @@ Check coverage with:
 supermem index status --profile-id query-expansion-v1 --cwd .
 ~~~
 
-The result reports eligible, indexed, pending, and stale counts. Run `pending` again until the intended scope is covered. A worker failure does not affect ordinary writes or default recall; it only leaves projections pending. All current expansion profiles contribute in stable profile order to an FTS field capped at 64 KiB per memory, so register only profiles that should influence recall in that database. There is currently no per-query expansion-profile selector or profile-removal CLI.
+The result reports profile activation plus eligible, indexed, pending, and stale counts. Run `pending` again until the intended scope is covered. A worker failure does not affect ordinary writes or default recall; it only leaves projections pending. Every projection has an independent contentless FTS row, so one profile cannot consume another profile's expansion budget.
+
+To discard a profile and all of its rebuildable projections:
+
+~~~sh
+supermem index remove-profile --profile-id query-expansion-v1 --yes
+~~~
+
+Removal does not delete canonical memories, events, revisions, or evidence. There is no per-query expansion-profile selector; activation applies to the database.
 
 ## Dense recall
 
@@ -105,7 +123,7 @@ supermem recall \
   --dense-min-similarity 0.20
 ~~~
 
-MCP `memory_context` exposes the equivalent `dense_profile`, `dense_vector`, and optional `dense_min_similarity` fields. Supplying a missing profile, a vector with the wrong dimensions, a zero or non-finite vector, or an invalid threshold returns an error. The default threshold is `0.0`, so anti-correlated vectors do not receive a dense retrieval signal. Without these fields, recall does not perform dense scoring.
+MCP `memory_context` exposes the equivalent `dense_profile`, `dense_vector`, and optional `dense_min_similarity` fields. Supplying a missing or inactive profile, a vector with the wrong dimensions, a zero or non-finite vector, or an invalid threshold returns an error. The default threshold is `0.0`, so anti-correlated vectors do not receive a dense retrieval signal. Without these fields, recall does not perform dense scoring.
 
 Dense candidate selection is portable and bounded:
 
@@ -116,9 +134,9 @@ Scope and lifecycle eligibility are applied before either path. Final dense-chan
 
 ## Rebuilds and snapshots
 
-Canonical events, memories, revisions, evidence, links, and feedback remain SQLite truth. FTS rows, alias-version markers, search profiles, expansions, vectors, and random-hyperplane signatures are derived search state.
+Canonical events, memories, revisions, evidence, links, and feedback remain SQLite truth. FTS rows, alias-version markers, fixed-width artifact fingerprints, search profiles and activation state, expansions, vectors, and random-hyperplane signatures are derived search state.
 
-Rebuild deterministic aliases and FTS from current canonical heads and any current registered projections with:
+Rebuild deterministic aliases, artifact fingerprints, and both canonical and expansion FTS rows from current canonical heads and registered projections with:
 
 ~~~sh
 supermem index rebuild
@@ -126,7 +144,7 @@ supermem index rebuild
 
 Opening a database also detects missing or old alias projections and rebuilds them. `rebuild` does not call a model or create missing background projections.
 
-JSONL snapshots intentionally exclude search profiles and projections. After importing a snapshot, register the desired profiles again and regenerate their pending projections. A raw filesystem backup of the SQLite database is different: it may contain this derived state.
+JSONL snapshots intentionally exclude search profiles, activation state, and projections. After importing a snapshot, register the desired profiles again and regenerate their pending projections. A raw filesystem backup of the SQLite database is different: it may contain this derived state.
 
 ## Privacy and integrity
 

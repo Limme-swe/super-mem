@@ -2,6 +2,203 @@
 
 use crate::{Applicability, ArtifactRef, GitRelation, Scope, compare_revisions};
 
+/// Fixed-width artifact material used while recall candidates are staged.
+///
+/// Candidate paths and symbols can each be several KiB. Retaining those
+/// strings for every oversampled candidate makes recall memory proportional to
+/// attacker-controlled metadata size. These domain-separated fingerprints
+/// preserve the exact identity/content comparisons used by applicability while
+/// keeping each retained artifact at a constant 64 bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ArtifactFingerprint {
+    identity: [u8; 32],
+    content: [u8; 32],
+}
+
+impl ArtifactFingerprint {
+    pub(crate) fn from_digests(identity: &[u8], content: &[u8]) -> Option<Self> {
+        Some(Self {
+            identity: identity.try_into().ok()?,
+            content: content.try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn digests(self) -> ([u8; 32], [u8; 32]) {
+        (self.identity, self.content)
+    }
+}
+
+/// A bounded set of verifiable artifacts.
+///
+/// `complete` is false when storage contained more artifacts than candidate
+/// staging retained. A partial set can prove a mismatch, but it must never
+/// prove that the entire historical artifact set is current.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ArtifactFingerprintSet {
+    pub(crate) fingerprints: Vec<ArtifactFingerprint>,
+    pub(crate) complete: bool,
+}
+
+impl ArtifactFingerprintSet {
+    pub(crate) fn complete(fingerprints: Vec<ArtifactFingerprint>) -> Self {
+        Self {
+            fingerprints,
+            complete: true,
+        }
+    }
+
+    pub(crate) fn is_fully_verified_by(&self, current: &Self) -> bool {
+        self.complete
+            && !self.fingerprints.is_empty()
+            && self.fingerprints.iter().all(|historical| {
+                current.fingerprints.iter().any(|candidate| {
+                    historical.identity == candidate.identity
+                        && historical.content == candidate.content
+                })
+            })
+    }
+}
+
+pub(crate) fn artifact_fingerprint(
+    repo_id: &str,
+    path: &str,
+    symbol: Option<&str>,
+    content_hash: &str,
+) -> ArtifactFingerprint {
+    let identity = artifact_identity_fingerprint(repo_id, path, symbol);
+
+    let mut content = blake3::Hasher::new();
+    update_length_framed(&mut content, b"super-mem:artifact-content:v1");
+    update_length_framed(&mut content, content_hash.as_bytes());
+    ArtifactFingerprint {
+        identity,
+        content: *content.finalize().as_bytes(),
+    }
+}
+
+/// Fixed-width identity shared by applicability staging and derived storage
+/// indexes. Content and Git revisions are intentionally excluded: callers use
+/// this key to recognize the same repository path and optional symbol across
+/// revisions.
+pub(crate) fn artifact_identity_fingerprint(
+    repo_id: &str,
+    path: &str,
+    symbol: Option<&str>,
+) -> [u8; 32] {
+    let mut identity = blake3::Hasher::new();
+    update_length_framed(&mut identity, b"super-mem:artifact-identity:v1");
+    update_length_framed(&mut identity, repo_id.as_bytes());
+    update_length_framed(&mut identity, path.as_bytes());
+    match symbol {
+        Some(symbol) => {
+            identity.update(&[1]);
+            update_length_framed(&mut identity, symbol.as_bytes());
+        }
+        None => {
+            identity.update(&[0]);
+        }
+    }
+    *identity.finalize().as_bytes()
+}
+
+pub(crate) fn fingerprint_artifacts(artifacts: &[ArtifactRef]) -> ArtifactFingerprintSet {
+    ArtifactFingerprintSet::complete(
+        artifacts
+            .iter()
+            .filter_map(|artifact| {
+                artifact.content_hash.as_deref().map(|content_hash| {
+                    artifact_fingerprint(
+                        &artifact.repo_id,
+                        &artifact.path,
+                        artifact.symbol.as_deref(),
+                        content_hash,
+                    )
+                })
+            })
+            .collect(),
+    )
+}
+
+fn update_length_framed(hasher: &mut blake3::Hasher, value: &[u8]) {
+    hasher.update(&(value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ArtifactComparison {
+    mismatched: bool,
+    fully_verified: bool,
+    complete: bool,
+}
+
+fn compare_artifact_refs(
+    memory_artifacts: &[ArtifactRef],
+    current_artifacts: &[ArtifactRef],
+) -> ArtifactComparison {
+    let mut verifiable = 0_usize;
+    let mut verified = 0_usize;
+    for historical in memory_artifacts
+        .iter()
+        .filter(|artifact| artifact.content_hash.is_some())
+    {
+        verifiable += 1;
+        let current = current_artifacts.iter().find(|current| {
+            historical.repo_id == current.repo_id
+                && historical.path == current.path
+                && historical.symbol == current.symbol
+        });
+        match (
+            historical.content_hash.as_deref(),
+            current.and_then(|artifact| artifact.content_hash.as_deref()),
+        ) {
+            (Some(old), Some(now)) if old != now => {
+                return ArtifactComparison {
+                    mismatched: true,
+                    fully_verified: false,
+                    complete: true,
+                };
+            }
+            (Some(_), Some(_)) => verified += 1,
+            _ => {}
+        }
+    }
+    ArtifactComparison {
+        mismatched: false,
+        fully_verified: verifiable > 0 && verified == verifiable,
+        complete: true,
+    }
+}
+
+fn compare_artifact_fingerprints(
+    memory_artifacts: &ArtifactFingerprintSet,
+    current_artifacts: &ArtifactFingerprintSet,
+) -> ArtifactComparison {
+    let mut verified = 0_usize;
+    for historical in &memory_artifacts.fingerprints {
+        let current = current_artifacts
+            .fingerprints
+            .iter()
+            .find(|current| historical.identity == current.identity);
+        if let Some(current) = current {
+            if historical.content != current.content {
+                return ArtifactComparison {
+                    mismatched: true,
+                    fully_verified: false,
+                    complete: memory_artifacts.complete,
+                };
+            }
+            verified += 1;
+        }
+    }
+    ArtifactComparison {
+        mismatched: false,
+        fully_verified: memory_artifacts.complete
+            && !memory_artifacts.fingerprints.is_empty()
+            && verified == memory_artifacts.fingerprints.len(),
+        complete: memory_artifacts.complete,
+    }
+}
+
 /// Classifies whether a memory can safely be applied to the current scope.
 ///
 /// Namespace and repository mismatches are hard isolation boundaries. Branch
@@ -31,6 +228,42 @@ pub(crate) fn classify_applicability_with_relation<F>(
 ) -> Applicability
 where
     F: FnOnce(&str, &str, &str) -> GitRelation,
+{
+    classify_applicability_with_artifact_comparison(
+        memory_scope,
+        current_scope,
+        || compare_artifact_refs(memory_artifacts, current_artifacts),
+        resolve_git_relation,
+    )
+}
+
+pub(crate) fn classify_applicability_fingerprints_with_relation<F>(
+    memory_scope: &Scope,
+    current_scope: &Scope,
+    memory_artifacts: &ArtifactFingerprintSet,
+    current_artifacts: &ArtifactFingerprintSet,
+    resolve_git_relation: F,
+) -> Applicability
+where
+    F: FnOnce(&str, &str, &str) -> GitRelation,
+{
+    classify_applicability_with_artifact_comparison(
+        memory_scope,
+        current_scope,
+        || compare_artifact_fingerprints(memory_artifacts, current_artifacts),
+        resolve_git_relation,
+    )
+}
+
+fn classify_applicability_with_artifact_comparison<F, A>(
+    memory_scope: &Scope,
+    current_scope: &Scope,
+    compare_artifacts: A,
+    resolve_git_relation: F,
+) -> Applicability
+where
+    F: FnOnce(&str, &str, &str) -> GitRelation,
+    A: FnOnce() -> ArtifactComparison,
 {
     if memory_scope.namespace != current_scope.namespace {
         return Applicability::Inapplicable;
@@ -64,28 +297,11 @@ where
         _ => {}
     }
 
-    let mut verifiable = 0_usize;
-    let mut verified = 0_usize;
-    for historical in memory_artifacts
-        .iter()
-        .filter(|artifact| artifact.content_hash.is_some())
-    {
-        verifiable += 1;
-        let current = current_artifacts.iter().find(|current| {
-            historical.repo_id == current.repo_id
-                && historical.path == current.path
-                && historical.symbol == current.symbol
-        });
-        match (
-            historical.content_hash.as_deref(),
-            current.and_then(|artifact| artifact.content_hash.as_deref()),
-        ) {
-            (Some(old), Some(now)) if old != now => return Applicability::Stale,
-            (Some(_), Some(_)) => verified += 1,
-            _ => {}
-        }
+    let artifact_comparison = compare_artifacts();
+    if artifact_comparison.mismatched {
+        return Applicability::Stale;
     }
-    let artifact_set_verified = verifiable > 0 && verified == verifiable;
+    let artifact_set_verified = artifact_comparison.fully_verified;
 
     if memory_repo.dirty_hash != current_repo.dirty_hash
         && (memory_repo.dirty_hash.is_some() || current_repo.dirty_hash.is_some())
@@ -100,7 +316,7 @@ where
         return Applicability::Exact;
     }
 
-    match (
+    let git_applicability = match (
         current_repo.root.as_deref(),
         memory_repo.head_oid.as_deref(),
         current_repo.head_oid.as_deref(),
@@ -123,6 +339,14 @@ where
             Applicability::Divergent
         }
         _ => Applicability::Unversioned,
+    };
+    // A truncated historical artifact set may still prove a mismatch, but a
+    // matching Git revision cannot prove that omitted attachment hashes are
+    // current. Downgrade only Exact; retain stronger stale/divergent evidence.
+    if !artifact_comparison.complete && git_applicability == Applicability::Exact {
+        Applicability::Unversioned
+    } else {
+        git_applicability
     }
 }
 
@@ -336,5 +560,166 @@ mod tests {
             classify_applicability(&scope("repo", "main"), &Scope::default(), &[], &[]),
             Applicability::Inapplicable
         );
+    }
+
+    #[test]
+    fn fixed_width_fingerprints_preserve_full_artifact_classification() {
+        assert_eq!(std::mem::size_of::<ArtifactFingerprint>(), 64);
+        let historical = ArtifactRef {
+            repo_id: "repo".into(),
+            path: "src/large.rs".into(),
+            symbol: Some("worker::run".into()),
+            content_hash: Some("before".into()),
+            ..ArtifactRef::default()
+        };
+        let matching = historical.clone();
+        let changed = ArtifactRef {
+            content_hash: Some("after".into()),
+            ..historical.clone()
+        };
+
+        let cases = [
+            (
+                vec![historical.clone()],
+                vec![matching],
+                GitRelation::Diverged {
+                    ahead: 1,
+                    behind: 1,
+                },
+            ),
+            (vec![historical.clone()], vec![changed], GitRelation::Same),
+            (
+                vec![historical.clone()],
+                Vec::new(),
+                GitRelation::Ancestor { behind: 1 },
+            ),
+            (Vec::new(), Vec::new(), GitRelation::Unknown),
+        ];
+        for (memory_artifacts, current_artifacts, relation) in cases {
+            let mut memory_scope = scope("repo", "main");
+            let mut current_scope = scope("repo", "main");
+            let memory_repo = memory_scope.repository.as_mut().unwrap();
+            memory_repo.root = Some("/repository".into());
+            memory_repo.head_oid = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+            let current_repo = current_scope.repository.as_mut().unwrap();
+            current_repo.root = Some("/repository".into());
+            current_repo.head_oid = Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into());
+            let expected = classify_applicability_with_relation(
+                &memory_scope,
+                &current_scope,
+                &memory_artifacts,
+                &current_artifacts,
+                |_, _, _| relation,
+            );
+            let memory_fingerprints = fingerprint_artifacts(&memory_artifacts);
+            let current_fingerprints = fingerprint_artifacts(&current_artifacts);
+            let actual = classify_applicability_fingerprints_with_relation(
+                &memory_scope,
+                &current_scope,
+                &memory_fingerprints,
+                &current_fingerprints,
+                |_, _, _| relation,
+            );
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn incomplete_fingerprint_sets_cannot_override_dirty_state() {
+        let mut memory = scope("repo", "main");
+        let mut current = memory.clone();
+        for candidate in [&mut memory, &mut current] {
+            let repository = candidate.repository.as_mut().unwrap();
+            repository.root = Some("/repository".into());
+            repository.head_oid = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        }
+        memory.repository.as_mut().unwrap().dirty_hash = Some("before".into());
+        current.repository.as_mut().unwrap().dirty_hash = Some("after".into());
+        let artifact = ArtifactRef {
+            repo_id: "repo".into(),
+            path: "src/lib.rs".into(),
+            content_hash: Some("same".into()),
+            ..ArtifactRef::default()
+        };
+        let mut historical = fingerprint_artifacts(std::slice::from_ref(&artifact));
+        let current_artifacts = fingerprint_artifacts(std::slice::from_ref(&artifact));
+        assert_eq!(
+            classify_applicability_fingerprints_with_relation(
+                &memory,
+                &current,
+                &historical,
+                &current_artifacts,
+                |_, _, _| GitRelation::Same,
+            ),
+            Applicability::Exact
+        );
+
+        historical.complete = false;
+        assert!(!historical.is_fully_verified_by(&current_artifacts));
+        assert_eq!(
+            classify_applicability_fingerprints_with_relation(
+                &memory,
+                &current,
+                &historical,
+                &current_artifacts,
+                |_, _, _| GitRelation::Same,
+            ),
+            Applicability::Stale
+        );
+        current.repository.as_mut().unwrap().dirty_hash = Some("before".into());
+        assert_eq!(
+            classify_applicability_fingerprints_with_relation(
+                &memory,
+                &current,
+                &historical,
+                &current_artifacts,
+                |_, _, _| GitRelation::Same,
+            ),
+            Applicability::Unversioned,
+            "an incomplete historical set must not become exact through Git fallback"
+        );
+    }
+
+    #[test]
+    fn fixed_width_fingerprints_preserve_dirty_exact_stale_and_missing_results() {
+        let mut memory = scope("repo", "main");
+        let mut current = memory.clone();
+        memory.repository.as_mut().unwrap().dirty_hash = Some("before".into());
+        current.repository.as_mut().unwrap().dirty_hash = Some("after".into());
+        let historical = ArtifactRef {
+            repo_id: "repo".into(),
+            path: "src/lib.rs".into(),
+            content_hash: Some("old".into()),
+            ..ArtifactRef::default()
+        };
+        let cases = [
+            (vec![historical.clone()], Applicability::Exact),
+            (
+                vec![ArtifactRef {
+                    content_hash: Some("new".into()),
+                    ..historical.clone()
+                }],
+                Applicability::Stale,
+            ),
+            (Vec::new(), Applicability::Stale),
+        ];
+        for (current_artifacts, expected) in cases {
+            let full = classify_applicability_with_relation(
+                &memory,
+                &current,
+                std::slice::from_ref(&historical),
+                &current_artifacts,
+                |_, _, _| GitRelation::Same,
+            );
+            let fingerprints = classify_applicability_fingerprints_with_relation(
+                &memory,
+                &current,
+                &fingerprint_artifacts(std::slice::from_ref(&historical)),
+                &fingerprint_artifacts(&current_artifacts),
+                |_, _, _| GitRelation::Same,
+            );
+            assert_eq!(full, expected);
+            assert_eq!(fingerprints, full);
+        }
     }
 }

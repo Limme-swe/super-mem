@@ -105,13 +105,13 @@ Automatic capture is fail-open: a memory error must not stop the coding session.
 3. Hard namespace, workspace, repository, lifecycle, and time filters run before channel limits.
 4. Exact, strict/loose lexical, code-alias, diagnostic, entity, artifact, and recency channels produce candidates; registered expansions and caller-supplied vectors can add optional semantic candidates.
 5. Git applicability, importance, confidence, trust, feedback, and redundancy affect ranking.
-6. Selected records are rendered as untrusted evidence under the requested budget.
+6. Only selected immutable revisions receive full provenance hydration; their bodies are fetched and rendered as untrusted evidence under the requested budget.
 
 Stale records require `--include-stale`. Descendant and diverged records are hidden unless recall uses `--include-divergent` or MCP sets `include_divergent`. A complete set of matching artifact hashes can keep a memory exact despite unrelated dirty files; incomplete automatic Git capture supplies no artifact evidence.
 
-SQLite memory rows are canonical. FTS, deterministic aliases, and optional search projections are derived state. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Default recall does not depend on network access or an embedding model; optional dense vectors are generated and supplied by the caller.
+SQLite memory rows are canonical. FTS, deterministic aliases, fixed-width artifact fingerprints, and optional search projections are derived state. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Default recall does not depend on network access or an embedding model; optional dense vectors are generated and supplied by the caller.
 
-See [Search indexing](docs/search-indexing.md) for the background `pending`/`register` workflow, immutable profiles, dense-vector scoring, rebuilds, snapshot behavior, and evaluation limits.
+See [Search indexing](docs/search-indexing.md) for the background `pending`/`register` workflow, immutable profile activation and removal, dense-vector scoring, rebuilds, snapshot behavior, and evaluation limits.
 
 ## MCP tools
 

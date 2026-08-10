@@ -11,9 +11,9 @@ use std::{
 
 use chrono::{DateTime, Utc};
 use rusqlite::{
-    Connection, OptionalExtension, Transaction, TransactionBehavior, named_params, params,
+    Connection, OptionalExtension, Row, Transaction, TransactionBehavior, named_params, params,
     params_from_iter,
-    types::{Value as SqlValue, ValueRef},
+    types::{Type as SqlType, Value as SqlValue, ValueRef},
 };
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -27,11 +27,14 @@ use crate::{
     RepositoryContext, Result, RetractRequest, RetrievalSignal, Scope, SearchIndexStatus,
     SearchProfile, SearchProfileRegistration, SearchProjectionReceipt, Status, TrustLevel,
     WriteReceipt,
-    applicability::classify_applicability_with_relation,
+    applicability::{
+        ArtifactFingerprint, ArtifactFingerprintSet, artifact_fingerprint,
+        classify_applicability_fingerprints_with_relation, fingerprint_artifacts,
+    },
     artifacts::materialize_current_artifacts,
     ranking::{Candidate, safe_fts_query, safe_fts_strict_query, score_candidate, select_mmr},
     redaction::Redactor,
-    schema::{SCHEMA_VERSION, initialize},
+    schema::{SCHEMA_VERSION, initialize, rebuild_artifact_fingerprints},
     search::{
         VECTOR_SIGNATURE_VERSION, code_aliases, cosine_similarity, decode_f32_vector,
         encode_f32_vector, hamming_distance, rank_by_cosine, validate_signature_width,
@@ -39,6 +42,11 @@ use crate::{
 };
 
 const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts,4.0,1.0,2.5,3.0,3.5,2.0,0.8),h.memory_id LIMIT 512";
+// A memory may have many matching expansion profiles. Materialize each FTS5
+// score, then select the best score per memory before applying the channel
+// limit; DISTINCT would retain an arbitrary row and make ranking depend on
+// projection insertion order.
+const EXPANSION_FTS_CANDIDATE_SQL: &str = "WITH matched(memory_id,score) AS MATERIALIZED (SELECT h.memory_id,bm25(search_expansion_fts) FROM search_expansion_fts CROSS JOIN search_projections p ON p.rowid=search_expansion_fts.rowid JOIN search_profile_state ps ON ps.profile_id=p.profile_id AND ps.active=1 JOIN memory_heads h ON h.memory_id=p.memory_id JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND p.revision=h.head_revision AND p.content_hash=r.content_hash AND search_expansion_fts MATCH :query) SELECT memory_id FROM matched GROUP BY memory_id ORDER BY min(score),memory_id LIMIT 512";
 const DENSE_EXACT_SCAN_LIMIT: usize = 4_096;
 const DENSE_BINARY_SHORTLIST: usize = 512;
 const CODE_ALIAS_VERSION: u32 = 1;
@@ -46,7 +54,16 @@ const MAX_SEARCH_PROJECTION_BATCH: usize = 256;
 const MAX_SEARCH_EXPANSIONS: usize = 128;
 const MAX_SEARCH_EXPANSION_ITEM_BYTES: usize = 4_096;
 const MAX_SEARCH_EXPANSION_BYTES: usize = 16_384;
-const MAX_FTS_EXPANSION_BYTES: usize = 65_536;
+// MMR only needs a stable lexical sketch of each candidate. Keeping the
+// prefix here prevents a single large memory from making candidate staging
+// proportional to the total corpus body size.
+const MMR_BODY_PREVIEW_CHARS: usize = 1_024;
+const MMR_MIN_POOL: usize = 256;
+const MMR_MAX_POOL: usize = 512;
+// Artifact applicability metadata is adversary-controlled and can be several
+// KiB per field. Candidate staging retains only fixed-width fingerprints, and
+// this per-memory cap keeps the 1,024-candidate oversample below a fixed bound.
+const MAX_STAGED_ARTIFACT_FINGERPRINTS: usize = MAX_COLLECTION_ITEMS;
 const ALIAS_INCOMPLETE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL LIMIT 1)";
 // Snapshot schema is independent from SQLite's user_version. Version 2 adds
 // immutable per-revision metadata and link provenance; version 1 remains
@@ -520,7 +537,6 @@ impl MemoryEngine {
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         drop(statement);
-        drop(connection);
 
         let mut events = Vec::new();
         for event in rows {
@@ -536,6 +552,7 @@ impl MemoryEngine {
         }
         events.reverse();
 
+        let mut automatic_attempts = Vec::new();
         let mut seen_evidence = request
             .evidence
             .iter()
@@ -559,11 +576,20 @@ impl MemoryEngine {
                 request.goal = truncate_to_tokens(&event.content, 256);
             }
 
-            let succeeded = event_succeeded(&event);
-            if event.kind == EventKind::CommandResult.as_str()
-                || event.kind == EventKind::Verification.as_str()
-                || (event.kind == EventKind::ToolResult.as_str() && !succeeded)
-            {
+            let promotion_reason = classify_checkpoint_event(&event);
+            let closes_failure_candidate = promotion_reason.is_none()
+                && event_succeeded(&event)
+                && matches!(
+                    event.kind.as_str(),
+                    "command_result" | "tool_result" | "verification"
+                )
+                && event
+                    .attributes
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|command| !command.trim().is_empty());
+            if promotion_reason.is_some() || closes_failure_candidate {
+                let succeeded = event_succeeded(&event);
                 let action = event_action(&event);
                 let result = truncate_to_tokens(&event.content, 768);
                 let fingerprint = event
@@ -571,25 +597,17 @@ impl MemoryEngine {
                     .get("error_fingerprint")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                if !request.attempts.iter().any(|attempt| {
-                    attempt.action == action
-                        && attempt.fingerprint == fingerprint
-                        && attempt.result == result
-                }) {
-                    request.attempts.push(crate::CheckpointAttempt {
-                        action: action.clone(),
-                        result: result.clone(),
-                        succeeded,
-                        fingerprint,
-                    });
-                }
-                if event.kind == EventKind::Verification.as_str()
-                    || event
-                        .attributes
-                        .get("verification")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                {
+                let group_identity =
+                    checkpoint_attempt_group_identity(&event, fingerprint.as_deref());
+                automatic_attempts.push(AutomaticCheckpointAttempt {
+                    action: action.clone(),
+                    result: result.clone(),
+                    succeeded,
+                    fingerprint,
+                    promotion_reason,
+                    group_identity,
+                });
+                if promotion_reason == Some(CheckpointPromotionReason::Verification) {
                     let verification = format!("{action}: {result}");
                     if !request.verification.contains(&verification) {
                         request.verification.push(verification);
@@ -597,6 +615,21 @@ impl MemoryEngine {
                 }
             }
         }
+        let automatic_keys = automatic_attempts
+            .iter()
+            .map(|attempt| checkpoint_attempt_canonical_key(&attempt.group_identity))
+            .collect::<BTreeSet<_>>();
+        let previously_failed = load_failed_checkpoint_attempts(
+            &connection,
+            &request.scope,
+            &automatic_keys,
+            retry_before_seq,
+        )?;
+        drop(connection);
+        request.attempts.extend(coalesce_checkpoint_attempts(
+            automatic_attempts,
+            &previously_failed,
+        ));
         self.checkpoint(request)
     }
 
@@ -743,6 +776,10 @@ impl MemoryEngine {
             let mut attributes = BTreeMap::from([
                 ("succeeded".to_owned(), Value::Bool(attempt.succeeded)),
                 ("goal".to_owned(), Value::String(goal.clone())),
+                (
+                    "attempt_result".to_owned(),
+                    Value::String(attempt.result.clone()),
+                ),
             ]);
             if let Some(fingerprint) = &attempt.fingerprint {
                 attributes.insert(
@@ -750,9 +787,13 @@ impl MemoryEngine {
                     Value::String(fingerprint.clone()),
                 );
             }
+            if let Some(reason) = &attempt.promotion_reason {
+                attributes.insert("promotion_reason".to_owned(), Value::String(reason.clone()));
+            }
             let prepared = self.prepare_memory(crate::RememberRequest {
                 kind: MemoryKind::Outcome,
                 scope: request.scope.clone(),
+                canonical_key: attempt.canonical_key.clone(),
                 title: if attempt.succeeded {
                     format!("Successful approach: {}", attempt.action)
                 } else {
@@ -904,7 +945,11 @@ impl MemoryEngine {
         prune_candidates(&mut candidates, 1_024);
 
         let candidate_ids = candidates.keys().copied().collect::<Vec<_>>();
-        let mut memories = load_memories(&transaction, &candidate_ids)?;
+        // Candidate staging deliberately omits full bodies, attributes, tags,
+        // entities, and evidence. Applicability needs immutable scalar head
+        // metadata and current artifacts; MMR needs only a bounded body
+        // preview. Full selected revisions are hydrated after diversification.
+        let mut memories = load_candidate_memories(&transaction, &candidate_ids)?;
         let utilities = feedback_utilities(&transaction, &candidate_ids)?;
         let database_seq = latest_sequence(&transaction)?;
         // Hash the artifacts of the strongest retrieval candidates first. A
@@ -923,30 +968,24 @@ impl MemoryEngine {
                 )
                 .then_with(|| left.cmp(right))
         });
-        let mut artifact_keys = BTreeSet::new();
-        let mut historical_artifacts = Vec::new();
-        'candidates: for memory_id in artifact_candidate_ids {
-            let Some(memory) = memories.get(&memory_id) else {
-                continue;
-            };
-            for artifact in &memory.artifacts {
-                if artifact.content_hash.is_none() {
-                    continue;
-                }
-                let key = (
-                    artifact.repo_id.clone(),
-                    artifact.path.clone(),
-                    artifact.symbol.clone(),
-                    artifact.content_hash.clone(),
-                );
-                if artifact_keys.insert(key) {
-                    historical_artifacts.push(artifact.clone());
-                    if historical_artifacts.len() == MAX_COLLECTION_ITEMS {
-                        break 'candidates;
-                    }
-                }
-            }
-        }
+        // Filesystem materialization needs real paths, but candidate scoring
+        // does not. Fetch at most 128 distinct paths in retrieval-priority
+        // order instead of retaining every candidate's multi-KiB metadata.
+        let historical_artifacts = request
+            .scope
+            .repository
+            .as_ref()
+            .filter(|repository| repository.root.is_some())
+            .map(|repository| {
+                load_materialization_artifacts(
+                    &transaction,
+                    &artifact_candidate_ids,
+                    &repository.repo_id,
+                    MAX_COLLECTION_ITEMS,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         transaction.commit()?;
         drop(connection);
 
@@ -960,16 +999,18 @@ impl MemoryEngine {
             );
             merge_artifact_hints(&mut request.hints.artifacts, inferred);
         }
+        let current_artifacts = fingerprint_artifacts(&request.hints.artifacts);
         let mut hits = Vec::new();
         let mut git_relations = HashMap::new();
         let mut resolve_git = |root: &str, stored: &str, current: &str| {
             crate::compare_revisions(root, stored, current)
         };
         for (memory_id, mut candidate) in candidates {
-            let memory = memories.remove(&memory_id).ok_or_else(|| Error::NotFound {
+            let staged = memories.remove(&memory_id).ok_or_else(|| Error::NotFound {
                 kind: "memory",
                 id: memory_id.to_string(),
             })?;
+            let memory = staged.memory;
             if !request.kinds.is_empty() && !request.kinds.contains(&memory.kind) {
                 continue;
             }
@@ -982,11 +1023,11 @@ impl MemoryEngine {
             if !valid_at(&memory, now) {
                 continue;
             }
-            let applicability = classify_applicability_with_relation(
+            let applicability = classify_applicability_fingerprints_with_relation(
                 &memory.scope,
                 &request.scope,
-                &memory.artifacts,
-                &request.hints.artifacts,
+                &staged.applicability_artifacts,
+                &current_artifacts,
                 |root, stored, current| {
                     cached_git_relation(root, stored, current, &mut git_relations, &mut resolve_git)
                 },
@@ -997,7 +1038,10 @@ impl MemoryEngine {
             {
                 continue;
             }
-            if artifact_verified(&memory.artifacts, &request.hints.artifacts) {
+            if staged
+                .applicability_artifacts
+                .is_fully_verified_by(&current_artifacts)
+            {
                 candidate.record(RetrievalSignal::ArtifactVerified, 1);
             }
             let utility = utilities.get(&memory_id).copied().unwrap_or(0.0);
@@ -1009,13 +1053,44 @@ impl MemoryEngine {
                 now,
             ));
         }
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
-        });
-        let selected = select_mmr(hits, limit, 0.78);
+        bound_mmr_pool(&mut hits, limit);
+        let mut selected = select_mmr(hits, limit, 0.78);
+
+        // The first read snapshot pinned each candidate's immutable
+        // (memory_id, revision). A writer may advance a head while Git
+        // applicability is resolved outside SQLite; hydrate the pinned
+        // revisions rather than consulting mutable heads again. One extra
+        // character beyond the largest possible rendered body is sufficient
+        // for truncate_to_tokens to preserve its exact ellipsis decision.
+        let maximum_body_chars = token_budget.saturating_mul(3).saturating_add(1);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let revisions = selected
+            .iter()
+            .map(|hit| (hit.memory.memory_id, hit.memory.revision))
+            .collect::<Vec<_>>();
+        let mut hydrated =
+            load_memory_revisions_bounded(&transaction, &revisions, maximum_body_chars)?;
+        for hit in &mut selected {
+            let pinned_revision = hit.memory.revision;
+            // Lifecycle links update the mutable head without rewriting the
+            // immutable revision metadata. Preserve the head scalars pinned
+            // by candidate staging while replacing only revision content and
+            // attachments here.
+            let pinned_state = hit.memory.state;
+            let pinned_updated_at = hit.memory.updated_at;
+            let mut memory = hydrated
+                .remove(&hit.memory.memory_id)
+                .filter(|memory| memory.revision == pinned_revision)
+                .ok_or_else(|| Error::NotFound {
+                    kind: "memory revision",
+                    id: format!("{}@{pinned_revision}", hit.memory.memory_id),
+                })?;
+            memory.state = pinned_state;
+            memory.updated_at = pinned_updated_at;
+            hit.memory = memory;
+        }
+        transaction.commit()?;
         Ok(compile_context(
             query_id,
             database_seq,
@@ -1078,6 +1153,55 @@ impl MemoryEngine {
         let profile = load_search_profile(&transaction, &registration.profile_id)?;
         transaction.commit()?;
         Ok(profile)
+    }
+
+    /// Lists immutable search profiles and their current activation state.
+    pub fn list_search_profiles(&self) -> Result<Vec<SearchProfile>> {
+        let connection = self.lock()?;
+        let mut statement = connection.prepare_cached(
+            "SELECT p.profile_id,p.model_digest,p.dimensions,p.signature_version,s.active,p.created_at_ms FROM search_profiles p JOIN search_profile_state s ON s.profile_id=p.profile_id ORDER BY p.profile_id",
+        )?;
+        let rows = statement
+            .query_map([], search_profile_storage_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter().map(search_profile_from_storage).collect()
+    }
+
+    /// Enables or disables a profile without discarding its derived data.
+    pub fn set_search_profile_active(
+        &self,
+        profile_id: &str,
+        active: bool,
+    ) -> Result<SearchProfile> {
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE search_profile_state SET active=?2 WHERE profile_id=?1",
+            params![profile_id, active],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound {
+                kind: "search profile",
+                id: profile_id.to_owned(),
+            });
+        }
+        let profile = load_search_profile(&transaction, profile_id)?;
+        transaction.commit()?;
+        Ok(profile)
+    }
+
+    /// Removes one profile and all of its rebuildable projections.
+    pub fn remove_search_profile(&self, profile_id: &str) -> Result<bool> {
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM search_profiles WHERE profile_id=?1",
+            [profile_id],
+        )? != 0;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Returns current documents whose derived projection is missing or stale.
@@ -1266,11 +1390,10 @@ impl MemoryEngine {
         }
         let mut registered = 0;
         let mut unchanged = 0;
-        let mut fts_rebuilds = Vec::new();
         for projection in prepared {
             let current = transaction
                 .query_row(
-                    "SELECT h.docid,h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted'",
+                    "SELECT h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted'",
                     params![
                         projection.memory_id.to_string(),
                         request.scope.namespace,
@@ -1279,14 +1402,13 @@ impl MemoryEngine {
                     ],
                     |row| {
                         Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, u32>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((docid, head_revision, head_hash)) = current else {
+            let Some((head_revision, head_hash)) = current else {
                 return Err(Error::Conflict(format!(
                     "memory {} is not a current non-retracted head in the authorized scope",
                     projection.memory_id
@@ -1314,17 +1436,6 @@ impl MemoryEngine {
                     },
                 )
                 .optional()?;
-            let expansion_changed = existing.as_ref().map_or(
-                !projection.expansion.is_empty(),
-                |(revision, content_hash, expansion, _, _, _)| {
-                    if *revision == projection.revision && content_hash == &projection.content_hash
-                    {
-                        expansion != &projection.expansion
-                    } else {
-                        !projection.expansion.is_empty()
-                    }
-                },
-            );
             let identical = existing.as_ref().is_some_and(
                 |(revision, content_hash, expansion, vector, signature, norm)| {
                     *revision == projection.revision
@@ -1338,6 +1449,17 @@ impl MemoryEngine {
             if identical {
                 unchanged += 1;
                 continue;
+            }
+            if existing
+                .as_ref()
+                .is_some_and(|(revision, content_hash, ..)| {
+                    *revision == projection.revision && content_hash == &projection.content_hash
+                })
+            {
+                return Err(Error::Conflict(format!(
+                    "search profile {} produced different bytes for unchanged memory {} revision {}; register a new immutable profile",
+                    request.profile_id, projection.memory_id, projection.revision
+                )));
             }
             transaction.execute(
                 "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,vector,signature,norm,indexed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(profile_id,memory_id) DO UPDATE SET revision=excluded.revision,content_hash=excluded.content_hash,expansion=excluded.expansion,vector=excluded.vector,signature=excluded.signature,norm=excluded.norm,indexed_at_ms=excluded.indexed_at_ms",
@@ -1354,23 +1476,6 @@ impl MemoryEngine {
                 ],
             )?;
             registered += 1;
-            if expansion_changed {
-                fts_rebuilds.push((projection.memory_id, docid));
-            }
-        }
-        if !fts_rebuilds.is_empty() {
-            let ids = fts_rebuilds
-                .iter()
-                .map(|(memory_id, _)| *memory_id)
-                .collect::<Vec<_>>();
-            let memories = load_memories(&transaction, &ids)?;
-            for (memory_id, docid) in fts_rebuilds {
-                let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
-                    kind: "memory",
-                    id: memory_id.to_string(),
-                })?;
-                rebuild_fts_from_memory(&transaction, docid, memory)?;
-            }
         }
         let receipt = SearchProjectionReceipt {
             profile_id: request.profile_id,
@@ -2183,6 +2288,12 @@ impl MemoryEngine {
             if let Some(fingerprint) = &mut attempt.fingerprint {
                 redact_string_field(self, fingerprint, &mut count);
             }
+            if let Some(canonical_key) = &mut attempt.canonical_key {
+                redact_string_field(self, canonical_key, &mut count);
+            }
+            if let Some(reason) = &mut attempt.promotion_reason {
+                redact_string_field(self, reason, &mut count);
+            }
         }
         for task in &mut request.open_tasks {
             redact_string_field(self, task, &mut count);
@@ -2257,6 +2368,17 @@ impl MemoryEngine {
                     false,
                     MAX_KEY_BYTES,
                 )?;
+            }
+            if let Some(canonical_key) = &attempt.canonical_key {
+                validate_bounded_text(
+                    "checkpoint attempt key",
+                    canonical_key,
+                    false,
+                    MAX_KEY_BYTES,
+                )?;
+            }
+            if let Some(reason) = &attempt.promotion_reason {
+                validate_bounded_text("checkpoint attempt promotion reason", reason, false, 64)?;
             }
         }
         for task in &request.open_tasks {
@@ -2374,6 +2496,384 @@ struct SessionEvent {
     kind: String,
     content: String,
     attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointPromotionReason {
+    Verification,
+    FailedExecution,
+    ExplicitSalience,
+}
+
+impl CheckpointPromotionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verification => "verification",
+            Self::FailedExecution => "failed_execution",
+            Self::ExplicitSalience => "explicit_salience",
+        }
+    }
+}
+
+struct AutomaticCheckpointAttempt {
+    action: String,
+    result: String,
+    succeeded: bool,
+    fingerprint: Option<String>,
+    promotion_reason: Option<CheckpointPromotionReason>,
+    group_identity: String,
+}
+
+struct CheckpointAttemptGroup {
+    canonical_key: String,
+    action: String,
+    final_result: String,
+    final_succeeded: bool,
+    fingerprint: Option<String>,
+    promotion_reason: Option<CheckpointPromotionReason>,
+    first_failure: Option<String>,
+    previously_failed: bool,
+    observations: usize,
+    last_order: usize,
+}
+
+fn classify_checkpoint_event(event: &SessionEvent) -> Option<CheckpointPromotionReason> {
+    let verification = event.kind == EventKind::Verification.as_str()
+        || event
+            .attributes
+            .get("verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if verification {
+        return Some(CheckpointPromotionReason::Verification);
+    }
+    let failed_execution = !event_succeeded(event)
+        && matches!(
+            event.kind.as_str(),
+            "command_result" | "tool_result" | "verification"
+        )
+        && !is_neutral_negative_probe(event);
+    if failed_execution {
+        return Some(CheckpointPromotionReason::FailedExecution);
+    }
+    event
+        .attributes
+        .get("memory_salient")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then_some(CheckpointPromotionReason::ExplicitSalience)
+}
+
+fn is_neutral_negative_probe(event: &SessionEvent) -> bool {
+    if event.kind != EventKind::CommandResult.as_str()
+        || event.attributes.get("exit_code").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let Some(command) = event.attributes.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let executable = tokens
+        .first()
+        .and_then(|token| token.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    let expected_negative = matches!(executable, "rg" | "grep")
+        || (executable == "git" && tokens.get(1) == Some(&"diff") && tokens.contains(&"--quiet"));
+    if !expected_negative {
+        return false;
+    }
+    let folded = event.content.to_ascii_lowercase();
+    ![
+        "error:",
+        "fatal:",
+        "panic",
+        "exception",
+        "traceback",
+        "segmentation fault",
+    ]
+    .iter()
+    .any(|marker| folded.contains(marker))
+}
+
+fn load_failed_checkpoint_attempts(
+    connection: &Connection,
+    scope: &Scope,
+    canonical_keys: &BTreeSet<String>,
+    before_seq: Option<i64>,
+) -> Result<BTreeMap<String, String>> {
+    if canonical_keys.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    // First execution only resolves failures that are live now. An
+    // idempotent retry instead reconstructs immutable revision metadata and
+    // lifecycle state immediately before the original checkpoint event.
+    // Mutable head state, keys, and update order must not change that request.
+    let placeholders = sql_placeholders(canonical_keys.len());
+    let base_values = || {
+        vec![
+            SqlValue::Text(scope.namespace.clone()),
+            SqlValue::Text(scope.key()),
+            scope
+                .workspace_id
+                .clone()
+                .map_or(SqlValue::Null, SqlValue::Text),
+        ]
+    };
+    let rows = if let Some(boundary) = before_seq {
+        // Key-drive the small historical candidate set before reconstructing
+        // the latest revision and lifecycle eligibility at the boundary.
+        let sql = format!(
+            "SELECT m.canonical_key,json_extract(r.attributes_json,'$.attempt_result'),r.body \
+             FROM memory_revision_metadata m INDEXED BY memory_revision_metadata_checkpoint \
+             CROSS JOIN memory_heads h ON h.memory_id=m.memory_id \
+             CROSS JOIN memory_revisions r \
+               ON r.memory_id=m.memory_id AND r.revision=m.revision \
+             WHERE h.namespace=?1 \
+               AND h.scope_key=?2 \
+               AND h.workspace_id IS ?3 \
+               AND m.kind='outcome' \
+               AND m.revision=( \
+                   SELECT earlier.revision \
+                   FROM memory_revisions earlier \
+                   WHERE earlier.memory_id=h.memory_id \
+                     AND earlier.recorded_seq < ?4 \
+                   ORDER BY earlier.recorded_seq DESC,earlier.revision DESC \
+                   LIMIT 1) \
+               AND NOT EXISTS ( \
+                   SELECT 1 \
+                   FROM event_memories em \
+                   JOIN events lifecycle ON lifecycle.event_id=em.event_id \
+                   WHERE em.memory_id=h.memory_id \
+                     AND lifecycle.kind='lifecycle' \
+                     AND lifecycle.seq < ?4) \
+               AND NOT EXISTS ( \
+                   SELECT 1 \
+                   FROM memory_link_revisions link \
+                   JOIN events linked ON linked.event_id=link.created_event_id \
+                   WHERE link.target_memory_id=h.memory_id \
+                     AND lower(trim(link.relation))='supersedes' \
+                     AND linked.seq < ?4) \
+               AND m.canonical_key IN ({placeholders}) \
+               AND json_extract(r.attributes_json,'$.succeeded')=0 \
+             ORDER BY m.canonical_key,r.recorded_seq DESC,r.revision DESC,h.memory_id"
+        );
+        let mut values = base_values();
+        values.push(SqlValue::Integer(boundary));
+        values.extend(canonical_keys.iter().cloned().map(SqlValue::Text));
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    } else {
+        // The common path remains an exact lookup over current canonical
+        // heads; historical metadata must not turn every checkpoint into a
+        // namespace-wide scan.
+        let sql = format!(
+            "SELECT h.canonical_key,json_extract(r.attributes_json,'$.attempt_result'),r.body \
+             FROM memory_heads h INDEXED BY memory_heads_canonical \
+             CROSS JOIN memory_revisions r \
+               ON r.memory_id=h.memory_id AND r.revision=h.head_revision \
+             WHERE h.namespace=?1 \
+               AND h.scope_key=?2 \
+               AND h.workspace_id IS ?3 \
+               AND h.kind='outcome' \
+               AND h.state IN ('active','contested') \
+               AND h.canonical_key IN ({placeholders}) \
+               AND json_extract(r.attributes_json,'$.succeeded')=0 \
+             ORDER BY h.canonical_key,h.updated_seq DESC,h.memory_id"
+        );
+        let mut values = base_values();
+        values.extend(canonical_keys.iter().cloned().map(SqlValue::Text));
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut failed = BTreeMap::new();
+    for (key, result, body) in rows {
+        failed.entry(key).or_insert_with(|| {
+            result.unwrap_or_else(|| checkpoint_result_from_memory_body(&body).unwrap_or(body))
+        });
+    }
+    Ok(failed)
+}
+
+fn checkpoint_result_from_memory_body(body: &str) -> Option<String> {
+    let result = body.strip_prefix("Attempt: ")?.split_once("\nResult: ")?.1;
+    let (result, _) = result.rsplit_once("\nSucceeded: ")?;
+    Some(result.to_owned())
+}
+
+fn coalesce_checkpoint_attempts(
+    attempts: Vec<AutomaticCheckpointAttempt>,
+    previously_failed: &BTreeMap<String, String>,
+) -> Vec<crate::CheckpointAttempt> {
+    let mut groups = BTreeMap::<String, CheckpointAttemptGroup>::new();
+    for (order, attempt) in attempts.into_iter().enumerate() {
+        let canonical_key = checkpoint_attempt_canonical_key(&attempt.group_identity);
+        let previous_failure = previously_failed.get(&canonical_key).cloned();
+        let group = groups
+            .entry(canonical_key.clone())
+            .or_insert_with(|| CheckpointAttemptGroup {
+                previously_failed: previous_failure.is_some(),
+                canonical_key,
+                action: attempt.action.clone(),
+                final_result: attempt.result.clone(),
+                final_succeeded: attempt.succeeded,
+                fingerprint: attempt.fingerprint.clone(),
+                promotion_reason: attempt.promotion_reason,
+                first_failure: previous_failure
+                    .clone()
+                    .or_else(|| (!attempt.succeeded).then(|| attempt.result.clone())),
+                observations: usize::from(previous_failure.is_some()),
+                last_order: order,
+            });
+        if !attempt.succeeded && group.first_failure.is_none() {
+            group.first_failure = Some(attempt.result.clone());
+        }
+        group.action = attempt.action;
+        group.final_result = attempt.result;
+        group.final_succeeded = attempt.succeeded;
+        if attempt.fingerprint.is_some() {
+            group.fingerprint = attempt.fingerprint;
+        }
+        group.promotion_reason =
+            merge_checkpoint_promotion_reason(group.promotion_reason, attempt.promotion_reason);
+        group.observations += 1;
+        group.last_order = order;
+    }
+
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        checkpoint_group_priority(left)
+            .cmp(&checkpoint_group_priority(right))
+            .then_with(|| right.last_order.cmp(&left.last_order))
+            .then_with(|| left.canonical_key.cmp(&right.canonical_key))
+    });
+    let mut successful_verifications = 0;
+    let mut successful_salient = 0;
+    groups
+        .into_iter()
+        .filter(|group| {
+            if group.previously_failed || group.first_failure.is_some() || !group.final_succeeded {
+                return true;
+            }
+            match group.promotion_reason {
+                Some(CheckpointPromotionReason::Verification) => {
+                    successful_verifications += 1;
+                    successful_verifications <= 4
+                }
+                Some(CheckpointPromotionReason::ExplicitSalience) => {
+                    successful_salient += 1;
+                    successful_salient <= 4
+                }
+                Some(CheckpointPromotionReason::FailedExecution) | None => false,
+            }
+        })
+        .map(|group| {
+            let result = coalesced_checkpoint_result(&group);
+            let promotion_reason = group
+                .promotion_reason
+                .unwrap_or(CheckpointPromotionReason::FailedExecution);
+            crate::CheckpointAttempt {
+                action: group.action,
+                result,
+                succeeded: group.final_succeeded,
+                fingerprint: group.fingerprint,
+                canonical_key: Some(group.canonical_key),
+                promotion_reason: Some(promotion_reason.as_str().to_owned()),
+            }
+        })
+        .collect()
+}
+
+fn merge_checkpoint_promotion_reason(
+    current: Option<CheckpointPromotionReason>,
+    next: Option<CheckpointPromotionReason>,
+) -> Option<CheckpointPromotionReason> {
+    use CheckpointPromotionReason::{ExplicitSalience, FailedExecution, Verification};
+    match (current, next) {
+        (Some(Verification), _) | (_, Some(Verification)) => Some(Verification),
+        (Some(ExplicitSalience), _) | (_, Some(ExplicitSalience)) => Some(ExplicitSalience),
+        (Some(FailedExecution), _) | (_, Some(FailedExecution)) => Some(FailedExecution),
+        (None, None) => None,
+    }
+}
+
+fn checkpoint_group_priority(group: &CheckpointAttemptGroup) -> u8 {
+    if !group.final_succeeded {
+        0
+    } else if group.first_failure.is_some() {
+        1
+    } else if group.promotion_reason == Some(CheckpointPromotionReason::Verification) {
+        2
+    } else {
+        3
+    }
+}
+
+fn coalesced_checkpoint_result(group: &CheckpointAttemptGroup) -> String {
+    if group.observations == 1 {
+        return group.final_result.clone();
+    }
+    match group.first_failure.as_deref() {
+        Some(first_failure) if group.final_succeeded => format!(
+            "First failure: {first_failure}\nFinal result: {}\nObserved runs: {}",
+            group.final_result, group.observations
+        ),
+        Some(first_failure) if first_failure != group.final_result => format!(
+            "First failure: {first_failure}\nLatest failure: {}\nObserved runs: {}",
+            group.final_result, group.observations
+        ),
+        _ => format!(
+            "{}\nObserved equivalent runs: {}",
+            group.final_result, group.observations
+        ),
+    }
+}
+
+fn checkpoint_attempt_canonical_key(identity: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"super-mem:checkpoint-attempt-key:v3\0");
+    let normalized = identity.split_whitespace().collect::<Vec<_>>().join(" ");
+    hasher.update(&(normalized.len() as u64).to_le_bytes());
+    hasher.update(normalized.as_bytes());
+    format!("auto:attempt:v3:{}", hasher.finalize().to_hex())
+}
+
+fn checkpoint_attempt_group_identity(event: &SessionEvent, fingerprint: Option<&str>) -> String {
+    if let Some(command) = event
+        .attributes
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.trim().is_empty())
+    {
+        return format!("command:{command}");
+    }
+    if !event_succeeded(event)
+        && let Some(fingerprint) = fingerprint
+    {
+        return format!("diagnostic:{fingerprint}");
+    }
+    // Some adapters can mark a result as verification but cannot pass the
+    // command without exposing it in argv. Their tool name alone (often just
+    // `Bash`) is not a safe grouping key: unrelated tests would collapse.
+    // Preserve those events independently until the adapter has a structured
+    // stdin event envelope.
+    format!("event:{}", event.event_id)
 }
 
 fn session_evidence_relation(event: &SessionEvent) -> &'static str {
@@ -2830,10 +3330,27 @@ fn upsert_memory(
             b"artifact",
             artifact.language.as_deref().unwrap_or(""),
         );
+        let path = normalize_artifact_path(&artifact.path);
+        let symbol = artifact.symbol.as_deref().unwrap_or("");
         let artifact_id: i64 = transaction.query_row(
             "INSERT INTO artifacts(namespace,repo_id,path,symbol,content_hash,git_oid,language) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(namespace,repo_id,path,symbol,content_hash,git_oid) DO UPDATE SET artifact_id=artifacts.artifact_id RETURNING artifact_id",
-            params![storage_namespace, artifact.repo_id, normalize_artifact_path(&artifact.path), artifact.symbol.as_deref().unwrap_or(""), artifact.content_hash.as_deref().unwrap_or(""), artifact.git_oid.as_deref().unwrap_or(""), artifact.language.as_deref().unwrap_or("")],
+            params![storage_namespace, artifact.repo_id, path, symbol, artifact.content_hash.as_deref().unwrap_or(""), artifact.git_oid.as_deref().unwrap_or(""), artifact.language.as_deref().unwrap_or("")],
             |row| row.get(0),
+        )?;
+        let digests = artifact.content_hash.as_deref().map(|content_hash| {
+            artifact_fingerprint(
+                &artifact.repo_id,
+                &path,
+                (!symbol.is_empty()).then_some(symbol),
+                content_hash,
+            )
+            .digests()
+        });
+        let identity = digests.as_ref().map(|(identity, _)| &identity[..]);
+        let content = digests.as_ref().map(|(_, content)| &content[..]);
+        transaction.execute(
+            "INSERT INTO artifact_fingerprints(artifact_id,identity,content) VALUES(?1,?2,?3) ON CONFLICT(artifact_id) DO UPDATE SET identity=excluded.identity,content=excluded.content",
+            params![artifact_id, identity, content],
         )?;
         transaction.execute(
             "INSERT OR IGNORE INTO memory_artifacts(memory_id,revision,artifact_id) VALUES(?1,?2,?3)",
@@ -2932,7 +3449,6 @@ fn rebuild_fts(
         &request.entities,
         &request.artifacts,
     );
-    let expansions = load_search_expansions(transaction, memory_id, revision)?;
     transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
     transaction.execute(
         "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -2958,7 +3474,7 @@ fn rebuild_fts(
                 .collect::<Vec<_>>()
                 .join(" "),
             aliases,
-            expansions,
+            "",
         ],
     )?;
     transaction.execute(
@@ -2968,44 +3484,49 @@ fn rebuild_fts(
     Ok(())
 }
 
-fn load_search_expansions(
-    connection: &Connection,
-    memory_id: MemoryId,
-    revision: u32,
-) -> Result<String> {
-    let mut statement = connection.prepare_cached(
-        "SELECT expansion FROM search_projections WHERE memory_id=?1 AND revision=?2 AND expansion!='' ORDER BY profile_id",
-    )?;
-    let expansions = statement.query_map(params![memory_id.to_string(), revision], |row| {
-        row.get::<_, String>(0)
-    })?;
-    let mut combined = String::new();
-    for expansion in expansions {
-        let expansion = expansion?;
-        let separator = usize::from(!combined.is_empty());
-        let Some(available) =
-            MAX_FTS_EXPANSION_BYTES.checked_sub(combined.len().saturating_add(separator))
-        else {
-            break;
-        };
-        if available == 0 {
-            break;
-        }
-        if separator != 0 {
-            combined.push(' ');
-        }
-        if expansion.len() <= available {
-            combined.push_str(&expansion);
-            continue;
-        }
-        let mut end = available;
-        while end > 0 && !expansion.is_char_boundary(end) {
-            end -= 1;
-        }
-        combined.push_str(&expansion[..end]);
-        break;
+struct SearchProfileStorage {
+    profile_id: String,
+    model_digest: String,
+    dimensions: Option<i64>,
+    signature_version: i64,
+    active: bool,
+    created_at_ms: i64,
+}
+
+fn search_profile_storage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchProfileStorage> {
+    Ok(SearchProfileStorage {
+        profile_id: row.get(0)?,
+        model_digest: row.get(1)?,
+        dimensions: row.get(2)?,
+        signature_version: row.get(3)?,
+        active: row.get(4)?,
+        created_at_ms: row.get(5)?,
+    })
+}
+
+fn search_profile_from_storage(row: SearchProfileStorage) -> Result<SearchProfile> {
+    let dimensions = row
+        .dimensions
+        .map(|dimensions| {
+            usize::try_from(dimensions)
+                .map_err(|_| Error::Migration("invalid search profile dimension".into()))
+        })
+        .transpose()?;
+    let signature_version = u32::try_from(row.signature_version)
+        .map_err(|_| Error::Migration("invalid search signature version".into()))?;
+    if signature_version != VECTOR_SIGNATURE_VERSION {
+        return Err(Error::Migration(format!(
+            "unsupported search signature version {signature_version}"
+        )));
     }
-    Ok(combined)
+    Ok(SearchProfile {
+        profile_id: row.profile_id,
+        model_digest: row.model_digest,
+        dimensions,
+        signature_version,
+        active: row.active,
+        created_at: from_ms(row.created_at_ms)?,
+    })
 }
 
 fn load_search_profile_optional(
@@ -3014,44 +3535,12 @@ fn load_search_profile_optional(
 ) -> Result<Option<SearchProfile>> {
     let row = connection
         .query_row(
-            "SELECT profile_id,model_digest,dimensions,signature_version,created_at_ms FROM search_profiles WHERE profile_id=?1",
+            "SELECT p.profile_id,p.model_digest,p.dimensions,p.signature_version,s.active,p.created_at_ms FROM search_profiles p JOIN search_profile_state s ON s.profile_id=p.profile_id WHERE p.profile_id=?1",
             [profile_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<i64>>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
+            search_profile_storage_row,
         )
         .optional()?;
-    row.map(
-        |(profile_id, model_digest, dimensions, signature_version, created_at_ms)| {
-            let dimensions = dimensions
-                .map(|dimensions| {
-                    usize::try_from(dimensions)
-                        .map_err(|_| Error::Migration("invalid search profile dimension".into()))
-                })
-                .transpose()?;
-            let signature_version = u32::try_from(signature_version)
-                .map_err(|_| Error::Migration("invalid search signature version".into()))?;
-            if signature_version != VECTOR_SIGNATURE_VERSION {
-                return Err(Error::Migration(format!(
-                    "unsupported search signature version {signature_version}"
-                )));
-            }
-            Ok(SearchProfile {
-                profile_id,
-                model_digest,
-                dimensions,
-                signature_version,
-                created_at: from_ms(created_at_ms)?,
-            })
-        },
-    )
-    .transpose()
+    row.map(search_profile_from_storage).transpose()
 }
 
 fn load_search_profile(connection: &Connection, profile_id: &str) -> Result<SearchProfile> {
@@ -3073,7 +3562,6 @@ fn rebuild_fts_from_memory(
         &memory.entities,
         &memory.artifacts,
     );
-    let expansions = load_search_expansions(transaction, memory.memory_id, memory.revision)?;
     transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
     transaction.execute(
         "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -3099,7 +3587,7 @@ fn rebuild_fts_from_memory(
                 .collect::<Vec<_>>()
                 .join(" "),
             aliases,
-            expansions,
+            "",
         ],
     )?;
     transaction.execute(
@@ -3358,30 +3846,7 @@ fn load_memory_revision(
         .query_row(
             "SELECT r.memory_id,r.revision,m.kind,m.state,m.canonical_key,m.importance,m.confidence,m.trust,m.valid_from_ms,m.valid_until_ms,m.expires_at_ms,h.created_at_ms,r.recorded_at_ms,r.title,r.body,r.attributes_json,r.scope_json,m.metadata_complete FROM memory_revisions r JOIN memory_revision_metadata m ON m.memory_id=r.memory_id AND m.revision=r.revision JOIN memory_heads h ON h.memory_id=r.memory_id WHERE r.memory_id=?1 AND r.revision=?2",
             params![memory_id.to_string(), revision],
-            |row| {
-                Ok((
-                    RawMemoryRow {
-                        memory_id: row.get(0)?,
-                        revision: row.get(1)?,
-                        kind: row.get(2)?,
-                        state: row.get(3)?,
-                        canonical_key: row.get(4)?,
-                        importance: row.get(5)?,
-                        confidence: row.get(6)?,
-                        trust: row.get(7)?,
-                        valid_from: row.get(8)?,
-                        valid_until: row.get(9)?,
-                        expires: row.get(10)?,
-                        created: row.get(11)?,
-                        updated: row.get(12)?,
-                        title: row.get(13)?,
-                        body: row.get(14)?,
-                        attributes_json: row.get(15)?,
-                        scope_json: row.get(16)?,
-                    },
-                    row.get::<_, bool>(17)?,
-                ))
-            },
+            memory_revision_row,
         )
         .optional()?
         .ok_or_else(|| Error::NotFound {
@@ -3455,6 +3920,210 @@ fn load_memory_revision(
         memory,
         metadata_complete,
     })
+}
+
+fn memory_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RawMemoryRow, bool)> {
+    Ok((
+        RawMemoryRow {
+            memory_id: row.get(0)?,
+            revision: row.get(1)?,
+            kind: row.get(2)?,
+            state: row.get(3)?,
+            canonical_key: row.get(4)?,
+            importance: row.get(5)?,
+            confidence: row.get(6)?,
+            trust: row.get(7)?,
+            valid_from: row.get(8)?,
+            valid_until: row.get(9)?,
+            expires: row.get(10)?,
+            created: row.get(11)?,
+            updated: row.get(12)?,
+            title: row.get(13)?,
+            body: row.get(14)?,
+            attributes_json: row.get(15)?,
+            scope_json: row.get(16)?,
+        },
+        row.get::<_, bool>(17)?,
+    ))
+}
+
+fn load_memory_revisions_bounded(
+    connection: &Connection,
+    revisions: &[(MemoryId, u32)],
+    maximum_body_chars: usize,
+) -> Result<HashMap<MemoryId, Memory>> {
+    if revisions.is_empty() {
+        return Ok(HashMap::new());
+    }
+    // The result is keyed by logical memory ID. Normalize exact duplicate
+    // requests and reject ambiguous requests for two revisions of the same
+    // memory instead of relying on a length mismatch that can panic.
+    let mut requested_revisions = BTreeMap::<MemoryId, u32>::new();
+    for &(memory_id, revision) in revisions {
+        if let Some(previous) = requested_revisions.insert(memory_id, revision)
+            && previous != revision
+        {
+            return Err(Error::InvalidInput(format!(
+                "cannot hydrate multiple revisions of memory {memory_id} in one batch"
+            )));
+        }
+    }
+    let revisions = requested_revisions.into_iter().collect::<Vec<_>>();
+    let maximum_body_chars = i64::try_from(maximum_body_chars)
+        .map_err(|_| Error::InvalidInput("body hydration limit is too large".into()))?;
+    let requested_values = std::iter::repeat_n("(?,?)", revisions.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let requested_cte =
+        format!("WITH requested(memory_id,revision) AS (VALUES {requested_values})");
+    let revision_params = || {
+        revisions.iter().flat_map(|(memory_id, revision)| {
+            [
+                SqlValue::Text(memory_id.to_string()),
+                SqlValue::Integer(i64::from(*revision)),
+            ]
+        })
+    };
+    let mut memories = HashMap::with_capacity(revisions.len());
+    {
+        let sql = format!(
+            "{requested_cte} SELECT r.memory_id,r.revision,m.kind,m.state,m.canonical_key,m.importance,m.confidence,m.trust,m.valid_from_ms,m.valid_until_ms,m.expires_at_ms,h.created_at_ms,r.recorded_at_ms,r.title,substr(r.body,1,{maximum_body_chars}),r.attributes_json,r.scope_json FROM requested q JOIN memory_revisions r ON r.memory_id=q.memory_id AND r.revision=q.revision JOIN memory_revision_metadata m ON m.memory_id=r.memory_id AND m.revision=r.revision JOIN memory_heads h ON h.memory_id=r.memory_id ORDER BY r.memory_id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok(RawMemoryRow {
+                    memory_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: row.get(3)?,
+                    canonical_key: row.get(4)?,
+                    importance: row.get(5)?,
+                    confidence: row.get(6)?,
+                    trust: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    expires: row.get(10)?,
+                    created: row.get(11)?,
+                    updated: row.get(12)?,
+                    title: row.get(13)?,
+                    body: row.get(14)?,
+                    attributes_json: row.get(15)?,
+                    scope_json: row.get(16)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in rows {
+            let (memory_id, memory) = memory_from_raw(row)?;
+            memories.insert(memory_id, memory);
+        }
+    }
+    if memories.len() != revisions.len() {
+        let missing = revisions
+            .iter()
+            .find(|(memory_id, revision)| {
+                memories
+                    .get(memory_id)
+                    .is_none_or(|memory| memory.revision != *revision)
+            })
+            .ok_or_else(|| {
+                Error::Migration("bounded revision hydration returned an inconsistent batch".into())
+            })?;
+        return Err(Error::NotFound {
+            kind: "memory revision",
+            id: format!("{}@{}", missing.0, missing.1),
+        });
+    }
+
+    {
+        let sql = format!(
+            "{requested_cte} SELECT t.memory_id,t.tag FROM requested q JOIN memory_tags t ON t.memory_id=q.memory_id AND t.revision=q.revision ORDER BY t.memory_id,t.normalized"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, tag) in rows {
+            memory_mut(&mut memories, &id)?.tags.push(tag);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT me.memory_id,e.kind,e.canonical,e.display FROM requested q JOIN memory_entities me ON me.memory_id=q.memory_id AND me.revision=q.revision JOIN entities e ON e.entity_id=me.entity_id ORDER BY me.memory_id,e.kind,e.canonical"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    EntityRef {
+                        kind: row.get(1)?,
+                        canonical: row.get(2)?,
+                        display: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, entity) in rows {
+            memory_mut(&mut memories, &id)?.entities.push(entity);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language FROM requested q JOIN memory_artifacts ma ON ma.memory_id=q.memory_id AND ma.revision=q.revision JOIN artifacts a ON a.artifact_id=ma.artifact_id ORDER BY ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language,a.artifact_id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                let symbol: String = row.get(3)?;
+                let content_hash: String = row.get(4)?;
+                let git_oid: String = row.get(5)?;
+                let language: String = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ArtifactRef {
+                        repo_id: row.get(1)?,
+                        path: row.get(2)?,
+                        symbol: (!symbol.is_empty()).then_some(symbol),
+                        content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                        git_oid: (!git_oid.is_empty()).then_some(git_oid),
+                        language: (!language.is_empty()).then_some(language),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, artifact) in rows {
+            memory_mut(&mut memories, &id)?.artifacts.push(artifact);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT me.memory_id,me.event_id,me.span_start,me.span_end,me.relation FROM requested q JOIN memory_evidence me ON me.memory_id=q.memory_id AND me.revision=q.revision ORDER BY me.memory_id,me.event_id,me.relation,me.span_start,me.span_end"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, event_id, span_start, span_end, relation) in rows {
+            memory_mut(&mut memories, &id)?.evidence.push(EvidenceRef {
+                event_id: parse_event_id(&event_id)?,
+                span_start: span_start.map(|value| value as usize),
+                span_end: span_end.map(|value| value as usize),
+                relation,
+            });
+        }
+    }
+    Ok(memories)
 }
 
 fn load_events(connection: &Connection, event_ids: &[EventId]) -> Result<Vec<Event>> {
@@ -3599,6 +4268,205 @@ fn load_memory_feedback(
             },
         )
         .collect()
+}
+
+#[derive(Debug)]
+struct StagedCandidateMemory {
+    memory: Memory,
+    applicability_artifacts: ArtifactFingerprintSet,
+}
+
+fn load_candidate_memories(
+    connection: &Connection,
+    memory_ids: &[MemoryId],
+) -> Result<HashMap<MemoryId, StagedCandidateMemory>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = sql_placeholders(memory_ids.len());
+    let id_params = || memory_ids.iter().map(ToString::to_string);
+    let mut memories = HashMap::with_capacity(memory_ids.len());
+    {
+        // SQLite substr counts Unicode scalar characters for TEXT values. The
+        // preview therefore has the same cross-platform bound for ASCII and
+        // non-ASCII memories without first transferring the complete body.
+        let sql = format!(
+            "SELECT h.memory_id,h.head_revision,h.kind,h.state,h.canonical_key,h.importance,h.confidence,h.trust,h.valid_from_ms,h.valid_until_ms,h.expires_at_ms,h.created_at_ms,h.updated_at_ms,r.title,substr(r.body,1,{MMR_BODY_PREVIEW_CHARS}),r.scope_json FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                Ok(RawMemoryRow {
+                    memory_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: row.get(3)?,
+                    canonical_key: row.get(4)?,
+                    importance: row.get(5)?,
+                    confidence: row.get(6)?,
+                    trust: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    expires: row.get(10)?,
+                    created: row.get(11)?,
+                    updated: row.get(12)?,
+                    title: row.get(13)?,
+                    body: row.get(14)?,
+                    // Attributes do not participate in applicability,
+                    // scoring, or MMR and are hydrated only for winners.
+                    attributes_json: "{}".to_owned(),
+                    scope_json: row.get(15)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in rows {
+            let (memory_id, memory) = memory_from_raw(row)?;
+            memories.insert(memory_id, memory);
+        }
+    }
+    if memories.len() != memory_ids.len() {
+        let missing = memory_ids
+            .iter()
+            .find(|id| !memories.contains_key(id))
+            .expect("different lengths imply a missing memory");
+        return Err(Error::NotFound {
+            kind: "memory",
+            id: missing.to_string(),
+        });
+    }
+
+    let mut staged = memories
+        .into_iter()
+        .map(|(memory_id, memory)| {
+            (
+                memory_id,
+                StagedCandidateMemory {
+                    memory,
+                    applicability_artifacts: ArtifactFingerprintSet {
+                        fingerprints: Vec::new(),
+                        complete: true,
+                    },
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+    // Applicability and artifact verification use only attachments belonging
+    // to the head revision pinned by this read snapshot. Stream each row into
+    // a fixed-width derived fingerprint. Unhashed artifacts have no derived
+    // row and cannot establish freshness; paths, symbols, Git OIDs, and
+    // language labels stay out of broad candidate staging entirely.
+    let requested_values = std::iter::repeat_n("(?)", memory_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH requested(memory_id) AS (VALUES {requested_values}) SELECT ma.memory_id,a.content_hash!='',f.artifact_id,f.identity,f.content FROM requested q CROSS JOIN memory_heads h ON h.memory_id=q.memory_id CROSS JOIN memory_artifacts ma ON ma.memory_id=h.memory_id AND ma.revision=h.head_revision CROSS JOIN artifacts a ON a.artifact_id=ma.artifact_id LEFT JOIN artifact_fingerprints f ON f.artifact_id=ma.artifact_id ORDER BY ma.memory_id,ma.artifact_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let mut rows = statement.query(params_from_iter(id_params()))?;
+    while let Some(row) = rows.next()? {
+        let memory_id = parse_memory_id(borrowed_sqlite_text(row, 0)?)?;
+        let candidate = staged.get_mut(&memory_id).ok_or_else(|| {
+            Error::Migration("memory attachment references a missing head".into())
+        })?;
+        let expected_verifiable = row.get::<_, bool>(1)?;
+        let projected_artifact_id = row.get::<_, Option<i64>>(2)?;
+        let identity = borrowed_sqlite_optional_blob(row, 3)?;
+        let content = borrowed_sqlite_optional_blob(row, 4)?;
+        let (identity, content) = match (
+            expected_verifiable,
+            projected_artifact_id,
+            identity,
+            content,
+        ) {
+            (true, Some(_), Some(identity), Some(content)) => (identity, content),
+            (true, _, None, None) | (true, None, _, _) => {
+                candidate.applicability_artifacts.complete = false;
+                continue;
+            }
+            (false, _, None, None) | (false, None, _, _) => continue,
+            _ => {
+                return Err(Error::Migration(
+                    "artifact fingerprint projection disagrees with canonical verifiability".into(),
+                ));
+            }
+        };
+        if candidate.applicability_artifacts.fingerprints.len() == MAX_STAGED_ARTIFACT_FINGERPRINTS
+        {
+            candidate.applicability_artifacts.complete = false;
+            continue;
+        }
+        let fingerprint =
+            ArtifactFingerprint::from_digests(identity, content).ok_or_else(|| {
+                Error::Migration(
+                    "artifact fingerprint projection contains a non-32-byte digest".into(),
+                )
+            })?;
+        candidate
+            .applicability_artifacts
+            .fingerprints
+            .push(fingerprint);
+    }
+    Ok(staged)
+}
+
+fn borrowed_sqlite_text<'row>(row: &'row Row<'_>, index: usize) -> rusqlite::Result<&'row str> {
+    row.get_ref(index)?.as_str().map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(index, SqlType::Text, Box::new(error))
+    })
+}
+
+fn borrowed_sqlite_optional_blob<'row>(
+    row: &'row Row<'_>,
+    index: usize,
+) -> rusqlite::Result<Option<&'row [u8]>> {
+    match row.get_ref(index)? {
+        ValueRef::Null => Ok(None),
+        value => value.as_blob().map(Some).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, SqlType::Blob, Box::new(error))
+        }),
+    }
+}
+
+fn load_materialization_artifacts(
+    connection: &Connection,
+    ordered_memory_ids: &[MemoryId],
+    repo_id: &str,
+    limit: usize,
+) -> Result<Vec<ArtifactRef>> {
+    let limit = limit.min(MAX_COLLECTION_ITEMS);
+    if ordered_memory_ids.is_empty() || limit == 0 {
+        return Ok(Vec::new());
+    }
+    let requested_values = ordered_memory_ids
+        .iter()
+        .enumerate()
+        .map(|(priority, _)| format!("(?,{priority})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "WITH requested(memory_id,priority) AS (VALUES {requested_values}), candidate_identities(memory_id,priority,identity,artifact_id) AS MATERIALIZED (SELECT q.memory_id,q.priority,f.identity,min(ma.artifact_id) FROM requested q CROSS JOIN memory_heads h ON h.memory_id=q.memory_id CROSS JOIN memory_artifacts ma ON ma.memory_id=h.memory_id AND ma.revision=h.head_revision CROSS JOIN artifacts a ON a.artifact_id=ma.artifact_id CROSS JOIN artifact_fingerprints f ON f.artifact_id=a.artifact_id WHERE a.repo_id=? AND f.identity IS NOT NULL GROUP BY q.memory_id,q.priority,f.identity), ranked(memory_id,priority,identity,artifact_id,candidate_rank) AS MATERIALIZED (SELECT memory_id,priority,identity,artifact_id,row_number() OVER (PARTITION BY memory_id ORDER BY identity,artifact_id) FROM candidate_identities), deduplicated(memory_id,priority,identity,artifact_id,candidate_rank,identity_rank) AS MATERIALIZED (SELECT memory_id,priority,identity,artifact_id,candidate_rank,row_number() OVER (PARTITION BY identity ORDER BY candidate_rank,priority,memory_id,artifact_id) FROM ranked), bounded(identity,artifact_id,priority,candidate_rank) AS MATERIALIZED (SELECT identity,artifact_id,priority,candidate_rank FROM deduplicated WHERE identity_rank=1 ORDER BY candidate_rank,priority,identity LIMIT {limit}) SELECT a.repo_id,a.path,a.symbol,a.content_hash FROM bounded b JOIN artifacts a ON a.artifact_id=b.artifact_id ORDER BY b.candidate_rank,b.priority,b.identity"
+    );
+    let parameters = ordered_memory_ids
+        .iter()
+        .map(ToString::to_string)
+        .chain(std::iter::once(repo_id.to_owned()));
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(parameters), |row| {
+            let symbol: String = row.get(2)?;
+            let content_hash: String = row.get(3)?;
+            Ok(ArtifactRef {
+                repo_id: row.get(0)?,
+                path: row.get(1)?,
+                symbol: (!symbol.is_empty()).then_some(symbol),
+                content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                git_oid: None,
+                language: None,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 fn load_memories(
@@ -3868,14 +4736,7 @@ fn collect_fts(
         RetrievalSignal::CodeAlias,
         candidates,
     )?;
-    collect_fts_channel(
-        connection,
-        request,
-        eligibility,
-        &format!("expansions : ({loose})"),
-        RetrievalSignal::SemanticExpansion,
-        candidates,
-    )
+    collect_expansion_fts(connection, request, eligibility, &loose, candidates)
 }
 
 fn collect_fts_channel(
@@ -3905,6 +4766,32 @@ fn collect_fts_channel(
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     add_candidates(candidates, ids, signal)
+}
+
+fn collect_expansion_fts(
+    connection: &Connection,
+    request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    query: &str,
+    candidates: &mut HashMap<MemoryId, Candidate>,
+) -> Result<()> {
+    let mut statement = connection.prepare_cached(EXPANSION_FTS_CANDIDATE_SQL)?;
+    let ids = statement
+        .query_map(
+            named_params! {
+                ":namespace": request.scope.namespace,
+                ":workspace": request.scope.workspace_id,
+                ":repo": request.scope.repo_id(),
+                ":query": query,
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
+            },
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    add_candidates(candidates, ids, RetrievalSignal::SemanticExpansion)
 }
 
 fn collect_sparse(
@@ -4058,6 +4945,12 @@ fn collect_dense_with_exact_limit(
         ));
     }
     let profile = load_search_profile(connection, &query.profile_id)?;
+    if !profile.active {
+        return Err(Error::InvalidInput(format!(
+            "search profile {} is inactive",
+            profile.profile_id
+        )));
+    }
     let dimensions = profile.dimensions.ok_or_else(|| {
         Error::InvalidInput(format!(
             "search profile {} is expansion-only and cannot score a dense query",
@@ -4245,6 +5138,25 @@ fn prune_candidates(candidates: &mut HashMap<MemoryId, Candidate>, maximum: usiz
     candidates.extend(ordered);
 }
 
+fn bound_mmr_pool(hits: &mut Vec<RecallHit>, limit: usize) {
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+    });
+    let maximum = mmr_pool_limit(limit);
+    // Deliberate deterministic tail tradeoff: candidates below the stable
+    // score/ID cutoff cannot affect diversity selection. The pool still keeps
+    // at least 4x the requested results and 256 candidates, while bounding
+    // token-set construction and incremental MMR work for broad recalls.
+    hits.truncate(maximum);
+}
+
+fn mmr_pool_limit(limit: usize) -> usize {
+    limit.saturating_mul(4).clamp(MMR_MIN_POOL, MMR_MAX_POOL)
+}
+
 fn cached_git_relation<F>(
     root: &str,
     stored: &str,
@@ -4320,22 +5232,6 @@ fn feedback_score(positive: i64, negative: i64) -> f64 {
     let negative = negative.max(0) as f64;
     let posterior = (positive + 1.0) / (positive + negative + 2.0);
     (posterior - 0.5) * 0.20
-}
-
-fn artifact_verified(memory: &[ArtifactRef], current: &[ArtifactRef]) -> bool {
-    let verifiable = memory
-        .iter()
-        .filter(|artifact| artifact.content_hash.is_some())
-        .collect::<Vec<_>>();
-    !verifiable.is_empty()
-        && verifiable.iter().all(|old| {
-            current.iter().any(|now| {
-                old.repo_id == now.repo_id
-                    && old.path == now.path
-                    && old.symbol == now.symbol
-                    && old.content_hash == now.content_hash
-            })
-        })
 }
 
 fn merge_artifact_hints(current: &mut Vec<ArtifactRef>, inferred: Vec<ArtifactRef>) {
@@ -4814,6 +5710,10 @@ fn json_to_sql(value: &Value) -> Result<SqlValue> {
 }
 
 fn rebuild_all_fts(transaction: &Transaction<'_>) -> Result<()> {
+    // Artifact fingerprints are derived just like FTS and aliases. Rebuild
+    // them here so full search repair and canonical snapshot restore cannot
+    // leave bounded staging or materialization with an incomplete projection.
+    rebuild_artifact_fingerprints(transaction)?;
     transaction.execute("DELETE FROM memory_fts", [])?;
     transaction.execute("DELETE FROM search_alias_state", [])?;
     let heads = transaction
@@ -4838,7 +5738,45 @@ fn rebuild_all_fts(transaction: &Transaction<'_>) -> Result<()> {
             rebuild_fts_from_memory(transaction, *docid, memory)?;
         }
     }
+    rebuild_expansion_fts(transaction)?;
     Ok(())
+}
+
+fn rebuild_expansion_fts(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM search_expansion_fts", [])?;
+    connection.execute(
+        "INSERT INTO search_expansion_fts(rowid,expansion) SELECT rowid,expansion FROM search_projections WHERE expansion!='' ORDER BY profile_id,memory_id",
+        [],
+    )?;
+    Ok(())
+}
+
+fn repair_incomplete_fts(transaction: &Transaction<'_>) -> Result<()> {
+    loop {
+        let heads = transaction
+            .prepare_cached(
+                "SELECT h.memory_id,h.docid FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL ORDER BY h.memory_id LIMIT 256",
+            )?
+            .query_map([CODE_ALIAS_VERSION], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if heads.is_empty() {
+            return Ok(());
+        }
+        let ids = heads
+            .iter()
+            .map(|(memory_id, _)| parse_memory_id(memory_id))
+            .collect::<Result<Vec<_>>>()?;
+        let memories = load_memories(transaction, &ids)?;
+        for ((_, docid), memory_id) in heads.iter().zip(ids) {
+            let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
+                kind: "memory",
+                id: memory_id.to_string(),
+            })?;
+            rebuild_fts_from_memory(transaction, *docid, memory)?;
+        }
+    }
 }
 
 fn ensure_search_indexes(connection: &mut Connection) -> Result<()> {
@@ -4851,7 +5789,7 @@ fn ensure_search_indexes(connection: &mut Connection) -> Result<()> {
     let still_incomplete: bool =
         transaction.query_row(ALIAS_INCOMPLETE_SQL, [CODE_ALIAS_VERSION], |row| row.get(0))?;
     if still_incomplete {
-        rebuild_all_fts(&transaction)?;
+        repair_incomplete_fts(&transaction)?;
     }
     transaction.commit()?;
     Ok(())
@@ -5119,6 +6057,657 @@ mod tests {
         assert_eq!(pack.hits.len(), 1);
         assert!(pack.estimated_tokens <= 80);
         assert!(pack.rendered.contains("cargo clean"));
+    }
+
+    #[test]
+    fn candidate_staging_bounds_unicode_previews_and_omits_heavy_attachments() {
+        let engine = engine();
+        let mut request = remember_request(
+            "Bounded candidate",
+            &format!("{}TAIL", "λ".repeat(MMR_BODY_PREVIEW_CHARS + 64)),
+        );
+        request.scope = repo_scope("staging", "session");
+        request
+            .attributes
+            .insert("payload".into(), json!([1, 2, 3]));
+        request.tags = vec!["bounded".into()];
+        request.entities = vec![EntityRef {
+            kind: "symbol".into(),
+            canonical: "bounded::candidate".into(),
+            display: "BoundedCandidate".into(),
+        }];
+        request.artifacts = vec![ArtifactRef {
+            repo_id: "staging".into(),
+            path: "src/lib.rs".into(),
+            symbol: Some("bounded_candidate".into()),
+            content_hash: Some("a".repeat(64)),
+            language: Some("rust".into()),
+            ..ArtifactRef::default()
+        }];
+        let memory_id = engine.remember(request).unwrap().memory_ids[0];
+
+        let connection = engine.lock().unwrap();
+        let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+        let staged = staged.get(&memory_id).unwrap();
+        assert_eq!(staged.memory.body.chars().count(), MMR_BODY_PREVIEW_CHARS);
+        assert!(!staged.memory.body.contains("TAIL"));
+        assert!(staged.memory.attributes.is_empty());
+        assert!(staged.memory.tags.is_empty());
+        assert!(staged.memory.entities.is_empty());
+        assert!(staged.memory.evidence.is_empty());
+        assert!(staged.memory.artifacts.is_empty());
+        assert_eq!(staged.applicability_artifacts.fingerprints.len(), 1);
+        assert!(staged.applicability_artifacts.complete);
+        drop(connection);
+
+        let pack = engine
+            .recall(RecallRequest {
+                scope: repo_scope("staging", "recall-session"),
+                query: "bounded candidate".into(),
+                hints: crate::ContextHints {
+                    artifacts: vec![ArtifactRef {
+                        repo_id: "staging".into(),
+                        path: "src/lib.rs".into(),
+                        symbol: Some("bounded_candidate".into()),
+                        content_hash: Some("a".repeat(64)),
+                        language: Some("rust".into()),
+                        ..ArtifactRef::default()
+                    }],
+                    ..crate::ContextHints::default()
+                },
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert_eq!(pack.hits[0].memory.artifacts[0].path, "src/lib.rs");
+        assert_eq!(
+            pack.hits[0].memory.artifacts[0].language.as_deref(),
+            Some("rust")
+        );
+    }
+
+    #[test]
+    fn candidate_artifact_staging_is_fixed_width_and_marks_overflow_incomplete() {
+        let engine = engine();
+        let artifacts = (0..MAX_STAGED_ARTIFACT_FINGERPRINTS)
+            .map(|index| ArtifactRef {
+                repo_id: "artifact-bounds".into(),
+                path: format!("src/{index:04}-{}.rs", "p".repeat(4_070)),
+                symbol: Some(format!("symbol_{index:04}_{}", "s".repeat(490))),
+                content_hash: Some(format!("hash-{index:04}-{}", "h".repeat(230))),
+                ..ArtifactRef::default()
+            })
+            .collect::<Vec<_>>();
+        let mut request = remember_request("Artifact bounds", "fixed width staging");
+        request.scope = repo_scope("artifact-bounds", "write-session");
+        request.artifacts = artifacts.clone();
+        let memory_id = engine.remember(request).unwrap().memory_ids[0];
+
+        let connection = engine.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO artifacts(namespace,repo_id,path,symbol,content_hash,git_oid,language) VALUES('overflow','artifact-bounds',?1,'overflow','overflow-hash','','')",
+                [format!("zz-{}.rs", "z".repeat(4_080))],
+            )
+            .unwrap();
+        let overflow_id = connection.last_insert_rowid();
+        connection
+            .execute(
+                "INSERT INTO memory_artifacts(memory_id,revision,artifact_id) VALUES(?1,1,?2)",
+                params![memory_id.to_string(), overflow_id],
+            )
+            .unwrap();
+        rebuild_artifact_fingerprints(&connection).unwrap();
+
+        let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+        let staged = &staged[&memory_id];
+        assert_eq!(
+            staged.applicability_artifacts.fingerprints.len(),
+            MAX_STAGED_ARTIFACT_FINGERPRINTS
+        );
+        assert!(!staged.applicability_artifacts.complete);
+        assert!(staged.memory.artifacts.is_empty());
+        assert_eq!(
+            staged.applicability_artifacts.fingerprints.len()
+                * std::mem::size_of::<crate::applicability::ArtifactFingerprint>(),
+            MAX_STAGED_ARTIFACT_FINGERPRINTS * 64
+        );
+        // Even at the 1,024-candidate oversampling cap, retained artifact
+        // material is bounded to eight MiB plus Vec headers.
+        assert_eq!(
+            1_024 * MAX_STAGED_ARTIFACT_FINGERPRINTS * 64,
+            8 * 1_024 * 1_024
+        );
+
+        let mut current_scope = staged.memory.scope.clone();
+        current_scope.repository.as_mut().unwrap().dirty_hash = Some("changed".into());
+        let current = fingerprint_artifacts(&artifacts);
+        assert!(
+            !staged
+                .applicability_artifacts
+                .is_fully_verified_by(&current)
+        );
+        assert_eq!(
+            classify_applicability_fingerprints_with_relation(
+                &staged.memory.scope,
+                &current_scope,
+                &staged.applicability_artifacts,
+                &current,
+                |_, _, _| GitRelation::Same,
+            ),
+            Applicability::Stale
+        );
+    }
+
+    #[test]
+    fn missing_artifact_fingerprint_projection_cannot_prove_exactness() {
+        let engine = engine();
+        let first_artifact = ArtifactRef {
+            repo_id: "projection-gap".into(),
+            path: "src/first.rs".into(),
+            content_hash: Some("first-hash".into()),
+            ..ArtifactRef::default()
+        };
+        let second_artifact = ArtifactRef {
+            path: "src/second.rs".into(),
+            content_hash: Some("second-hash".into()),
+            ..first_artifact.clone()
+        };
+        let mut request = remember_request("Projection gap", "derived coverage must fail closed");
+        request.scope = repo_scope("projection-gap", "write-session");
+        request.scope.repository.as_mut().unwrap().dirty_hash = Some("1111111111111111".into());
+        request.artifacts = vec![first_artifact.clone(), second_artifact.clone()];
+        let memory_id = engine.remember(request).unwrap().memory_ids[0];
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute(
+                    "DELETE FROM artifact_fingerprints WHERE artifact_id=(SELECT artifact_id FROM artifacts WHERE path='src/first.rs')",
+                    [],
+                )
+                .unwrap();
+            let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+            assert_eq!(
+                staged[&memory_id]
+                    .applicability_artifacts
+                    .fingerprints
+                    .len(),
+                1
+            );
+            assert!(!staged[&memory_id].applicability_artifacts.complete);
+        }
+
+        let mut current_scope = repo_scope("projection-gap", "recall-session");
+        current_scope.repository.as_mut().unwrap().dirty_hash = Some("2222222222222222".into());
+        let incomplete = engine
+            .recall(RecallRequest {
+                query: "projection gap".into(),
+                scope: current_scope.clone(),
+                include_stale: true,
+                hints: crate::ContextHints {
+                    artifacts: vec![second_artifact.clone()],
+                    ..crate::ContextHints::default()
+                },
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        let hit = incomplete
+            .hits
+            .iter()
+            .find(|hit| hit.memory.memory_id == memory_id)
+            .unwrap();
+        assert_eq!(hit.applicability, Applicability::Stale);
+        assert!(!hit.signals.contains(&RetrievalSignal::ArtifactVerified));
+
+        engine.rebuild_search_indexes().unwrap();
+        let connection = engine.lock().unwrap();
+        let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+        assert_eq!(
+            staged[&memory_id]
+                .applicability_artifacts
+                .fingerprints
+                .len(),
+            2
+        );
+        assert!(staged[&memory_id].applicability_artifacts.complete);
+        drop(connection);
+
+        let repaired = engine
+            .recall(RecallRequest {
+                query: "projection gap".into(),
+                scope: current_scope.clone(),
+                hints: crate::ContextHints {
+                    artifacts: vec![first_artifact.clone(), second_artifact.clone()],
+                    ..crate::ContextHints::default()
+                },
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        let hit = repaired
+            .hits
+            .iter()
+            .find(|hit| hit.memory.memory_id == memory_id)
+            .unwrap();
+        assert_eq!(hit.applicability, Applicability::Exact);
+        assert!(hit.signals.contains(&RetrievalSignal::ArtifactVerified));
+
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute(
+                    "UPDATE artifact_fingerprints SET identity=NULL,content=NULL WHERE artifact_id=(SELECT artifact_id FROM artifacts WHERE path='src/first.rs')",
+                    [],
+                )
+                .unwrap();
+            let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+            assert_eq!(
+                staged[&memory_id]
+                    .applicability_artifacts
+                    .fingerprints
+                    .len(),
+                1
+            );
+            assert!(!staged[&memory_id].applicability_artifacts.complete);
+        }
+        let corrupted = engine
+            .recall(RecallRequest {
+                query: "projection gap".into(),
+                scope: current_scope,
+                include_stale: true,
+                hints: crate::ContextHints {
+                    artifacts: vec![second_artifact],
+                    ..crate::ContextHints::default()
+                },
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        let hit = corrupted
+            .hits
+            .iter()
+            .find(|hit| hit.memory.memory_id == memory_id)
+            .unwrap();
+        assert_eq!(hit.applicability, Applicability::Stale);
+        assert!(!hit.signals.contains(&RetrievalSignal::ArtifactVerified));
+    }
+
+    #[test]
+    fn filesystem_materialization_round_robins_candidates_before_second_paths() {
+        let engine = engine();
+        let make_memory = |title: &str, prefix: &str| {
+            let mut request = remember_request(title, "materialization candidate");
+            request.scope = repo_scope("materialization", title);
+            request.artifacts = (0..3)
+                .map(|index| ArtifactRef {
+                    repo_id: "materialization".into(),
+                    path: format!("{prefix}/{index}.rs"),
+                    content_hash: Some(format!("{prefix}-{index}")),
+                    ..ArtifactRef::default()
+                })
+                .collect();
+            engine.remember(request).unwrap().memory_ids[0]
+        };
+        let lower = make_memory("lower", "lower");
+        let stronger = make_memory("stronger", "stronger");
+        let connection = engine.lock().unwrap();
+        let materialization =
+            load_materialization_artifacts(&connection, &[stronger, lower], "materialization", 2)
+                .unwrap();
+        assert_eq!(materialization.len(), 2);
+        assert_eq!(
+            materialization
+                .iter()
+                .filter(|artifact| artifact.path.starts_with("stronger/"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            materialization
+                .iter()
+                .filter(|artifact| artifact.path.starts_with("lower/"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_artifact_revisions_do_not_starve_distinct_materialization_paths() {
+        let engine = engine();
+        let mut lower = remember_request("lower unique", "materialization candidate");
+        lower.scope = repo_scope("materialization-crowding", "lower");
+        lower.artifacts = vec![ArtifactRef {
+            repo_id: "materialization-crowding".into(),
+            path: "src/unique.rs".into(),
+            content_hash: Some("unique-hash".into()),
+            ..ArtifactRef::default()
+        }];
+        let lower = engine.remember(lower).unwrap().memory_ids[0];
+
+        let mut stronger = remember_request("stronger duplicates", "materialization candidate");
+        stronger.scope = repo_scope("materialization-crowding", "stronger");
+        stronger.artifacts = (0..MAX_COLLECTION_ITEMS)
+            .map(|index| ArtifactRef {
+                repo_id: "materialization-crowding".into(),
+                path: "src/shared.rs".into(),
+                symbol: Some("shared".into()),
+                content_hash: Some(format!("revision-{index:03}")),
+                git_oid: Some(format!("oid-{index:03}")),
+                ..ArtifactRef::default()
+            })
+            .collect();
+        let stronger = engine.remember(stronger).unwrap().memory_ids[0];
+
+        let connection = engine.lock().unwrap();
+        let materialization = load_materialization_artifacts(
+            &connection,
+            &[stronger, lower],
+            "materialization-crowding",
+            MAX_COLLECTION_ITEMS,
+        )
+        .unwrap();
+        assert_eq!(
+            materialization
+                .iter()
+                .map(|artifact| artifact.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/shared.rs", "src/unique.rs"]
+        );
+    }
+
+    #[test]
+    fn one_candidate_cannot_monopolize_the_global_materialization_cap() {
+        let engine = engine();
+        let mut lower = remember_request("lower unique", "materialization candidate");
+        lower.scope = repo_scope("materialization-fairness", "lower");
+        lower.artifacts = vec![ArtifactRef {
+            repo_id: "materialization-fairness".into(),
+            path: "lower/unique.rs".into(),
+            content_hash: Some("lower-hash".into()),
+            ..ArtifactRef::default()
+        }];
+        let lower = engine.remember(lower).unwrap().memory_ids[0];
+
+        let mut stronger = remember_request("stronger many", "materialization candidate");
+        stronger.scope = repo_scope("materialization-fairness", "stronger");
+        stronger.artifacts = (0..MAX_COLLECTION_ITEMS)
+            .map(|index| ArtifactRef {
+                repo_id: "materialization-fairness".into(),
+                path: format!("stronger/{index:03}.rs"),
+                content_hash: Some(format!("stronger-hash-{index:03}")),
+                ..ArtifactRef::default()
+            })
+            .collect();
+        let stronger = engine.remember(stronger).unwrap().memory_ids[0];
+
+        let connection = engine.lock().unwrap();
+        let materialization = load_materialization_artifacts(
+            &connection,
+            &[stronger, lower],
+            "materialization-fairness",
+            MAX_COLLECTION_ITEMS,
+        )
+        .unwrap();
+        assert_eq!(materialization.len(), MAX_COLLECTION_ITEMS);
+        assert!(
+            materialization
+                .iter()
+                .any(|artifact| artifact.path == "lower/unique.rs")
+        );
+        assert_eq!(
+            materialization
+                .iter()
+                .filter(|artifact| artifact.path.starts_with("stronger/"))
+                .count(),
+            MAX_COLLECTION_ITEMS - 1
+        );
+    }
+
+    #[test]
+    fn artifact_fingerprint_projection_survives_rebuild_and_snapshot_restore() {
+        let source = engine();
+        let mut request = remember_request("Identity projection", "derived artifact identity");
+        request.scope = repo_scope("identity-rebuild", "source");
+        request.artifacts = vec![
+            ArtifactRef {
+                repo_id: "identity-rebuild".into(),
+                path: "src/identity.rs".into(),
+                symbol: Some("identity".into()),
+                content_hash: Some("identity-hash".into()),
+                ..ArtifactRef::default()
+            },
+            ArtifactRef {
+                repo_id: "identity-rebuild".into(),
+                path: "src/unverifiable.rs".into(),
+                ..ArtifactRef::default()
+            },
+        ];
+        let memory_id = source.remember(request).unwrap().memory_ids[0];
+        let (expected_identity, expected_content) = artifact_fingerprint(
+            "identity-rebuild",
+            "src/identity.rs",
+            Some("identity"),
+            "identity-hash",
+        )
+        .digests();
+
+        {
+            let connection = source.lock().unwrap();
+            let stored = connection
+                .query_row(
+                    "SELECT identity,content FROM artifact_fingerprints WHERE identity IS NOT NULL",
+                    [],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .unwrap();
+            assert_eq!(stored.0, expected_identity);
+            assert_eq!(stored.1, expected_content);
+            assert_eq!(
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM artifact_fingerprints WHERE identity IS NULL AND content IS NULL",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                1,
+                "unverifiable artifacts retain a coverage marker"
+            );
+            connection
+                .execute_batch(
+                    "PRAGMA ignore_check_constraints=ON;
+                     UPDATE artifact_fingerprints SET content=x'00' WHERE identity IS NOT NULL;
+                     PRAGMA ignore_check_constraints=OFF;",
+                )
+                .unwrap();
+            assert!(matches!(
+                load_candidate_memories(&connection, &[memory_id]),
+                Err(Error::Migration(message))
+                    if message.contains("non-32-byte digest")
+            ));
+        }
+        source.rebuild_search_indexes().unwrap();
+        assert_eq!(
+            source
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM artifact_fingerprints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            2
+        );
+
+        let snapshot = source.export_jsonl().unwrap();
+        assert!(!snapshot.contains("artifact_fingerprints"));
+        let mut restored = engine();
+        restored.import_jsonl(&snapshot).unwrap();
+        let connection = restored.lock().unwrap();
+        let stored = connection
+            .query_row(
+                "SELECT identity,content FROM artifact_fingerprints WHERE identity IS NOT NULL",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(stored.0, expected_identity);
+        assert_eq!(stored.1, expected_content);
+        let materialization = load_materialization_artifacts(
+            &connection,
+            &[memory_id],
+            "identity-rebuild",
+            MAX_COLLECTION_ITEMS,
+        )
+        .unwrap();
+        assert_eq!(materialization[0].path, "src/identity.rs");
+    }
+
+    #[test]
+    fn candidate_previews_preserve_mmr_selection_when_bodies_fit() {
+        let engine = engine();
+        let bodies = [
+            "alpha beta shared repair",
+            "alpha gamma distinct migration",
+            "delta epsilon release",
+            "beta shared alternative",
+            "zeta isolated verification",
+        ];
+        let memory_ids = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| {
+                engine
+                    .remember(remember_request(&format!("Candidate {index}"), body))
+                    .unwrap()
+                    .memory_ids[0]
+            })
+            .collect::<Vec<_>>();
+        let connection = engine.lock().unwrap();
+        let full = load_memories(&connection, &memory_ids).unwrap();
+        let staged = load_candidate_memories(&connection, &memory_ids).unwrap();
+        let staged_memories = staged
+            .iter()
+            .map(|(memory_id, candidate)| (*memory_id, candidate.memory.clone()))
+            .collect::<HashMap<_, _>>();
+        let hits = |memories: &HashMap<MemoryId, Memory>| {
+            memory_ids
+                .iter()
+                .enumerate()
+                .map(|(index, memory_id)| RecallHit {
+                    memory: memories[memory_id].clone(),
+                    score: 1.0 - index as f64 * 0.05,
+                    applicability: Applicability::Unversioned,
+                    signals: vec![RetrievalSignal::Lexical],
+                    reasons: vec!["lexical_match".into()],
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(memory_ids.iter().all(|memory_id| {
+            full[memory_id].body == staged_memories[memory_id].body
+                && full[memory_id].title == staged_memories[memory_id].title
+        }));
+        let full_selection = select_mmr(hits(&full), 3, 0.78)
+            .into_iter()
+            .map(|hit| hit.memory.memory_id)
+            .collect::<Vec<_>>();
+        let staged_selection = select_mmr(hits(&staged_memories), 3, 0.78)
+            .into_iter()
+            .map(|hit| hit.memory.memory_id)
+            .collect::<Vec<_>>();
+        assert_eq!(staged_selection, full_selection);
+    }
+
+    #[test]
+    fn bounded_revision_body_preserves_context_truncation() {
+        let engine = engine();
+        let body = format!("bounded-prefix {} FINAL_TAIL", "x".repeat(8_000));
+        let memory_id = engine
+            .remember(remember_request("Bounded hydration", &body))
+            .unwrap()
+            .memory_ids[0];
+        let full = engine.get(memory_id).unwrap();
+        let token_budget = 120;
+        let maximum_body_chars = token_budget * 3 + 1;
+        let connection = engine.lock().unwrap();
+        let bounded = load_memory_revisions_bounded(
+            &connection,
+            &[(memory_id, full.revision)],
+            maximum_body_chars,
+        )
+        .unwrap()
+        .remove(&memory_id)
+        .unwrap();
+        drop(connection);
+        assert_eq!(bounded.body.chars().count(), maximum_body_chars);
+        assert!(!bounded.body.contains("FINAL_TAIL"));
+
+        let hit = |memory| RecallHit {
+            memory,
+            score: 1.0,
+            applicability: Applicability::Unversioned,
+            signals: vec![RetrievalSignal::Lexical],
+            reasons: vec!["lexical_match".into()],
+        };
+        let query_id = QueryId::new();
+        let full_pack = compile_context(query_id, 1, token_budget, vec![hit(full)]);
+        let bounded_pack = compile_context(query_id, 1, token_budget, vec![hit(bounded)]);
+        assert_eq!(bounded_pack.rendered, full_pack.rendered);
+        assert_eq!(
+            bounded_pack.sections[0].items[0].body,
+            full_pack.sections[0].items[0].body
+        );
+        assert_eq!(
+            bounded_pack.hits[0].memory.body,
+            full_pack.hits[0].memory.body
+        );
+        assert!(bounded_pack.hits[0].memory.body.ends_with('…'));
+    }
+
+    #[test]
+    fn pinned_revision_hydration_survives_head_advancement_between_snapshots() {
+        let engine = engine();
+        let mut first = remember_request("Pinned revision one", "immutable old body");
+        first.canonical_key = Some("pinned-revision".into());
+        first.tags = vec!["old-tag".into()];
+        let memory_id = engine.remember(first).unwrap().memory_ids[0];
+
+        let pinned_revision = {
+            let connection = engine.lock().unwrap();
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("begin read snapshot");
+            let staged = load_candidate_memories(&transaction, &[memory_id]).unwrap();
+            let revision = staged[&memory_id].memory.revision;
+            transaction.commit().unwrap();
+            revision
+        };
+
+        let mut second = remember_request("Pinned revision two", "new head body");
+        second.canonical_key = Some("pinned-revision".into());
+        second.tags = vec!["new-tag".into()];
+        assert_eq!(engine.remember(second).unwrap().memory_ids[0], memory_id);
+
+        let connection = engine.lock().unwrap();
+        let pinned =
+            load_memory_revisions_bounded(&connection, &[(memory_id, pinned_revision)], 1_024)
+                .unwrap()
+                .remove(&memory_id)
+                .unwrap();
+        let current = load_memory(&connection, memory_id).unwrap();
+        assert_eq!(pinned.revision, pinned_revision);
+        assert_eq!(pinned.title, "Pinned revision one");
+        assert_eq!(pinned.body, "immutable old body");
+        assert_eq!(pinned.tags, ["old-tag"]);
+        assert_eq!(current.revision, pinned_revision + 1);
+        assert_eq!(current.title, "Pinned revision two");
+        assert_eq!(current.tags, ["new-tag"]);
+    }
+
+    #[test]
+    fn mmr_pool_is_broad_but_bounded() {
+        assert_eq!(mmr_pool_limit(1), 256);
+        assert_eq!(mmr_pool_limit(64), 256);
+        assert_eq!(mmr_pool_limit(100), 400);
+        assert_eq!(mmr_pool_limit(128), 512);
+        assert_eq!(mmr_pool_limit(usize::MAX), 512);
     }
 
     #[test]
@@ -5421,6 +7010,331 @@ mod tests {
     }
 
     #[test]
+    fn search_profile_deserialization_keeps_legacy_profiles_active() {
+        let profile = serde_json::from_value::<SearchProfile>(json!({
+            "profile_id": "legacy-profile",
+            "model_digest": "legacy-model",
+            "dimensions": null,
+            "signature_version": 1,
+            "created_at": "2025-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert!(profile.active);
+    }
+
+    #[test]
+    fn expansion_profiles_are_independent_reproducible_and_lifecycle_managed() {
+        let engine = engine();
+        let scope = repo_workspace_scope("profile-lifecycle", "workspace-a", "session-one");
+        let mut target = remember_request("Projection target", "Canonical wording only");
+        target.scope = scope.clone();
+        let target_id = engine.remember(target).unwrap().memory_ids[0];
+
+        for index in 0..5 {
+            let profile_id = format!("expansion-{index}");
+            engine
+                .register_search_profile(SearchProfileRegistration {
+                    profile_id: profile_id.clone(),
+                    model_digest: format!("fixed-generator-{index}"),
+                    dimensions: None,
+                })
+                .unwrap();
+            let source = engine
+                .pending_search_documents(&profile_id, scope.clone(), 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let expansions = vec![
+                format!("a{index}{}", "a".repeat(3_990)),
+                format!("b{index}{}", "b".repeat(3_990)),
+                format!("c{index}{}", "c".repeat(3_990)),
+                format!("zzzz unique_profile_tail_{index} {}", "z".repeat(3_950)),
+            ];
+            engine
+                .register_search_projections(RegisterSearchProjectionsRequest {
+                    scope: scope.clone(),
+                    profile_id,
+                    projections: vec![SearchProjectionInput {
+                        memory_id: target_id,
+                        revision: source.revision,
+                        content_hash: source.content_hash,
+                        expansions,
+                        vector: None,
+                    }],
+                })
+                .unwrap();
+        }
+
+        let mut legacy_json = serde_json::to_value(
+            engine
+                .list_search_profiles()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        legacy_json.as_object_mut().unwrap().remove("active");
+        let legacy_profile: SearchProfile = serde_json::from_value(legacy_json).unwrap();
+        assert!(
+            legacy_profile.active,
+            "legacy profile JSON defaults to active"
+        );
+
+        for index in 0..5 {
+            let pack = engine
+                .recall(RecallRequest {
+                    query: format!("unique_profile_tail_{index}"),
+                    scope: scope.clone(),
+                    ..RecallRequest::default()
+                })
+                .unwrap();
+            assert_eq!(pack.hits[0].memory.memory_id, target_id);
+            assert!(
+                pack.hits[0]
+                    .signals
+                    .contains(&RetrievalSignal::SemanticExpansion)
+            );
+        }
+
+        let source = engine
+            .pending_search_documents("expansion-4", scope.clone(), 1)
+            .unwrap();
+        assert!(source.is_empty());
+        let current = engine.get(target_id).unwrap();
+        let conflict = engine.register_search_projections(RegisterSearchProjectionsRequest {
+            scope: scope.clone(),
+            profile_id: "expansion-4".into(),
+            projections: vec![SearchProjectionInput {
+                memory_id: target_id,
+                revision: current.revision,
+                content_hash: memory_content_hash(&current.title, &current.body),
+                expansions: vec!["different output for the same immutable input".into()],
+                vector: None,
+            }],
+        });
+        assert!(matches!(conflict, Err(Error::Conflict(_))));
+
+        let inactive = engine
+            .set_search_profile_active("expansion-4", false)
+            .unwrap();
+        assert!(!inactive.active);
+        let inactive_pack = engine
+            .recall(RecallRequest {
+                query: "unique_profile_tail_4".into(),
+                scope: scope.clone(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert!(
+            inactive_pack
+                .hits
+                .iter()
+                .all(|hit| { !hit.signals.contains(&RetrievalSignal::SemanticExpansion) })
+        );
+        assert!(
+            engine
+                .list_search_profiles()
+                .unwrap()
+                .iter()
+                .any(|profile| profile.profile_id == "expansion-4" && !profile.active)
+        );
+
+        assert!(engine.remove_search_profile("expansion-4").unwrap());
+        assert!(!engine.remove_search_profile("expansion-4").unwrap());
+        assert!(
+            engine
+                .list_search_profiles()
+                .unwrap()
+                .iter()
+                .all(|profile| profile.profile_id != "expansion-4")
+        );
+    }
+
+    #[test]
+    fn expansion_candidate_limit_counts_distinct_memories_not_profile_rows() {
+        let engine = engine();
+        let duplicate_id = engine
+            .remember(remember_request(
+                "Repeated projection",
+                "canonical duplicate",
+            ))
+            .unwrap()
+            .memory_ids[0];
+        let unique_id = engine
+            .remember(remember_request("Unique projection", "canonical unique"))
+            .unwrap()
+            .memory_ids[0];
+        let duplicate = engine.get(duplicate_id).unwrap();
+        let unique = engine.get(unique_id).unwrap();
+        let duplicate_hash = memory_content_hash(&duplicate.title, &duplicate.body);
+        let unique_hash = memory_content_hash(&unique.title, &unique.body);
+
+        let mut connection = engine.lock().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..512 {
+            let profile_id = format!("aaaa-duplicate-{index:03}");
+            transaction
+                .execute(
+                    "INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms) VALUES(?1,'crowding-test',NULL,?2)",
+                    params![profile_id, index],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,indexed_at_ms) VALUES(?1,?2,?3,?4,'crowdinguniqueterm',?5)",
+                    params![
+                        profile_id,
+                        duplicate_id.to_string(),
+                        duplicate.revision,
+                        duplicate_hash,
+                        index
+                    ],
+                )
+                .unwrap();
+        }
+        transaction
+            .execute(
+                "INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms) VALUES('zzzz-unique','crowding-test',NULL,600)",
+                [],
+            )
+            .unwrap();
+        transaction
+            .execute(
+                "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,indexed_at_ms) VALUES('zzzz-unique',?1,?2,?3,'crowdinguniqueterm',600)",
+                params![unique_id.to_string(), unique.revision, unique_hash],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let pack = engine
+            .recall(RecallRequest {
+                query: "crowdinguniqueterm".into(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        let unique_hit = pack
+            .hits
+            .iter()
+            .find(|hit| hit.memory.memory_id == unique_id)
+            .expect("a unique memory must survive projection-row crowding");
+        assert!(
+            unique_hit
+                .signals
+                .contains(&RetrievalSignal::SemanticExpansion)
+        );
+    }
+
+    #[test]
+    fn expansion_candidate_rank_is_independent_of_projection_rowids() {
+        fn candidate_order(engine: &MemoryEngine, query: &str) -> Vec<String> {
+            let request = RecallRequest {
+                query: query.to_owned(),
+                as_of: Some(Utc::now()),
+                ..RecallRequest::default()
+            };
+            let eligibility = CandidateEligibility::new(&request).unwrap();
+            let connection = engine.lock().unwrap();
+            let mut statement = connection.prepare(EXPANSION_FTS_CANDIDATE_SQL).unwrap();
+            statement
+                .query_map(
+                    named_params! {
+                        ":namespace": request.scope.namespace,
+                        ":workspace": request.scope.workspace_id,
+                        ":repo": request.scope.repo_id(),
+                        ":query": query,
+                        ":include_superseded": eligibility.include_superseded,
+                        ":all_kinds": eligibility.all_kinds,
+                        ":kinds": eligibility.kinds_json,
+                        ":as_of": eligibility.as_of_ms,
+                    },
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        }
+
+        let engine = engine();
+        let best_id = engine
+            .remember(remember_request("Best semantic match", "canonical best"))
+            .unwrap()
+            .memory_ids[0];
+        let middle_id = engine
+            .remember(remember_request(
+                "Middle semantic match",
+                "canonical middle",
+            ))
+            .unwrap()
+            .memory_ids[0];
+        let other_id = engine
+            .remember(remember_request("Other semantic match", "canonical other"))
+            .unwrap()
+            .memory_ids[0];
+        let memories = [
+            engine.get(best_id).unwrap(),
+            engine.get(middle_id).unwrap(),
+            engine.get(other_id).unwrap(),
+        ];
+        let profile_ids = ["rank-best", "rank-worst", "rank-middle", "rank-other"];
+        for profile_id in profile_ids {
+            engine
+                .register_search_profile(SearchProfileRegistration {
+                    profile_id: profile_id.into(),
+                    model_digest: "deterministic-rank-fixture".into(),
+                    dimensions: None,
+                })
+                .unwrap();
+        }
+
+        let weak_document = format!("{} semanticrankterm", "unrelated ".repeat(400));
+        let middle_document = format!("{} semanticrankterm", "filler ".repeat(30));
+        let other_document = format!("{} semanticrankterm", "padding ".repeat(40));
+        let projections = [
+            (profile_ids[0], &memories[0], "semanticrankterm".to_owned()),
+            (profile_ids[1], &memories[0], weak_document),
+            (profile_ids[2], &memories[1], middle_document),
+            (profile_ids[3], &memories[2], other_document),
+        ];
+        let insert = |connection: &Connection, order: &[usize]| {
+            for &index in order {
+                let (profile_id, memory, expansion) = &projections[index];
+                connection
+                    .execute(
+                        "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,indexed_at_ms) VALUES(?1,?2,?3,?4,?5,1)",
+                        params![
+                            profile_id,
+                            memory.memory_id.to_string(),
+                            memory.revision,
+                            memory_content_hash(&memory.title, &memory.body),
+                            expansion,
+                        ],
+                    )
+                    .unwrap();
+            }
+        };
+
+        {
+            let connection = engine.lock().unwrap();
+            insert(&connection, &[0, 1, 2, 3]);
+        }
+        let forward = candidate_order(&engine, "semanticrankterm");
+        {
+            let connection = engine.lock().unwrap();
+            connection
+                .execute("DELETE FROM search_projections", [])
+                .unwrap();
+            insert(&connection, &[3, 2, 1, 0]);
+        }
+        let reversed = candidate_order(&engine, "semanticrankterm");
+
+        assert_eq!(forward, reversed);
+        assert_eq!(forward.len(), 3);
+        assert_eq!(forward.first(), Some(&best_id.to_string()));
+    }
+
+    #[test]
     fn deterministic_code_aliases_improve_runtime_error_recall() {
         let engine = engine();
         let mut relevant = remember_request(
@@ -5502,6 +7416,8 @@ mod tests {
                     result: "CI still failed".into(),
                     succeeded: false,
                     fingerprint: Some("link-sqlite3".into()),
+                    canonical_key: None,
+                    promotion_reason: None,
                 }],
                 open_tasks: vec!["Test Windows".into()],
                 ..CheckpointRequest::default()
@@ -5535,6 +7451,21 @@ mod tests {
                 content: "Fix the SQLite migration race".into(),
                 attributes: BTreeMap::from([("role".into(), json!("user"))]),
                 trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let mundane = engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "README.md\nsrc/lib.rs".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("rg --files")),
+                    ("succeeded".into(), json!(true)),
+                    ("verification".into(), json!(false)),
+                ]),
+                trust: TrustLevel::ToolVerified,
                 ..ObserveRequest::default()
             })
             .unwrap();
@@ -5584,7 +7515,14 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.event_id == tool.event_id)
         );
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == mundane.event_id)
+        );
         assert!(episode.body.contains("cargo test migration"));
+        assert!(!episode.body.contains("rg --files"));
 
         let second = engine
             .checkpoint_session(CheckpointRequest {
@@ -5610,6 +7548,639 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|evidence| evidence.event_id == tool.event_id)
+        );
+    }
+
+    #[test]
+    fn automatic_checkpoint_coalesces_verification_history_without_command_noise() {
+        let engine = engine();
+        let mut scope = Scope {
+            session_id: Some("promotion-session-one".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Make the workspace tests reliable".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        for index in 0..25 {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::CommandResult,
+                    scope: scope.clone(),
+                    content: format!("inspection output {index}"),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("command".into(), json!(format!("rg inspection_{index}"))),
+                        ("succeeded".into(), json!(true)),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+        for (content, succeeded, verification) in [
+            ("workspace test failed: assertion mismatch", false, false),
+            ("workspace tests passed", true, true),
+        ] {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::CommandResult,
+                    scope: scope.clone(),
+                    content: content.into(),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("command".into(), json!("cargo test --workspace")),
+                        ("succeeded".into(), json!(succeeded)),
+                        ("verification".into(), json!(verification)),
+                        ("error_fingerprint".into(), json!("workspace-test-v1")),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+
+        let first = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("promotion-checkpoint-one".into()),
+                scope: scope.clone(),
+                goal: "coding task".into(),
+                summary: "Fixed the test race".into(),
+                outcome: CheckpointOutcome::Success,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert_eq!(first.memory_ids.len(), 2);
+        let outcome_id = first.memory_ids[1];
+        let outcome = engine.get(outcome_id).unwrap();
+        assert_eq!(
+            outcome
+                .attributes
+                .get("promotion_reason")
+                .and_then(Value::as_str),
+            Some("verification")
+        );
+        assert!(outcome.body.contains("First failure:"));
+        assert!(
+            outcome
+                .body
+                .contains("Final result: workspace tests passed")
+        );
+        assert!(outcome.body.contains("Observed runs: 2"));
+        assert!(outcome.canonical_key.is_some());
+
+        scope.session_id = Some("promotion-session-two".into());
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Recheck the workspace tests".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "workspace test failed again".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test --workspace")),
+                    ("succeeded".into(), json!(false)),
+                    ("verification".into(), json!(true)),
+                    ("error_fingerprint".into(), json!("workspace-test-v1")),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let second = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("promotion-checkpoint-two".into()),
+                scope,
+                goal: "coding task".into(),
+                summary: "The regression returned".into(),
+                outcome: CheckpointOutcome::Failure,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert_eq!(second.memory_ids.len(), 2);
+        assert_eq!(second.memory_ids[1], outcome_id);
+        assert_eq!(engine.history(outcome_id).unwrap().revisions.len(), 2);
+    }
+
+    #[test]
+    fn automatic_checkpoint_promotes_an_ordinary_success_that_closes_a_failure() {
+        let engine = engine();
+        let scope = Scope {
+            session_id: Some("ordinary-resolution-session".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Repair the focused test".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        for (content, succeeded) in [
+            ("focused test failed: expected 2, got 1", false),
+            ("focused test passed", true),
+        ] {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::CommandResult,
+                    scope: scope.clone(),
+                    content: content.into(),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("command".into(), json!("cargo test -p focused")),
+                        ("succeeded".into(), json!(succeeded)),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+
+        let receipt = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("ordinary-resolution-checkpoint".into()),
+                scope,
+                goal: "coding task".into(),
+                summary: "Repaired the focused test".into(),
+                outcome: CheckpointOutcome::Success,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(receipt.memory_ids.len(), 2);
+        let outcome = engine.get(receipt.memory_ids[1]).unwrap();
+        assert_eq!(
+            outcome.attributes.get("succeeded").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            outcome
+                .attributes
+                .get("promotion_reason")
+                .and_then(Value::as_str),
+            Some("failed_execution")
+        );
+        assert!(outcome.body.contains("First failure:"));
+        assert!(outcome.body.contains("Final result: focused test passed"));
+        assert!(outcome.body.contains("Observed runs: 2"));
+    }
+
+    #[test]
+    fn ordinary_success_revises_a_prior_session_failure_in_place() {
+        let engine = engine();
+        let mut scope = Scope {
+            session_id: Some("cross-session-failure".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Run the release check".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "release check failed".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test --release")),
+                    ("succeeded".into(), json!(false)),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let failed = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("cross-session-failure-checkpoint".into()),
+                scope: scope.clone(),
+                goal: "coding task".into(),
+                summary: "Release check still fails".into(),
+                outcome: CheckpointOutcome::Failure,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert_eq!(failed.memory_ids.len(), 2);
+        let outcome_id = failed.memory_ids[1];
+        assert_eq!(
+            engine
+                .get(outcome_id)
+                .unwrap()
+                .attributes
+                .get("succeeded")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+
+        scope.session_id = Some("cross-session-success".into());
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Re-run the release check".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "release check passed".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test --release")),
+                    ("succeeded".into(), json!(true)),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let resolution = CheckpointRequest {
+            idempotency_key: Some("cross-session-success-checkpoint".into()),
+            scope,
+            goal: "coding task".into(),
+            summary: "Release check now passes".into(),
+            outcome: CheckpointOutcome::Success,
+            ..CheckpointRequest::default()
+        };
+        let succeeded = engine.checkpoint_session(resolution.clone()).unwrap();
+        let retry = engine.checkpoint_session(resolution.clone()).unwrap();
+
+        assert_eq!(succeeded.memory_ids.len(), 2);
+        assert_eq!(succeeded.memory_ids[1], outcome_id);
+        assert!(retry.deduplicated);
+        assert_eq!(retry.memory_ids, succeeded.memory_ids);
+        assert_eq!(engine.history(outcome_id).unwrap().revisions.len(), 2);
+        let resolved = engine.get(outcome_id).unwrap();
+        assert_eq!(resolved.revision, 2);
+        assert_eq!(
+            resolved
+                .attributes
+                .get("succeeded")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        assert!(
+            resolved
+                .body
+                .contains("First failure: release check failed")
+        );
+        assert!(resolved.body.contains("Final result: release check passed"));
+        assert!(resolved.body.contains("Observed runs: 2"));
+
+        let mut manual_revision = remember_request(
+            "Manually curated release outcome",
+            "A later explicit revision changes the current canonical identity",
+        );
+        manual_revision.memory_id = Some(outcome_id);
+        manual_revision.kind = MemoryKind::Outcome;
+        manual_revision.scope = resolution.scope.clone();
+        manual_revision.canonical_key = Some("manual:release-outcome".into());
+        engine.remember(manual_revision).unwrap();
+        assert_eq!(engine.get(outcome_id).unwrap().revision, 3);
+        let revised_seq = engine.status().unwrap().database_seq;
+        let revised_retry = engine.checkpoint_session(resolution.clone()).unwrap();
+        assert!(revised_retry.deduplicated);
+        assert_eq!(revised_retry.memory_ids, succeeded.memory_ids);
+        assert_eq!(engine.status().unwrap().database_seq, revised_seq);
+
+        let mut replacement = remember_request(
+            "Replacement release outcome",
+            "A later durable record supersedes the automatic outcome",
+        );
+        replacement.scope = resolution.scope.clone();
+        replacement.links = vec![crate::LinkInput {
+            target: outcome_id,
+            relation: "supersedes".into(),
+            weight: 1_000,
+        }];
+        engine.remember(replacement).unwrap();
+        assert_eq!(
+            engine.get(outcome_id).unwrap().state,
+            MemoryState::Superseded
+        );
+        let superseded_seq = engine.status().unwrap().database_seq;
+        let superseded_retry = engine.checkpoint_session(resolution.clone()).unwrap();
+        assert!(superseded_retry.deduplicated);
+        assert_eq!(superseded_retry.memory_ids, succeeded.memory_ids);
+        assert_eq!(engine.status().unwrap().database_seq, superseded_seq);
+
+        engine
+            .retract(RetractRequest {
+                memory_id: outcome_id,
+                reason: "Retire the generated checkpoint outcome".into(),
+                idempotency_key: Some("retract-resolved-outcome".into()),
+            })
+            .unwrap();
+        assert_eq!(
+            engine.get(outcome_id).unwrap().state,
+            MemoryState::Retracted
+        );
+        let retracted_seq = engine.status().unwrap().database_seq;
+        let retracted_retry = engine.checkpoint_session(resolution).unwrap();
+        assert!(retracted_retry.deduplicated);
+        assert_eq!(retracted_retry.memory_ids, succeeded.memory_ids);
+        assert_eq!(engine.status().unwrap().database_seq, retracted_seq);
+        assert_eq!(engine.history(outcome_id).unwrap().revisions.len(), 3);
+    }
+
+    #[test]
+    fn checkpoint_retry_uses_lifecycle_state_at_the_original_boundary() {
+        let engine = engine();
+        let mut scope = Scope {
+            session_id: Some("boundary-failure".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Run the boundary check".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "boundary check failed".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test boundary")),
+                    ("succeeded".into(), json!(false)),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let failed = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("boundary-failure-checkpoint".into()),
+                scope: scope.clone(),
+                goal: "coding task".into(),
+                summary: "Boundary check still fails".into(),
+                outcome: CheckpointOutcome::Failure,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        let failed_outcome = failed.memory_ids[1];
+
+        let mut replacement = remember_request(
+            "Boundary replacement",
+            "Supersede the automatic failure before the success checkpoint",
+        );
+        replacement.scope = scope.clone();
+        replacement.links = vec![crate::LinkInput {
+            target: failed_outcome,
+            relation: "supersedes".into(),
+            weight: 1_000,
+        }];
+        engine.remember(replacement).unwrap();
+        assert_eq!(
+            engine.get(failed_outcome).unwrap().state,
+            MemoryState::Superseded
+        );
+
+        scope.session_id = Some("boundary-success".into());
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Re-run the boundary check".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "boundary check passed".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test boundary")),
+                    ("succeeded".into(), json!(true)),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let request = CheckpointRequest {
+            idempotency_key: Some("boundary-success-checkpoint".into()),
+            scope,
+            goal: "coding task".into(),
+            summary: "Boundary check now passes".into(),
+            outcome: CheckpointOutcome::Success,
+            ..CheckpointRequest::default()
+        };
+        let first = engine.checkpoint_session(request.clone()).unwrap();
+        assert_eq!(
+            first.memory_ids.len(),
+            1,
+            "a success must not revive a failure superseded before its boundary"
+        );
+
+        engine
+            .retract(RetractRequest {
+                memory_id: failed_outcome,
+                reason: "Retract the already superseded outcome after the checkpoint".into(),
+                idempotency_key: Some("boundary-retraction".into()),
+            })
+            .unwrap();
+        let lifecycle_seq = engine.status().unwrap().database_seq;
+        let retry = engine.checkpoint_session(request).unwrap();
+        assert!(retry.deduplicated);
+        assert_eq!(retry.memory_ids, first.memory_ids);
+        assert_eq!(engine.status().unwrap().database_seq, lifecycle_seq);
+    }
+
+    #[test]
+    fn historical_checkpoint_failure_selection_ignores_post_boundary_head_order() {
+        let engine = engine();
+        let scope = Scope::default();
+        let canonical_key = "auto:failure:v3:duplicate-boundary";
+        let write_failure = |memory_id: MemoryId, result: &str, key: &str| {
+            let mut request = remember_request("Automatic failure", result);
+            request.memory_id = Some(memory_id);
+            request.kind = MemoryKind::Outcome;
+            request.scope = scope.clone();
+            request.canonical_key = Some(key.to_owned());
+            request.attributes = BTreeMap::from([
+                ("succeeded".into(), json!(false)),
+                ("attempt_result".into(), json!(result)),
+            ]);
+            engine.remember(request).unwrap();
+        };
+        let older = MemoryId::new();
+        let newer = MemoryId::new();
+        write_failure(older, "older failure", canonical_key);
+        write_failure(newer, "newer failure", canonical_key);
+        let boundary = engine
+            .observe(ObserveRequest {
+                scope: scope.clone(),
+                content: "checkpoint boundary".into(),
+                ..ObserveRequest::default()
+            })
+            .unwrap()
+            .database_seq;
+        let keys = BTreeSet::from([canonical_key.to_owned()]);
+
+        write_failure(older, "post-boundary update", canonical_key);
+        let connection = engine.lock().unwrap();
+        let selected =
+            load_failed_checkpoint_attempts(&connection, &scope, &keys, Some(boundary)).unwrap();
+        assert_eq!(
+            selected.get(canonical_key).map(String::as_str),
+            Some("newer failure")
+        );
+        drop(connection);
+
+        write_failure(older, "post-boundary key change", "manual:key");
+        let connection = engine.lock().unwrap();
+        let selected =
+            load_failed_checkpoint_attempts(&connection, &scope, &keys, Some(boundary)).unwrap();
+        assert_eq!(
+            selected.get(canonical_key).map(String::as_str),
+            Some("newer failure")
+        );
+    }
+
+    #[test]
+    fn commandless_adapter_verifications_remain_independent_outcomes() {
+        let engine = engine();
+        let scope = Scope {
+            session_id: Some("commandless-adapter-session".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Verify both adapter checks".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        for content in ["unit checks passed", "schema checks passed"] {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::ToolResult,
+                    scope: scope.clone(),
+                    content: content.into(),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("succeeded".into(), json!(true)),
+                        ("verification".into(), json!(true)),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+
+        let receipt = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("commandless-adapter-checkpoint".into()),
+                scope,
+                goal: "coding task".into(),
+                summary: "Both adapter checks passed".into(),
+                outcome: CheckpointOutcome::Success,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+
+        assert_eq!(receipt.memory_ids.len(), 3);
+        let first = engine.get(receipt.memory_ids[1]).unwrap();
+        let second = engine.get(receipt.memory_ids[2]).unwrap();
+        assert_ne!(first.canonical_key, second.canonical_key);
+        let bodies = [first.body.as_str(), second.body.as_str()];
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("unit checks passed"))
+        );
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("schema checks passed"))
+        );
+    }
+
+    #[test]
+    fn checkpoint_classifier_distinguishes_negative_probes_and_real_failures() {
+        let mut event = SessionEvent {
+            event_id: "probe".into(),
+            kind: EventKind::CommandResult.as_str().into(),
+            content: String::new(),
+            attributes: BTreeMap::from([
+                ("command".into(), json!("rg missing_symbol src")),
+                ("exit_code".into(), json!(1)),
+                ("succeeded".into(), json!(false)),
+            ]),
+        };
+        assert_eq!(classify_checkpoint_event(&event), None);
+
+        event.attributes.insert("exit_code".into(), json!(2));
+        assert_eq!(
+            classify_checkpoint_event(&event),
+            Some(CheckpointPromotionReason::FailedExecution)
+        );
+
+        event.attributes.insert("succeeded".into(), json!(true));
+        event
+            .attributes
+            .insert("memory_salient".into(), json!(true));
+        assert_eq!(
+            classify_checkpoint_event(&event),
+            Some(CheckpointPromotionReason::ExplicitSalience)
+        );
+
+        let mut adapter_event = SessionEvent {
+            event_id: "tool-call-one".into(),
+            kind: EventKind::ToolResult.as_str().into(),
+            content: "tests passed".into(),
+            attributes: BTreeMap::from([
+                ("tool_name".into(), json!("Bash")),
+                ("succeeded".into(), json!(true)),
+                ("verification".into(), json!(true)),
+            ]),
+        };
+        let first = checkpoint_attempt_group_identity(&adapter_event, None);
+        adapter_event.event_id = "tool-call-two".into();
+        let second = checkpoint_attempt_group_identity(&adapter_event, None);
+        assert_ne!(
+            first, second,
+            "a bare tool name must not merge unrelated runs"
         );
     }
 
@@ -5721,10 +8292,46 @@ mod tests {
         let connection = engine.lock().unwrap();
         let point = load_memories(&connection, &[first]).unwrap();
         let batch = load_memories(&connection, &[second, first]).unwrap();
+        let bounded = load_memory_revisions_bounded(
+            &connection,
+            &[
+                (second, batch[&second].revision),
+                (first, batch[&first].revision),
+            ],
+            1_024,
+        )
+        .unwrap();
+        let duplicate = load_memory_revisions_bounded(
+            &connection,
+            &[
+                (first, batch[&first].revision),
+                (first, batch[&first].revision),
+            ],
+            1_024,
+        )
+        .unwrap();
+        assert_eq!(duplicate.len(), 1);
+        assert!(matches!(
+            load_memory_revisions_bounded(
+                &connection,
+                &[
+                    (first, batch[&first].revision),
+                    (first, batch[&first].revision + 1),
+                ],
+                1_024,
+            ),
+            Err(Error::InvalidInput(_))
+        ));
         assert_eq!(
             serde_json::to_value(&point[&first]).unwrap(),
             serde_json::to_value(&batch[&first]).unwrap()
         );
+        for memory_id in [first, second] {
+            assert_eq!(
+                serde_json::to_value(&batch[&memory_id]).unwrap(),
+                serde_json::to_value(&bounded[&memory_id]).unwrap()
+            );
+        }
         assert_eq!(
             batch[&first]
                 .artifacts
@@ -6312,6 +8919,16 @@ mod tests {
                 .iter()
                 .any(|hit| hit.memory.memory_id == old)
         );
+        assert_eq!(
+            historical
+                .hits
+                .iter()
+                .find(|hit| hit.memory.memory_id == old)
+                .unwrap()
+                .memory
+                .state,
+            MemoryState::Superseded
+        );
 
         let mut illegal_restore = remember_request("Old rule", "restore");
         illegal_restore.memory_id = Some(old);
@@ -6338,6 +8955,28 @@ mod tests {
         assert_eq!(
             engine.get(contest_id).unwrap().state,
             MemoryState::Contested
+        );
+        let contested = engine
+            .recall(RecallRequest {
+                query: "one claim".into(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert_eq!(
+            contested
+                .hits
+                .iter()
+                .find(|hit| hit.memory.memory_id == contested_target)
+                .unwrap()
+                .memory
+                .state,
+            MemoryState::Contested
+        );
+        assert!(
+            contested
+                .warnings
+                .iter()
+                .any(|warning| warning.contains(&contested_target.to_string()))
         );
     }
 
@@ -7018,9 +9657,9 @@ mod tests {
         prune_candidates(&mut profile_candidates, 256);
         let candidate_elapsed = candidate_started.elapsed();
         let profile_ids = profile_candidates.keys().copied().collect::<Vec<_>>();
-        let materialize_started = Instant::now();
-        black_box(load_memories(&connection, &profile_ids).unwrap());
-        let materialize_elapsed = materialize_started.elapsed();
+        let staging_started = Instant::now();
+        black_box(load_candidate_memories(&connection, &profile_ids).unwrap());
+        let staging_elapsed = staging_started.elapsed();
         let feedback_started = Instant::now();
         black_box(feedback_utilities(&connection, &profile_ids).unwrap());
         let feedback_elapsed = feedback_started.elapsed();
@@ -7113,6 +9752,8 @@ mod tests {
                             result: "Successful benchmark outcome".into(),
                             succeeded: true,
                             fingerprint: Some(format!("benchmark-{index}")),
+                            canonical_key: None,
+                            promotion_reason: None,
                         }],
                         open_tasks: vec![format!("Follow-up {index}")],
                         ..CheckpointRequest::default()
@@ -7162,7 +9803,7 @@ mod tests {
             redaction.as_secs_f64() * 1_000_000.0 / REDACTIONS as f64,
         );
         println!(
-            "PERF_PHASE candidates={} candidate_us={} exact_us={} fts_us={} sparse_us={} entity_us={} error_us={} recent_us={} materialize_us={} feedback_us={}",
+            "PERF_PHASE candidates={} candidate_us={} exact_us={} fts_us={} sparse_us={} entity_us={} error_us={} recent_us={} staging_us={} feedback_us={}",
             profile_ids.len(),
             candidate_elapsed.as_micros(),
             exact_elapsed.as_micros(),
@@ -7171,7 +9812,7 @@ mod tests {
             entity_elapsed.as_micros(),
             error_elapsed.as_micros(),
             recent_elapsed.as_micros(),
-            materialize_elapsed.as_micros(),
+            staging_elapsed.as_micros(),
             feedback_elapsed.as_micros(),
         );
         println!("PERF_PLAN {plan:?}");

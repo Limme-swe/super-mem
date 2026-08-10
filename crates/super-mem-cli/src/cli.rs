@@ -366,6 +366,14 @@ pub struct IndexArgs {
 pub enum IndexCommand {
     /// Register one immutable generator/model profile.
     AddProfile(IndexAddProfileArgs),
+    /// List registered profiles and whether they are active.
+    ListProfiles,
+    /// Allow a profile to contribute retrieval candidates.
+    Activate(IndexProfileArgs),
+    /// Keep a profile's data but exclude it from retrieval.
+    Deactivate(IndexProfileArgs),
+    /// Remove a profile and all of its rebuildable projections.
+    RemoveProfile(IndexRemoveProfileArgs),
     /// List current memories missing a projection for a profile.
     Pending(IndexPendingArgs),
     /// Register a JSON or JSONL batch generated outside the write path.
@@ -387,6 +395,21 @@ pub struct IndexAddProfileArgs {
     /// Dense dimensions. Omit for document-expansion-only profiles.
     #[arg(long)]
     pub dimensions: Option<usize>,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexProfileArgs {
+    #[arg(long)]
+    pub profile_id: String,
+}
+
+#[derive(Clone, Debug, Args)]
+pub struct IndexRemoveProfileArgs {
+    #[arg(long)]
+    pub profile_id: String,
+    /// Confirm deletion of this profile's rebuildable projections.
+    #[arg(long)]
+    pub yes: bool,
 }
 
 #[derive(Clone, Debug, Args)]

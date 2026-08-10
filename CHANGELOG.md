@@ -8,18 +8,20 @@ Notable changes are recorded here. Versioning follows Semantic Versioning. Befor
 
 - Deterministic, bounded code aliases for compound identifiers, paths, symbols, and a conservative coding/error concept lexicon.
 - Optional immutable search profiles for background document expansions and caller-generated dense vectors, without model calls or downloads in memory writes or recall.
-- `supermem index add-profile`, `pending`, `register`, `status`, and `rebuild` operator commands, plus optional dense-query inputs for CLI and MCP recall.
+- `supermem index add-profile`, `list-profiles`, `activate`, `deactivate`, `remove-profile`, `pending`, `register`, `status`, and `rebuild` operator commands, plus optional dense-query inputs for CLI and MCP recall.
 - A labeled retrieval starter fixture and qrels covering paraphrases, exact symbols and errors, scope isolation, Git applicability, and revision correction. The fixture is a regression seed, not a published quality benchmark.
 
 ### Changed
 
-- Recall now separates strict all-term and loose any-term FTS channels for canonical text and code aliases, adds a semantic-expansion channel, and fuses them with existing exact, diagnostic, artifact, entity, sparse, and recency signals.
+- Recall now separates strict all-term and loose any-term FTS channels for canonical text and code aliases, adds a semantic-expansion channel, and fuses them with existing exact, diagnostic, artifact, entity, sparse, and recency signals. Expansion profiles use independent FTS rows so one profile cannot truncate another profile's text.
+- Recall stages bounded body previews and precomputed fixed-width artifact applicability fingerprints, round-robins at most 128 distinct real paths across ranked candidates, bounds the MMR pool, and hydrates full provenance only for pinned selected revisions. Candidate materialization no longer scales with the combined size of up to 1,024 full memory bodies or multi-KiB artifact metadata, one artifact-heavy candidate cannot deny filesystem verification to the rest, and missing or corrupt derived fingerprints cannot prove exact applicability.
 - Dense retrieval uses exact cosine scoring for up to 4,096 eligible projections. Larger sets stream deterministic 128-bit random-hyperplane signatures into a 512-item Hamming shortlist followed by exact cosine reranking.
-- Database schema v5 adds rebuildable alias-version state, immutable generator profiles, current-revision search projections, and an indexed error-fingerprint lookup. JSONL snapshots continue to contain canonical state only and omit search profiles and projections.
+- Automatic session checkpoints retain every captured command as event evidence but promote only verification results, failed attempts, and explicitly salient results into standalone outcome memories. Repeated verification runs with a stable command identity coalesce under a revision key and preserve fail-to-pass endpoints; generic tool names never merge unrelated runs. Idempotent retries reconstruct canonical identity, ordering, and lifecycle eligibility at the original checkpoint boundary instead of consulting mutable heads.
+- Database schema v6 adds search-profile activation, independent per-projection expansion FTS rows, a rebuildable fixed-width artifact fingerprint projection, and a reverse link-revision index. JSONL snapshots continue to contain canonical state only and omit derived projections.
 
 ### Security
 
-- Background projection registration is exact-scope and atomic, passes expansion text through the configured redaction pipeline, validates dense-vector shape and values, and rejects stale work by comparing the current revision and content hash.
+- Background projection registration is exact-scope and atomic, passes expansion text through the configured redaction pipeline, validates dense-vector shape and values, rejects stale work by comparing the current revision and content hash, and rejects nondeterministic bytes for an unchanged profile input.
 
 ## [0.1.0] - 2026-08-06
 
