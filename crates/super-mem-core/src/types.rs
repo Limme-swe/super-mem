@@ -739,8 +739,10 @@ pub struct CheckpointAttempt {
     /// Optional normalized error or command fingerprint.
     pub fingerprint: Option<String>,
     /// Optional stable key used to revise a recurring automatic outcome.
+    #[serde(default)]
     pub canonical_key: Option<String>,
     /// Why an automatically captured event was promoted into durable memory.
+    #[serde(default)]
     pub promotion_reason: Option<String>,
 }
 
@@ -845,9 +847,14 @@ pub struct SearchProfile {
     /// Core random-hyperplane signature algorithm version.
     pub signature_version: u32,
     /// Whether this profile may contribute retrieval candidates.
+    #[serde(default = "search_profile_active_by_default")]
     pub active: bool,
     /// Registration time.
     pub created_at: DateTime<Utc>,
+}
+
+const fn search_profile_active_by_default() -> bool {
+    true
 }
 
 /// One current memory that still needs background search enrichment.

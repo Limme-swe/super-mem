@@ -1053,6 +1053,34 @@ mod tests {
             .unwrap();
 
         migrate_v5(&connection).unwrap();
+        // Seed v5 derived search state before v6 exists so this exercises the
+        // lifecycle and FTS backfill, not merely the post-migration triggers.
+        connection
+            .execute_batch(
+                r"
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('dense-v1','digest-v1',3,10);
+                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
+                VALUES('expansion-v1','digest-v1',NULL,10);
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'dense-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'likely semantic query',zeroblob(12),zeroblob(16),1.0,11
+                );
+                INSERT INTO search_projections(
+                    profile_id,memory_id,revision,content_hash,expansion,
+                    vector,signature,norm,indexed_at_ms
+                ) VALUES(
+                    'expansion-v1','018f0000-0000-7000-8000-000000000102',1,
+                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+                    'another likely query',NULL,NULL,NULL,11
+                );
+                ",
+            )
+            .unwrap();
         migrate_v6(&connection).unwrap();
         assert_eq!(
             connection
@@ -1177,32 +1205,6 @@ mod tests {
                 .is_err()
         );
 
-        connection
-            .execute_batch(
-                r"
-                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
-                VALUES('dense-v1','digest-v1',3,10);
-                INSERT INTO search_profiles(profile_id,model_digest,dimensions,created_at_ms)
-                VALUES('expansion-v1','digest-v1',NULL,10);
-                INSERT INTO search_projections(
-                    profile_id,memory_id,revision,content_hash,expansion,
-                    vector,signature,norm,indexed_at_ms
-                ) VALUES(
-                    'dense-v1','018f0000-0000-7000-8000-000000000102',1,
-                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                    'likely semantic query',zeroblob(12),zeroblob(16),1.0,11
-                );
-                INSERT INTO search_projections(
-                    profile_id,memory_id,revision,content_hash,expansion,
-                    vector,signature,norm,indexed_at_ms
-                ) VALUES(
-                    'expansion-v1','018f0000-0000-7000-8000-000000000102',1,
-                    'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
-                    'another likely query',NULL,NULL,NULL,11
-                );
-                ",
-            )
-            .unwrap();
         assert_eq!(
             connection
                 .query_row(
@@ -1213,6 +1215,38 @@ mod tests {
                 .unwrap(),
             2
         );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "UPDATE search_projections SET expansion='' WHERE profile_id='expansion-v1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        connection
+            .execute(
+                "UPDATE search_projections SET expansion='another likely query restored' WHERE profile_id='expansion-v1'",
+                [],
+            )
+            .unwrap();
         assert_eq!(
             connection
                 .query_row(
