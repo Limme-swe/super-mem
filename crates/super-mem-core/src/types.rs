@@ -738,6 +738,10 @@ pub struct CheckpointAttempt {
     pub succeeded: bool,
     /// Optional normalized error or command fingerprint.
     pub fingerprint: Option<String>,
+    /// Optional stable key used to revise a recurring automatic outcome.
+    pub canonical_key: Option<String>,
+    /// Why an automatically captured event was promoted into durable memory.
+    pub promotion_reason: Option<String>,
 }
 
 /// Atomic task checkpoint request.
@@ -840,6 +844,8 @@ pub struct SearchProfile {
     pub dimensions: Option<usize>,
     /// Core random-hyperplane signature algorithm version.
     pub signature_version: u32,
+    /// Whether this profile may contribute retrieval candidates.
+    pub active: bool,
     /// Registration time.
     pub created_at: DateTime<Utc>,
 }

@@ -39,6 +39,7 @@ use crate::{
 };
 
 const FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM memory_fts CROSS JOIN memory_heads h ON h.docid=memory_fts.rowid WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND memory_fts MATCH :query ORDER BY bm25(memory_fts,4.0,1.0,2.5,3.0,3.5,2.0,0.8),h.memory_id LIMIT 512";
+const EXPANSION_FTS_CANDIDATE_SQL: &str = "SELECT h.memory_id FROM search_expansion_fts CROSS JOIN search_projections p ON p.rowid=search_expansion_fts.rowid JOIN search_profile_state ps ON ps.profile_id=p.profile_id AND ps.active=1 JOIN memory_heads h ON h.memory_id=p.memory_id JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.namespace=:namespace AND (h.workspace_id IS NULL OR h.workspace_id=:workspace) AND ((:repo IS NOT NULL AND (h.repo_id IS NULL OR h.repo_id=:repo)) OR (:repo IS NULL AND h.repo_id IS NULL)) AND h.state!='retracted' AND (:include_superseded OR h.state!='superseded') AND (:all_kinds OR instr(:kinds,'\"'||h.kind||'\"')>0) AND (h.valid_from_ms IS NULL OR h.valid_from_ms<=:as_of) AND (h.valid_until_ms IS NULL OR :as_of<h.valid_until_ms) AND (h.expires_at_ms IS NULL OR :as_of<h.expires_at_ms) AND p.revision=h.head_revision AND p.content_hash=r.content_hash AND search_expansion_fts MATCH :query ORDER BY bm25(search_expansion_fts),p.profile_id,h.memory_id LIMIT 512";
 const DENSE_EXACT_SCAN_LIMIT: usize = 4_096;
 const DENSE_BINARY_SHORTLIST: usize = 512;
 const CODE_ALIAS_VERSION: u32 = 1;
@@ -46,7 +47,12 @@ const MAX_SEARCH_PROJECTION_BATCH: usize = 256;
 const MAX_SEARCH_EXPANSIONS: usize = 128;
 const MAX_SEARCH_EXPANSION_ITEM_BYTES: usize = 4_096;
 const MAX_SEARCH_EXPANSION_BYTES: usize = 16_384;
-const MAX_FTS_EXPANSION_BYTES: usize = 65_536;
+// MMR only needs a stable lexical sketch of each candidate. Keeping the
+// prefix here prevents a single large memory from making candidate staging
+// proportional to the total corpus body size.
+const MMR_BODY_PREVIEW_CHARS: usize = 1_024;
+const MMR_MIN_POOL: usize = 256;
+const MMR_MAX_POOL: usize = 512;
 const ALIAS_INCOMPLETE_SQL: &str = "SELECT EXISTS(SELECT 1 FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL LIMIT 1)";
 // Snapshot schema is independent from SQLite's user_version. Version 2 adds
 // immutable per-revision metadata and link provenance; version 1 remains
@@ -536,6 +542,7 @@ impl MemoryEngine {
         }
         events.reverse();
 
+        let mut promoted_attempts = Vec::new();
         let mut seen_evidence = request
             .evidence
             .iter()
@@ -559,11 +566,8 @@ impl MemoryEngine {
                 request.goal = truncate_to_tokens(&event.content, 256);
             }
 
-            let succeeded = event_succeeded(&event);
-            if event.kind == EventKind::CommandResult.as_str()
-                || event.kind == EventKind::Verification.as_str()
-                || (event.kind == EventKind::ToolResult.as_str() && !succeeded)
-            {
+            if let Some(reason) = classify_checkpoint_event(&event) {
+                let succeeded = event_succeeded(&event);
                 let action = event_action(&event);
                 let result = truncate_to_tokens(&event.content, 768);
                 let fingerprint = event
@@ -571,25 +575,14 @@ impl MemoryEngine {
                     .get("error_fingerprint")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
-                if !request.attempts.iter().any(|attempt| {
-                    attempt.action == action
-                        && attempt.fingerprint == fingerprint
-                        && attempt.result == result
-                }) {
-                    request.attempts.push(crate::CheckpointAttempt {
-                        action: action.clone(),
-                        result: result.clone(),
-                        succeeded,
-                        fingerprint,
-                    });
-                }
-                if event.kind == EventKind::Verification.as_str()
-                    || event
-                        .attributes
-                        .get("verification")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false)
-                {
+                promoted_attempts.push(AutomaticCheckpointAttempt {
+                    action: action.clone(),
+                    result: result.clone(),
+                    succeeded,
+                    fingerprint,
+                    reason,
+                });
+                if reason == CheckpointPromotionReason::Verification {
                     let verification = format!("{action}: {result}");
                     if !request.verification.contains(&verification) {
                         request.verification.push(verification);
@@ -597,6 +590,9 @@ impl MemoryEngine {
                 }
             }
         }
+        request
+            .attempts
+            .extend(coalesce_checkpoint_attempts(promoted_attempts));
         self.checkpoint(request)
     }
 
@@ -750,9 +746,13 @@ impl MemoryEngine {
                     Value::String(fingerprint.clone()),
                 );
             }
+            if let Some(reason) = &attempt.promotion_reason {
+                attributes.insert("promotion_reason".to_owned(), Value::String(reason.clone()));
+            }
             let prepared = self.prepare_memory(crate::RememberRequest {
                 kind: MemoryKind::Outcome,
                 scope: request.scope.clone(),
+                canonical_key: attempt.canonical_key.clone(),
                 title: if attempt.succeeded {
                     format!("Successful approach: {}", attempt.action)
                 } else {
@@ -904,7 +904,11 @@ impl MemoryEngine {
         prune_candidates(&mut candidates, 1_024);
 
         let candidate_ids = candidates.keys().copied().collect::<Vec<_>>();
-        let mut memories = load_memories(&transaction, &candidate_ids)?;
+        // Candidate staging deliberately omits full bodies, attributes, tags,
+        // entities, and evidence. Applicability needs immutable scalar head
+        // metadata and current artifacts; MMR needs only a bounded body
+        // preview. Full selected revisions are hydrated after diversification.
+        let mut memories = load_candidate_memories(&transaction, &candidate_ids)?;
         let utilities = feedback_utilities(&transaction, &candidate_ids)?;
         let database_seq = latest_sequence(&transaction)?;
         // Hash the artifacts of the strongest retrieval candidates first. A
@@ -1009,13 +1013,35 @@ impl MemoryEngine {
                 now,
             ));
         }
-        hits.sort_by(|left, right| {
-            right
-                .score
-                .total_cmp(&left.score)
-                .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
-        });
-        let selected = select_mmr(hits, limit, 0.78);
+        bound_mmr_pool(&mut hits, limit);
+        let mut selected = select_mmr(hits, limit, 0.78);
+
+        // The first read snapshot pinned each candidate's immutable
+        // (memory_id, revision). A writer may advance a head while Git
+        // applicability is resolved outside SQLite; hydrate the pinned
+        // revisions rather than consulting mutable heads again. One extra
+        // character beyond the largest possible rendered body is sufficient
+        // for truncate_to_tokens to preserve its exact ellipsis decision.
+        let maximum_body_chars = token_budget.saturating_mul(3).saturating_add(1);
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+        let revisions = selected
+            .iter()
+            .map(|hit| (hit.memory.memory_id, hit.memory.revision))
+            .collect::<Vec<_>>();
+        let mut hydrated =
+            load_memory_revisions_bounded(&transaction, &revisions, maximum_body_chars)?;
+        for hit in &mut selected {
+            let pinned_revision = hit.memory.revision;
+            hit.memory = hydrated
+                .remove(&hit.memory.memory_id)
+                .filter(|memory| memory.revision == pinned_revision)
+                .ok_or_else(|| Error::NotFound {
+                    kind: "memory revision",
+                    id: format!("{}@{pinned_revision}", hit.memory.memory_id),
+                })?;
+        }
+        transaction.commit()?;
         Ok(compile_context(
             query_id,
             database_seq,
@@ -1078,6 +1104,57 @@ impl MemoryEngine {
         let profile = load_search_profile(&transaction, &registration.profile_id)?;
         transaction.commit()?;
         Ok(profile)
+    }
+
+    /// Lists immutable search profiles and their current activation state.
+    pub fn list_search_profiles(&self) -> Result<Vec<SearchProfile>> {
+        let connection = self.lock()?;
+        let mut statement = connection
+            .prepare_cached("SELECT profile_id FROM search_profiles ORDER BY profile_id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        ids.into_iter()
+            .map(|profile_id| load_search_profile(&connection, &profile_id))
+            .collect()
+    }
+
+    /// Enables or disables a profile without discarding its derived data.
+    pub fn set_search_profile_active(
+        &self,
+        profile_id: &str,
+        active: bool,
+    ) -> Result<SearchProfile> {
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE search_profile_state SET active=?2 WHERE profile_id=?1",
+            params![profile_id, active],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound {
+                kind: "search profile",
+                id: profile_id.to_owned(),
+            });
+        }
+        let profile = load_search_profile(&transaction, profile_id)?;
+        transaction.commit()?;
+        Ok(profile)
+    }
+
+    /// Removes one profile and all of its rebuildable projections.
+    pub fn remove_search_profile(&self, profile_id: &str) -> Result<bool> {
+        validate_bounded_text("search profile ID", profile_id, false, 256)?;
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = transaction.execute(
+            "DELETE FROM search_profiles WHERE profile_id=?1",
+            [profile_id],
+        )? != 0;
+        transaction.commit()?;
+        Ok(removed)
     }
 
     /// Returns current documents whose derived projection is missing or stale.
@@ -1266,11 +1343,10 @@ impl MemoryEngine {
         }
         let mut registered = 0;
         let mut unchanged = 0;
-        let mut fts_rebuilds = Vec::new();
         for projection in prepared {
             let current = transaction
                 .query_row(
-                    "SELECT h.docid,h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted'",
+                    "SELECT h.head_revision,r.content_hash FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id=?1 AND h.namespace=?2 AND h.scope_key=?3 AND h.workspace_id IS ?4 AND h.state!='retracted'",
                     params![
                         projection.memory_id.to_string(),
                         request.scope.namespace,
@@ -1279,14 +1355,13 @@ impl MemoryEngine {
                     ],
                     |row| {
                         Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, u32>(1)?,
-                            row.get::<_, String>(2)?,
+                            row.get::<_, u32>(0)?,
+                            row.get::<_, String>(1)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((docid, head_revision, head_hash)) = current else {
+            let Some((head_revision, head_hash)) = current else {
                 return Err(Error::Conflict(format!(
                     "memory {} is not a current non-retracted head in the authorized scope",
                     projection.memory_id
@@ -1314,17 +1389,6 @@ impl MemoryEngine {
                     },
                 )
                 .optional()?;
-            let expansion_changed = existing.as_ref().map_or(
-                !projection.expansion.is_empty(),
-                |(revision, content_hash, expansion, _, _, _)| {
-                    if *revision == projection.revision && content_hash == &projection.content_hash
-                    {
-                        expansion != &projection.expansion
-                    } else {
-                        !projection.expansion.is_empty()
-                    }
-                },
-            );
             let identical = existing.as_ref().is_some_and(
                 |(revision, content_hash, expansion, vector, signature, norm)| {
                     *revision == projection.revision
@@ -1338,6 +1402,17 @@ impl MemoryEngine {
             if identical {
                 unchanged += 1;
                 continue;
+            }
+            if existing
+                .as_ref()
+                .is_some_and(|(revision, content_hash, ..)| {
+                    *revision == projection.revision && content_hash == &projection.content_hash
+                })
+            {
+                return Err(Error::Conflict(format!(
+                    "search profile {} produced different bytes for unchanged memory {} revision {}; register a new immutable profile",
+                    request.profile_id, projection.memory_id, projection.revision
+                )));
             }
             transaction.execute(
                 "INSERT INTO search_projections(profile_id,memory_id,revision,content_hash,expansion,vector,signature,norm,indexed_at_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(profile_id,memory_id) DO UPDATE SET revision=excluded.revision,content_hash=excluded.content_hash,expansion=excluded.expansion,vector=excluded.vector,signature=excluded.signature,norm=excluded.norm,indexed_at_ms=excluded.indexed_at_ms",
@@ -1354,23 +1429,6 @@ impl MemoryEngine {
                 ],
             )?;
             registered += 1;
-            if expansion_changed {
-                fts_rebuilds.push((projection.memory_id, docid));
-            }
-        }
-        if !fts_rebuilds.is_empty() {
-            let ids = fts_rebuilds
-                .iter()
-                .map(|(memory_id, _)| *memory_id)
-                .collect::<Vec<_>>();
-            let memories = load_memories(&transaction, &ids)?;
-            for (memory_id, docid) in fts_rebuilds {
-                let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
-                    kind: "memory",
-                    id: memory_id.to_string(),
-                })?;
-                rebuild_fts_from_memory(&transaction, docid, memory)?;
-            }
         }
         let receipt = SearchProjectionReceipt {
             profile_id: request.profile_id,
@@ -2183,6 +2241,12 @@ impl MemoryEngine {
             if let Some(fingerprint) = &mut attempt.fingerprint {
                 redact_string_field(self, fingerprint, &mut count);
             }
+            if let Some(canonical_key) = &mut attempt.canonical_key {
+                redact_string_field(self, canonical_key, &mut count);
+            }
+            if let Some(reason) = &mut attempt.promotion_reason {
+                redact_string_field(self, reason, &mut count);
+            }
         }
         for task in &mut request.open_tasks {
             redact_string_field(self, task, &mut count);
@@ -2257,6 +2321,17 @@ impl MemoryEngine {
                     false,
                     MAX_KEY_BYTES,
                 )?;
+            }
+            if let Some(canonical_key) = &attempt.canonical_key {
+                validate_bounded_text(
+                    "checkpoint attempt key",
+                    canonical_key,
+                    false,
+                    MAX_KEY_BYTES,
+                )?;
+            }
+            if let Some(reason) = &attempt.promotion_reason {
+                validate_bounded_text("checkpoint attempt promotion reason", reason, false, 64)?;
             }
         }
         for task in &request.open_tasks {
@@ -2374,6 +2449,231 @@ struct SessionEvent {
     kind: String,
     content: String,
     attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckpointPromotionReason {
+    Verification,
+    FailedExecution,
+    ExplicitSalience,
+}
+
+impl CheckpointPromotionReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verification => "verification",
+            Self::FailedExecution => "failed_execution",
+            Self::ExplicitSalience => "explicit_salience",
+        }
+    }
+}
+
+struct AutomaticCheckpointAttempt {
+    action: String,
+    result: String,
+    succeeded: bool,
+    fingerprint: Option<String>,
+    reason: CheckpointPromotionReason,
+}
+
+struct CheckpointAttemptGroup {
+    canonical_key: String,
+    action: String,
+    final_result: String,
+    final_succeeded: bool,
+    fingerprint: Option<String>,
+    reason: CheckpointPromotionReason,
+    first_failure: Option<String>,
+    observations: usize,
+    last_order: usize,
+}
+
+fn classify_checkpoint_event(event: &SessionEvent) -> Option<CheckpointPromotionReason> {
+    let verification = event.kind == EventKind::Verification.as_str()
+        || event
+            .attributes
+            .get("verification")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    if verification {
+        return Some(CheckpointPromotionReason::Verification);
+    }
+    let failed_execution = !event_succeeded(event)
+        && matches!(
+            event.kind.as_str(),
+            "command_result" | "tool_result" | "verification"
+        )
+        && !is_neutral_negative_probe(event);
+    if failed_execution {
+        return Some(CheckpointPromotionReason::FailedExecution);
+    }
+    event
+        .attributes
+        .get("memory_salient")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        .then_some(CheckpointPromotionReason::ExplicitSalience)
+}
+
+fn is_neutral_negative_probe(event: &SessionEvent) -> bool {
+    if event.kind != EventKind::CommandResult.as_str()
+        || event.attributes.get("exit_code").and_then(Value::as_i64) != Some(1)
+    {
+        return false;
+    }
+    let Some(command) = event.attributes.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    let tokens = command.split_whitespace().collect::<Vec<_>>();
+    let executable = tokens
+        .first()
+        .and_then(|token| token.rsplit(['/', '\\']).next())
+        .unwrap_or("");
+    let expected_negative = matches!(executable, "rg" | "grep")
+        || (executable == "git" && tokens.get(1) == Some(&"diff") && tokens.contains(&"--quiet"));
+    if !expected_negative {
+        return false;
+    }
+    let folded = event.content.to_ascii_lowercase();
+    ![
+        "error:",
+        "fatal:",
+        "panic",
+        "exception",
+        "traceback",
+        "segmentation fault",
+    ]
+    .iter()
+    .any(|marker| folded.contains(marker))
+}
+
+fn coalesce_checkpoint_attempts(
+    attempts: Vec<AutomaticCheckpointAttempt>,
+) -> Vec<crate::CheckpointAttempt> {
+    let mut groups = BTreeMap::<String, CheckpointAttemptGroup>::new();
+    for (order, attempt) in attempts.into_iter().enumerate() {
+        let canonical_key = checkpoint_attempt_canonical_key(
+            attempt.reason,
+            &attempt.action,
+            attempt.fingerprint.as_deref(),
+        );
+        let group = groups
+            .entry(canonical_key.clone())
+            .or_insert_with(|| CheckpointAttemptGroup {
+                canonical_key,
+                action: attempt.action.clone(),
+                final_result: attempt.result.clone(),
+                final_succeeded: attempt.succeeded,
+                fingerprint: attempt.fingerprint.clone(),
+                reason: attempt.reason,
+                first_failure: (!attempt.succeeded).then(|| attempt.result.clone()),
+                observations: 0,
+                last_order: order,
+            });
+        if !attempt.succeeded && group.first_failure.is_none() {
+            group.first_failure = Some(attempt.result.clone());
+        }
+        group.action = attempt.action;
+        group.final_result = attempt.result;
+        group.final_succeeded = attempt.succeeded;
+        if attempt.fingerprint.is_some() {
+            group.fingerprint = attempt.fingerprint;
+        }
+        group.observations += 1;
+        group.last_order = order;
+    }
+
+    let mut groups = groups.into_values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        checkpoint_group_priority(left)
+            .cmp(&checkpoint_group_priority(right))
+            .then_with(|| right.last_order.cmp(&left.last_order))
+            .then_with(|| left.canonical_key.cmp(&right.canonical_key))
+    });
+    let mut successful_verifications = 0;
+    let mut successful_salient = 0;
+    groups
+        .into_iter()
+        .filter(|group| {
+            if group.first_failure.is_some() || !group.final_succeeded {
+                return true;
+            }
+            match group.reason {
+                CheckpointPromotionReason::Verification => {
+                    successful_verifications += 1;
+                    successful_verifications <= 4
+                }
+                CheckpointPromotionReason::ExplicitSalience => {
+                    successful_salient += 1;
+                    successful_salient <= 4
+                }
+                CheckpointPromotionReason::FailedExecution => false,
+            }
+        })
+        .map(|group| {
+            let result = coalesced_checkpoint_result(&group);
+            crate::CheckpointAttempt {
+                action: group.action,
+                result,
+                succeeded: group.final_succeeded,
+                fingerprint: group.fingerprint,
+                canonical_key: Some(group.canonical_key),
+                promotion_reason: Some(group.reason.as_str().to_owned()),
+            }
+        })
+        .collect()
+}
+
+fn checkpoint_group_priority(group: &CheckpointAttemptGroup) -> u8 {
+    if !group.final_succeeded {
+        0
+    } else if group.first_failure.is_some() {
+        1
+    } else if group.reason == CheckpointPromotionReason::Verification {
+        2
+    } else {
+        3
+    }
+}
+
+fn coalesced_checkpoint_result(group: &CheckpointAttemptGroup) -> String {
+    if group.observations == 1 {
+        return group.final_result.clone();
+    }
+    match group.first_failure.as_deref() {
+        Some(first_failure) if group.final_succeeded => format!(
+            "First failure: {first_failure}\nFinal result: {}\nObserved runs: {}",
+            group.final_result, group.observations
+        ),
+        Some(first_failure) if first_failure != group.final_result => format!(
+            "First failure: {first_failure}\nLatest failure: {}\nObserved runs: {}",
+            group.final_result, group.observations
+        ),
+        _ => format!(
+            "{}\nObserved equivalent runs: {}",
+            group.final_result, group.observations
+        ),
+    }
+}
+
+fn checkpoint_attempt_canonical_key(
+    reason: CheckpointPromotionReason,
+    action: &str,
+    fingerprint: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"super-mem:checkpoint-attempt-key:v2\0");
+    let identity = if reason == CheckpointPromotionReason::FailedExecution {
+        fingerprint.unwrap_or(action)
+    } else {
+        action
+    };
+    for part in [reason.as_str(), identity] {
+        let normalized = part.split_whitespace().collect::<Vec<_>>().join(" ");
+        hasher.update(&(normalized.len() as u64).to_le_bytes());
+        hasher.update(normalized.as_bytes());
+    }
+    format!("auto:{}:v2:{}", reason.as_str(), hasher.finalize().to_hex())
 }
 
 fn session_evidence_relation(event: &SessionEvent) -> &'static str {
@@ -2932,7 +3232,6 @@ fn rebuild_fts(
         &request.entities,
         &request.artifacts,
     );
-    let expansions = load_search_expansions(transaction, memory_id, revision)?;
     transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
     transaction.execute(
         "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -2958,7 +3257,7 @@ fn rebuild_fts(
                 .collect::<Vec<_>>()
                 .join(" "),
             aliases,
-            expansions,
+            "",
         ],
     )?;
     transaction.execute(
@@ -2968,53 +3267,13 @@ fn rebuild_fts(
     Ok(())
 }
 
-fn load_search_expansions(
-    connection: &Connection,
-    memory_id: MemoryId,
-    revision: u32,
-) -> Result<String> {
-    let mut statement = connection.prepare_cached(
-        "SELECT expansion FROM search_projections WHERE memory_id=?1 AND revision=?2 AND expansion!='' ORDER BY profile_id",
-    )?;
-    let expansions = statement.query_map(params![memory_id.to_string(), revision], |row| {
-        row.get::<_, String>(0)
-    })?;
-    let mut combined = String::new();
-    for expansion in expansions {
-        let expansion = expansion?;
-        let separator = usize::from(!combined.is_empty());
-        let Some(available) =
-            MAX_FTS_EXPANSION_BYTES.checked_sub(combined.len().saturating_add(separator))
-        else {
-            break;
-        };
-        if available == 0 {
-            break;
-        }
-        if separator != 0 {
-            combined.push(' ');
-        }
-        if expansion.len() <= available {
-            combined.push_str(&expansion);
-            continue;
-        }
-        let mut end = available;
-        while end > 0 && !expansion.is_char_boundary(end) {
-            end -= 1;
-        }
-        combined.push_str(&expansion[..end]);
-        break;
-    }
-    Ok(combined)
-}
-
 fn load_search_profile_optional(
     connection: &Connection,
     profile_id: &str,
 ) -> Result<Option<SearchProfile>> {
     let row = connection
         .query_row(
-            "SELECT profile_id,model_digest,dimensions,signature_version,created_at_ms FROM search_profiles WHERE profile_id=?1",
+            "SELECT p.profile_id,p.model_digest,p.dimensions,p.signature_version,s.active,p.created_at_ms FROM search_profiles p JOIN search_profile_state s ON s.profile_id=p.profile_id WHERE p.profile_id=?1",
             [profile_id],
             |row| {
                 Ok((
@@ -3022,13 +3281,14 @@ fn load_search_profile_optional(
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<i64>>(2)?,
                     row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, bool>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?;
     row.map(
-        |(profile_id, model_digest, dimensions, signature_version, created_at_ms)| {
+        |(profile_id, model_digest, dimensions, signature_version, active, created_at_ms)| {
             let dimensions = dimensions
                 .map(|dimensions| {
                     usize::try_from(dimensions)
@@ -3047,6 +3307,7 @@ fn load_search_profile_optional(
                 model_digest,
                 dimensions,
                 signature_version,
+                active,
                 created_at: from_ms(created_at_ms)?,
             })
         },
@@ -3073,7 +3334,6 @@ fn rebuild_fts_from_memory(
         &memory.entities,
         &memory.artifacts,
     );
-    let expansions = load_search_expansions(transaction, memory.memory_id, memory.revision)?;
     transaction.execute("DELETE FROM memory_fts WHERE rowid=?1", [docid])?;
     transaction.execute(
         "INSERT INTO memory_fts(rowid,title,body,tags,entities,paths,aliases,expansions) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -3099,7 +3359,7 @@ fn rebuild_fts_from_memory(
                 .collect::<Vec<_>>()
                 .join(" "),
             aliases,
-            expansions,
+            "",
         ],
     )?;
     transaction.execute(
@@ -3358,30 +3618,7 @@ fn load_memory_revision(
         .query_row(
             "SELECT r.memory_id,r.revision,m.kind,m.state,m.canonical_key,m.importance,m.confidence,m.trust,m.valid_from_ms,m.valid_until_ms,m.expires_at_ms,h.created_at_ms,r.recorded_at_ms,r.title,r.body,r.attributes_json,r.scope_json,m.metadata_complete FROM memory_revisions r JOIN memory_revision_metadata m ON m.memory_id=r.memory_id AND m.revision=r.revision JOIN memory_heads h ON h.memory_id=r.memory_id WHERE r.memory_id=?1 AND r.revision=?2",
             params![memory_id.to_string(), revision],
-            |row| {
-                Ok((
-                    RawMemoryRow {
-                        memory_id: row.get(0)?,
-                        revision: row.get(1)?,
-                        kind: row.get(2)?,
-                        state: row.get(3)?,
-                        canonical_key: row.get(4)?,
-                        importance: row.get(5)?,
-                        confidence: row.get(6)?,
-                        trust: row.get(7)?,
-                        valid_from: row.get(8)?,
-                        valid_until: row.get(9)?,
-                        expires: row.get(10)?,
-                        created: row.get(11)?,
-                        updated: row.get(12)?,
-                        title: row.get(13)?,
-                        body: row.get(14)?,
-                        attributes_json: row.get(15)?,
-                        scope_json: row.get(16)?,
-                    },
-                    row.get::<_, bool>(17)?,
-                ))
-            },
+            memory_revision_row,
         )
         .optional()?
         .ok_or_else(|| Error::NotFound {
@@ -3455,6 +3692,194 @@ fn load_memory_revision(
         memory,
         metadata_complete,
     })
+}
+
+fn memory_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(RawMemoryRow, bool)> {
+    Ok((
+        RawMemoryRow {
+            memory_id: row.get(0)?,
+            revision: row.get(1)?,
+            kind: row.get(2)?,
+            state: row.get(3)?,
+            canonical_key: row.get(4)?,
+            importance: row.get(5)?,
+            confidence: row.get(6)?,
+            trust: row.get(7)?,
+            valid_from: row.get(8)?,
+            valid_until: row.get(9)?,
+            expires: row.get(10)?,
+            created: row.get(11)?,
+            updated: row.get(12)?,
+            title: row.get(13)?,
+            body: row.get(14)?,
+            attributes_json: row.get(15)?,
+            scope_json: row.get(16)?,
+        },
+        row.get::<_, bool>(17)?,
+    ))
+}
+
+fn load_memory_revisions_bounded(
+    connection: &Connection,
+    revisions: &[(MemoryId, u32)],
+    maximum_body_chars: usize,
+) -> Result<HashMap<MemoryId, Memory>> {
+    if revisions.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let maximum_body_chars = i64::try_from(maximum_body_chars)
+        .map_err(|_| Error::InvalidInput("body hydration limit is too large".into()))?;
+    let requested_values = std::iter::repeat_n("(?,?)", revisions.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let requested_cte =
+        format!("WITH requested(memory_id,revision) AS (VALUES {requested_values})");
+    let revision_params = || {
+        revisions.iter().flat_map(|(memory_id, revision)| {
+            [
+                SqlValue::Text(memory_id.to_string()),
+                SqlValue::Integer(i64::from(*revision)),
+            ]
+        })
+    };
+    let mut memories = HashMap::with_capacity(revisions.len());
+    {
+        let sql = format!(
+            "{requested_cte} SELECT r.memory_id,r.revision,m.kind,m.state,m.canonical_key,m.importance,m.confidence,m.trust,m.valid_from_ms,m.valid_until_ms,m.expires_at_ms,h.created_at_ms,r.recorded_at_ms,r.title,substr(r.body,1,{maximum_body_chars}),r.attributes_json,r.scope_json FROM requested q JOIN memory_revisions r ON r.memory_id=q.memory_id AND r.revision=q.revision JOIN memory_revision_metadata m ON m.memory_id=r.memory_id AND m.revision=r.revision JOIN memory_heads h ON h.memory_id=r.memory_id ORDER BY r.memory_id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok(RawMemoryRow {
+                    memory_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: row.get(3)?,
+                    canonical_key: row.get(4)?,
+                    importance: row.get(5)?,
+                    confidence: row.get(6)?,
+                    trust: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    expires: row.get(10)?,
+                    created: row.get(11)?,
+                    updated: row.get(12)?,
+                    title: row.get(13)?,
+                    body: row.get(14)?,
+                    attributes_json: row.get(15)?,
+                    scope_json: row.get(16)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in rows {
+            let (memory_id, memory) = memory_from_raw(row)?;
+            memories.insert(memory_id, memory);
+        }
+    }
+    if memories.len() != revisions.len() {
+        let missing = revisions
+            .iter()
+            .find(|(memory_id, revision)| {
+                memories
+                    .get(memory_id)
+                    .is_none_or(|memory| memory.revision != *revision)
+            })
+            .expect("different lengths imply a missing revision");
+        return Err(Error::NotFound {
+            kind: "memory revision",
+            id: format!("{}@{}", missing.0, missing.1),
+        });
+    }
+
+    {
+        let sql = format!(
+            "{requested_cte} SELECT t.memory_id,t.tag FROM requested q JOIN memory_tags t ON t.memory_id=q.memory_id AND t.revision=q.revision ORDER BY t.memory_id,t.normalized"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, tag) in rows {
+            memory_mut(&mut memories, &id)?.tags.push(tag);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT me.memory_id,e.kind,e.canonical,e.display FROM requested q JOIN memory_entities me ON me.memory_id=q.memory_id AND me.revision=q.revision JOIN entities e ON e.entity_id=me.entity_id ORDER BY me.memory_id,e.kind,e.canonical"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    EntityRef {
+                        kind: row.get(1)?,
+                        canonical: row.get(2)?,
+                        display: row.get(3)?,
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, entity) in rows {
+            memory_mut(&mut memories, &id)?.entities.push(entity);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language FROM requested q JOIN memory_artifacts ma ON ma.memory_id=q.memory_id AND ma.revision=q.revision JOIN artifacts a ON a.artifact_id=ma.artifact_id ORDER BY ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.git_oid,a.language,a.artifact_id"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                let symbol: String = row.get(3)?;
+                let content_hash: String = row.get(4)?;
+                let git_oid: String = row.get(5)?;
+                let language: String = row.get(6)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    ArtifactRef {
+                        repo_id: row.get(1)?,
+                        path: row.get(2)?,
+                        symbol: (!symbol.is_empty()).then_some(symbol),
+                        content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                        git_oid: (!git_oid.is_empty()).then_some(git_oid),
+                        language: (!language.is_empty()).then_some(language),
+                    },
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, artifact) in rows {
+            memory_mut(&mut memories, &id)?.artifacts.push(artifact);
+        }
+    }
+    {
+        let sql = format!(
+            "{requested_cte} SELECT me.memory_id,me.event_id,me.span_start,me.span_end,me.relation FROM requested q JOIN memory_evidence me ON me.memory_id=q.memory_id AND me.revision=q.revision ORDER BY me.memory_id,me.event_id,me.relation,me.span_start,me.span_end"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(revision_params()), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (id, event_id, span_start, span_end, relation) in rows {
+            memory_mut(&mut memories, &id)?.evidence.push(EvidenceRef {
+                event_id: parse_event_id(&event_id)?,
+                span_start: span_start.map(|value| value as usize),
+                span_end: span_end.map(|value| value as usize),
+                relation,
+            });
+        }
+    }
+    Ok(memories)
 }
 
 fn load_events(connection: &Connection, event_ids: &[EventId]) -> Result<Vec<Event>> {
@@ -3599,6 +4024,96 @@ fn load_memory_feedback(
             },
         )
         .collect()
+}
+
+fn load_candidate_memories(
+    connection: &Connection,
+    memory_ids: &[MemoryId],
+) -> Result<HashMap<MemoryId, Memory>> {
+    if memory_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders = sql_placeholders(memory_ids.len());
+    let id_params = || memory_ids.iter().map(ToString::to_string);
+    let mut memories = HashMap::with_capacity(memory_ids.len());
+    {
+        // SQLite substr counts Unicode scalar characters for TEXT values. The
+        // preview therefore has the same cross-platform bound for ASCII and
+        // non-ASCII memories without first transferring the complete body.
+        let sql = format!(
+            "SELECT h.memory_id,h.head_revision,h.kind,h.state,h.canonical_key,h.importance,h.confidence,h.trust,h.valid_from_ms,h.valid_until_ms,h.expires_at_ms,h.created_at_ms,h.updated_at_ms,r.title,substr(r.body,1,{MMR_BODY_PREVIEW_CHARS}),r.scope_json FROM memory_heads h JOIN memory_revisions r ON r.memory_id=h.memory_id AND r.revision=h.head_revision WHERE h.memory_id IN ({placeholders})"
+        );
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(id_params()), |row| {
+                Ok(RawMemoryRow {
+                    memory_id: row.get(0)?,
+                    revision: row.get(1)?,
+                    kind: row.get(2)?,
+                    state: row.get(3)?,
+                    canonical_key: row.get(4)?,
+                    importance: row.get(5)?,
+                    confidence: row.get(6)?,
+                    trust: row.get(7)?,
+                    valid_from: row.get(8)?,
+                    valid_until: row.get(9)?,
+                    expires: row.get(10)?,
+                    created: row.get(11)?,
+                    updated: row.get(12)?,
+                    title: row.get(13)?,
+                    body: row.get(14)?,
+                    // Attributes do not participate in applicability,
+                    // scoring, or MMR and are hydrated only for winners.
+                    attributes_json: "{}".to_owned(),
+                    scope_json: row.get(15)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for row in rows {
+            let (memory_id, memory) = memory_from_raw(row)?;
+            memories.insert(memory_id, memory);
+        }
+    }
+    if memories.len() != memory_ids.len() {
+        let missing = memory_ids
+            .iter()
+            .find(|id| !memories.contains_key(id))
+            .expect("different lengths imply a missing memory");
+        return Err(Error::NotFound {
+            kind: "memory",
+            id: missing.to_string(),
+        });
+    }
+
+    // Applicability and artifact verification use only attachments belonging
+    // to the head revision pinned by this read snapshot. Unhashed artifacts
+    // cannot establish freshness, while git OIDs and language labels are
+    // render-only metadata, so candidate staging does not transfer them.
+    let sql = format!(
+        "SELECT ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash FROM memory_artifacts ma JOIN memory_heads h ON h.memory_id=ma.memory_id AND h.head_revision=ma.revision JOIN artifacts a ON a.artifact_id=ma.artifact_id WHERE ma.memory_id IN ({placeholders}) AND a.content_hash!='' ORDER BY ma.memory_id,a.repo_id,a.path,a.symbol,a.content_hash,a.artifact_id"
+    );
+    let mut statement = connection.prepare(&sql)?;
+    let rows = statement
+        .query_map(params_from_iter(id_params()), |row| {
+            let symbol: String = row.get(3)?;
+            let content_hash: String = row.get(4)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                ArtifactRef {
+                    repo_id: row.get(1)?,
+                    path: row.get(2)?,
+                    symbol: (!symbol.is_empty()).then_some(symbol),
+                    content_hash: (!content_hash.is_empty()).then_some(content_hash),
+                    git_oid: None,
+                    language: None,
+                },
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (id, artifact) in rows {
+        memory_mut(&mut memories, &id)?.artifacts.push(artifact);
+    }
+    Ok(memories)
 }
 
 fn load_memories(
@@ -3868,14 +4383,7 @@ fn collect_fts(
         RetrievalSignal::CodeAlias,
         candidates,
     )?;
-    collect_fts_channel(
-        connection,
-        request,
-        eligibility,
-        &format!("expansions : ({loose})"),
-        RetrievalSignal::SemanticExpansion,
-        candidates,
-    )
+    collect_expansion_fts(connection, request, eligibility, &loose, candidates)
 }
 
 fn collect_fts_channel(
@@ -3905,6 +4413,32 @@ fn collect_fts_channel(
         )?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     add_candidates(candidates, ids, signal)
+}
+
+fn collect_expansion_fts(
+    connection: &Connection,
+    request: &RecallRequest,
+    eligibility: &CandidateEligibility,
+    query: &str,
+    candidates: &mut HashMap<MemoryId, Candidate>,
+) -> Result<()> {
+    let mut statement = connection.prepare_cached(EXPANSION_FTS_CANDIDATE_SQL)?;
+    let ids = statement
+        .query_map(
+            named_params! {
+                ":namespace": request.scope.namespace,
+                ":workspace": request.scope.workspace_id,
+                ":repo": request.scope.repo_id(),
+                ":query": query,
+                ":include_superseded": eligibility.include_superseded,
+                ":all_kinds": eligibility.all_kinds,
+                ":kinds": eligibility.kinds_json,
+                ":as_of": eligibility.as_of_ms,
+            },
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    add_candidates(candidates, ids, RetrievalSignal::SemanticExpansion)
 }
 
 fn collect_sparse(
@@ -4058,6 +4592,12 @@ fn collect_dense_with_exact_limit(
         ));
     }
     let profile = load_search_profile(connection, &query.profile_id)?;
+    if !profile.active {
+        return Err(Error::InvalidInput(format!(
+            "search profile {} is inactive",
+            profile.profile_id
+        )));
+    }
     let dimensions = profile.dimensions.ok_or_else(|| {
         Error::InvalidInput(format!(
             "search profile {} is expansion-only and cannot score a dense query",
@@ -4243,6 +4783,25 @@ fn prune_candidates(candidates: &mut HashMap<MemoryId, Candidate>, maximum: usiz
     });
     ordered.truncate(maximum);
     candidates.extend(ordered);
+}
+
+fn bound_mmr_pool(hits: &mut Vec<RecallHit>, limit: usize) {
+    hits.sort_by(|left, right| {
+        right
+            .score
+            .total_cmp(&left.score)
+            .then_with(|| left.memory.memory_id.cmp(&right.memory.memory_id))
+    });
+    let maximum = mmr_pool_limit(limit);
+    // Deliberate deterministic tail tradeoff: candidates below the stable
+    // score/ID cutoff cannot affect diversity selection. The pool still keeps
+    // at least 4x the requested results and 256 candidates, while bounding
+    // token-set construction and incremental MMR work for broad recalls.
+    hits.truncate(maximum);
+}
+
+fn mmr_pool_limit(limit: usize) -> usize {
+    limit.saturating_mul(4).clamp(MMR_MIN_POOL, MMR_MAX_POOL)
 }
 
 fn cached_git_relation<F>(
@@ -4838,7 +5397,45 @@ fn rebuild_all_fts(transaction: &Transaction<'_>) -> Result<()> {
             rebuild_fts_from_memory(transaction, *docid, memory)?;
         }
     }
+    rebuild_expansion_fts(transaction)?;
     Ok(())
+}
+
+fn rebuild_expansion_fts(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM search_expansion_fts", [])?;
+    connection.execute(
+        "INSERT INTO search_expansion_fts(rowid,expansion) SELECT rowid,expansion FROM search_projections WHERE expansion!='' ORDER BY profile_id,memory_id",
+        [],
+    )?;
+    Ok(())
+}
+
+fn repair_incomplete_fts(transaction: &Transaction<'_>) -> Result<()> {
+    loop {
+        let heads = transaction
+            .prepare_cached(
+                "SELECT h.memory_id,h.docid FROM memory_heads h LEFT JOIN search_alias_state s ON s.memory_id=h.memory_id AND s.revision=h.head_revision AND s.algorithm_version=?1 WHERE h.state!='retracted' AND s.memory_id IS NULL ORDER BY h.memory_id LIMIT 256",
+            )?
+            .query_map([CODE_ALIAS_VERSION], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if heads.is_empty() {
+            return Ok(());
+        }
+        let ids = heads
+            .iter()
+            .map(|(memory_id, _)| parse_memory_id(memory_id))
+            .collect::<Result<Vec<_>>>()?;
+        let memories = load_memories(transaction, &ids)?;
+        for ((_, docid), memory_id) in heads.iter().zip(ids) {
+            let memory = memories.get(&memory_id).ok_or_else(|| Error::NotFound {
+                kind: "memory",
+                id: memory_id.to_string(),
+            })?;
+            rebuild_fts_from_memory(transaction, *docid, memory)?;
+        }
+    }
 }
 
 fn ensure_search_indexes(connection: &mut Connection) -> Result<()> {
@@ -4851,7 +5448,7 @@ fn ensure_search_indexes(connection: &mut Connection) -> Result<()> {
     let still_incomplete: bool =
         transaction.query_row(ALIAS_INCOMPLETE_SQL, [CODE_ALIAS_VERSION], |row| row.get(0))?;
     if still_incomplete {
-        rebuild_all_fts(&transaction)?;
+        repair_incomplete_fts(&transaction)?;
     }
     transaction.commit()?;
     Ok(())
@@ -5119,6 +5716,192 @@ mod tests {
         assert_eq!(pack.hits.len(), 1);
         assert!(pack.estimated_tokens <= 80);
         assert!(pack.rendered.contains("cargo clean"));
+    }
+
+    #[test]
+    fn candidate_staging_bounds_unicode_previews_and_omits_heavy_attachments() {
+        let engine = engine();
+        let mut request = remember_request(
+            "Bounded candidate",
+            &format!("{}TAIL", "λ".repeat(MMR_BODY_PREVIEW_CHARS + 64)),
+        );
+        request.scope = repo_scope("staging", "session");
+        request
+            .attributes
+            .insert("payload".into(), json!([1, 2, 3]));
+        request.tags = vec!["bounded".into()];
+        request.entities = vec![EntityRef {
+            kind: "symbol".into(),
+            canonical: "bounded::candidate".into(),
+            display: "BoundedCandidate".into(),
+        }];
+        request.artifacts = vec![ArtifactRef {
+            repo_id: "staging".into(),
+            path: "src/lib.rs".into(),
+            symbol: Some("bounded_candidate".into()),
+            content_hash: Some("a".repeat(64)),
+            language: Some("rust".into()),
+            ..ArtifactRef::default()
+        }];
+        let memory_id = engine.remember(request).unwrap().memory_ids[0];
+
+        let connection = engine.lock().unwrap();
+        let staged = load_candidate_memories(&connection, &[memory_id]).unwrap();
+        let staged = staged.get(&memory_id).unwrap();
+        assert_eq!(staged.body.chars().count(), MMR_BODY_PREVIEW_CHARS);
+        assert!(!staged.body.contains("TAIL"));
+        assert!(staged.attributes.is_empty());
+        assert!(staged.tags.is_empty());
+        assert!(staged.entities.is_empty());
+        assert!(staged.evidence.is_empty());
+        assert_eq!(staged.artifacts.len(), 1);
+        assert_eq!(staged.artifacts[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn candidate_previews_preserve_mmr_selection_when_bodies_fit() {
+        let engine = engine();
+        let bodies = [
+            "alpha beta shared repair",
+            "alpha gamma distinct migration",
+            "delta epsilon release",
+            "beta shared alternative",
+            "zeta isolated verification",
+        ];
+        let memory_ids = bodies
+            .iter()
+            .enumerate()
+            .map(|(index, body)| {
+                engine
+                    .remember(remember_request(&format!("Candidate {index}"), body))
+                    .unwrap()
+                    .memory_ids[0]
+            })
+            .collect::<Vec<_>>();
+        let connection = engine.lock().unwrap();
+        let full = load_memories(&connection, &memory_ids).unwrap();
+        let staged = load_candidate_memories(&connection, &memory_ids).unwrap();
+        let hits = |memories: &HashMap<MemoryId, Memory>| {
+            memory_ids
+                .iter()
+                .enumerate()
+                .map(|(index, memory_id)| RecallHit {
+                    memory: memories[memory_id].clone(),
+                    score: 1.0 - index as f64 * 0.05,
+                    applicability: Applicability::Unversioned,
+                    signals: vec![RetrievalSignal::Lexical],
+                    reasons: vec!["lexical_match".into()],
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(memory_ids.iter().all(|memory_id| {
+            full[memory_id].body == staged[memory_id].body
+                && full[memory_id].title == staged[memory_id].title
+        }));
+        let full_selection = select_mmr(hits(&full), 3, 0.78)
+            .into_iter()
+            .map(|hit| hit.memory.memory_id)
+            .collect::<Vec<_>>();
+        let staged_selection = select_mmr(hits(&staged), 3, 0.78)
+            .into_iter()
+            .map(|hit| hit.memory.memory_id)
+            .collect::<Vec<_>>();
+        assert_eq!(staged_selection, full_selection);
+    }
+
+    #[test]
+    fn bounded_revision_body_preserves_context_truncation() {
+        let engine = engine();
+        let body = format!("bounded-prefix {} FINAL_TAIL", "x".repeat(8_000));
+        let memory_id = engine
+            .remember(remember_request("Bounded hydration", &body))
+            .unwrap()
+            .memory_ids[0];
+        let full = engine.get(memory_id).unwrap();
+        let token_budget = 120;
+        let maximum_body_chars = token_budget * 3 + 1;
+        let connection = engine.lock().unwrap();
+        let bounded = load_memory_revisions_bounded(
+            &connection,
+            &[(memory_id, full.revision)],
+            maximum_body_chars,
+        )
+        .unwrap()
+        .remove(&memory_id)
+        .unwrap();
+        drop(connection);
+        assert_eq!(bounded.body.chars().count(), maximum_body_chars);
+        assert!(!bounded.body.contains("FINAL_TAIL"));
+
+        let hit = |memory| RecallHit {
+            memory,
+            score: 1.0,
+            applicability: Applicability::Unversioned,
+            signals: vec![RetrievalSignal::Lexical],
+            reasons: vec!["lexical_match".into()],
+        };
+        let query_id = QueryId::new();
+        let full_pack = compile_context(query_id, 1, token_budget, vec![hit(full)]);
+        let bounded_pack = compile_context(query_id, 1, token_budget, vec![hit(bounded)]);
+        assert_eq!(bounded_pack.rendered, full_pack.rendered);
+        assert_eq!(
+            bounded_pack.sections[0].items[0].body,
+            full_pack.sections[0].items[0].body
+        );
+        assert_eq!(
+            bounded_pack.hits[0].memory.body,
+            full_pack.hits[0].memory.body
+        );
+        assert!(bounded_pack.hits[0].memory.body.ends_with('…'));
+    }
+
+    #[test]
+    fn pinned_revision_hydration_survives_head_advancement_between_snapshots() {
+        let engine = engine();
+        let mut first = remember_request("Pinned revision one", "immutable old body");
+        first.canonical_key = Some("pinned-revision".into());
+        first.tags = vec!["old-tag".into()];
+        let memory_id = engine.remember(first).unwrap().memory_ids[0];
+
+        let pinned_revision = {
+            let connection = engine.lock().unwrap();
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("begin read snapshot");
+            let staged = load_candidate_memories(&transaction, &[memory_id]).unwrap();
+            let revision = staged[&memory_id].revision;
+            transaction.commit().unwrap();
+            revision
+        };
+
+        let mut second = remember_request("Pinned revision two", "new head body");
+        second.canonical_key = Some("pinned-revision".into());
+        second.tags = vec!["new-tag".into()];
+        assert_eq!(engine.remember(second).unwrap().memory_ids[0], memory_id);
+
+        let connection = engine.lock().unwrap();
+        let pinned =
+            load_memory_revisions_bounded(&connection, &[(memory_id, pinned_revision)], 1_024)
+                .unwrap()
+                .remove(&memory_id)
+                .unwrap();
+        let current = load_memory(&connection, memory_id).unwrap();
+        assert_eq!(pinned.revision, pinned_revision);
+        assert_eq!(pinned.title, "Pinned revision one");
+        assert_eq!(pinned.body, "immutable old body");
+        assert_eq!(pinned.tags, ["old-tag"]);
+        assert_eq!(current.revision, pinned_revision + 1);
+        assert_eq!(current.title, "Pinned revision two");
+        assert_eq!(current.tags, ["new-tag"]);
+    }
+
+    #[test]
+    fn mmr_pool_is_broad_but_bounded() {
+        assert_eq!(mmr_pool_limit(1), 256);
+        assert_eq!(mmr_pool_limit(64), 256);
+        assert_eq!(mmr_pool_limit(100), 400);
+        assert_eq!(mmr_pool_limit(128), 512);
+        assert_eq!(mmr_pool_limit(usize::MAX), 512);
     }
 
     #[test]
@@ -5421,6 +6204,119 @@ mod tests {
     }
 
     #[test]
+    fn expansion_profiles_are_independent_reproducible_and_lifecycle_managed() {
+        let engine = engine();
+        let scope = repo_workspace_scope("profile-lifecycle", "workspace-a", "session-one");
+        let mut target = remember_request("Projection target", "Canonical wording only");
+        target.scope = scope.clone();
+        let target_id = engine.remember(target).unwrap().memory_ids[0];
+
+        for index in 0..5 {
+            let profile_id = format!("expansion-{index}");
+            engine
+                .register_search_profile(SearchProfileRegistration {
+                    profile_id: profile_id.clone(),
+                    model_digest: format!("fixed-generator-{index}"),
+                    dimensions: None,
+                })
+                .unwrap();
+            let source = engine
+                .pending_search_documents(&profile_id, scope.clone(), 1)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let expansions = vec![
+                format!("a{index}{}", "a".repeat(3_990)),
+                format!("b{index}{}", "b".repeat(3_990)),
+                format!("c{index}{}", "c".repeat(3_990)),
+                format!("zzzz unique_profile_tail_{index} {}", "z".repeat(3_950)),
+            ];
+            engine
+                .register_search_projections(RegisterSearchProjectionsRequest {
+                    scope: scope.clone(),
+                    profile_id,
+                    projections: vec![SearchProjectionInput {
+                        memory_id: target_id,
+                        revision: source.revision,
+                        content_hash: source.content_hash,
+                        expansions,
+                        vector: None,
+                    }],
+                })
+                .unwrap();
+        }
+
+        for index in 0..5 {
+            let pack = engine
+                .recall(RecallRequest {
+                    query: format!("unique_profile_tail_{index}"),
+                    scope: scope.clone(),
+                    ..RecallRequest::default()
+                })
+                .unwrap();
+            assert_eq!(pack.hits[0].memory.memory_id, target_id);
+            assert!(
+                pack.hits[0]
+                    .signals
+                    .contains(&RetrievalSignal::SemanticExpansion)
+            );
+        }
+
+        let source = engine
+            .pending_search_documents("expansion-4", scope.clone(), 1)
+            .unwrap();
+        assert!(source.is_empty());
+        let current = engine.get(target_id).unwrap();
+        let conflict = engine.register_search_projections(RegisterSearchProjectionsRequest {
+            scope: scope.clone(),
+            profile_id: "expansion-4".into(),
+            projections: vec![SearchProjectionInput {
+                memory_id: target_id,
+                revision: current.revision,
+                content_hash: memory_content_hash(&current.title, &current.body),
+                expansions: vec!["different output for the same immutable input".into()],
+                vector: None,
+            }],
+        });
+        assert!(matches!(conflict, Err(Error::Conflict(_))));
+
+        let inactive = engine
+            .set_search_profile_active("expansion-4", false)
+            .unwrap();
+        assert!(!inactive.active);
+        let inactive_pack = engine
+            .recall(RecallRequest {
+                query: "unique_profile_tail_4".into(),
+                scope: scope.clone(),
+                ..RecallRequest::default()
+            })
+            .unwrap();
+        assert!(
+            inactive_pack
+                .hits
+                .iter()
+                .all(|hit| { !hit.signals.contains(&RetrievalSignal::SemanticExpansion) })
+        );
+        assert!(
+            engine
+                .list_search_profiles()
+                .unwrap()
+                .iter()
+                .any(|profile| profile.profile_id == "expansion-4" && !profile.active)
+        );
+
+        assert!(engine.remove_search_profile("expansion-4").unwrap());
+        assert!(!engine.remove_search_profile("expansion-4").unwrap());
+        assert!(
+            engine
+                .list_search_profiles()
+                .unwrap()
+                .iter()
+                .all(|profile| profile.profile_id != "expansion-4")
+        );
+    }
+
+    #[test]
     fn deterministic_code_aliases_improve_runtime_error_recall() {
         let engine = engine();
         let mut relevant = remember_request(
@@ -5502,6 +6398,8 @@ mod tests {
                     result: "CI still failed".into(),
                     succeeded: false,
                     fingerprint: Some("link-sqlite3".into()),
+                    canonical_key: None,
+                    promotion_reason: None,
                 }],
                 open_tasks: vec!["Test Windows".into()],
                 ..CheckpointRequest::default()
@@ -5535,6 +6433,21 @@ mod tests {
                 content: "Fix the SQLite migration race".into(),
                 attributes: BTreeMap::from([("role".into(), json!("user"))]),
                 trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let mundane = engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "README.md\nsrc/lib.rs".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("rg --files")),
+                    ("succeeded".into(), json!(true)),
+                    ("verification".into(), json!(false)),
+                ]),
+                trust: TrustLevel::ToolVerified,
                 ..ObserveRequest::default()
             })
             .unwrap();
@@ -5584,7 +6497,14 @@ mod tests {
                 .iter()
                 .any(|evidence| evidence.event_id == tool.event_id)
         );
+        assert!(
+            episode
+                .evidence
+                .iter()
+                .any(|evidence| evidence.event_id == mundane.event_id)
+        );
         assert!(episode.body.contains("cargo test migration"));
+        assert!(!episode.body.contains("rg --files"));
 
         let second = engine
             .checkpoint_session(CheckpointRequest {
@@ -5610,6 +6530,162 @@ mod tests {
                 .evidence
                 .iter()
                 .any(|evidence| evidence.event_id == tool.event_id)
+        );
+    }
+
+    #[test]
+    fn automatic_checkpoint_coalesces_verification_history_without_command_noise() {
+        let engine = engine();
+        let mut scope = Scope {
+            session_id: Some("promotion-session-one".into()),
+            ..Scope::default()
+        };
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Make the workspace tests reliable".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        for index in 0..25 {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::CommandResult,
+                    scope: scope.clone(),
+                    content: format!("inspection output {index}"),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("command".into(), json!(format!("rg inspection_{index}"))),
+                        ("succeeded".into(), json!(true)),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+        for (content, succeeded) in [
+            ("workspace test failed: assertion mismatch", false),
+            ("workspace tests passed", true),
+        ] {
+            engine
+                .observe(ObserveRequest {
+                    kind: EventKind::CommandResult,
+                    scope: scope.clone(),
+                    content: content.into(),
+                    attributes: BTreeMap::from([
+                        ("tool_name".into(), json!("Bash")),
+                        ("command".into(), json!("cargo test --workspace")),
+                        ("succeeded".into(), json!(succeeded)),
+                        ("verification".into(), json!(true)),
+                        ("error_fingerprint".into(), json!("workspace-test-v1")),
+                    ]),
+                    trust: TrustLevel::ToolVerified,
+                    ..ObserveRequest::default()
+                })
+                .unwrap();
+        }
+
+        let first = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("promotion-checkpoint-one".into()),
+                scope: scope.clone(),
+                goal: "coding task".into(),
+                summary: "Fixed the test race".into(),
+                outcome: CheckpointOutcome::Success,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert_eq!(first.memory_ids.len(), 2);
+        let outcome_id = first.memory_ids[1];
+        let outcome = engine.get(outcome_id).unwrap();
+        assert_eq!(
+            outcome
+                .attributes
+                .get("promotion_reason")
+                .and_then(Value::as_str),
+            Some("verification")
+        );
+        assert!(outcome.body.contains("First failure:"));
+        assert!(
+            outcome
+                .body
+                .contains("Final result: workspace tests passed")
+        );
+        assert!(outcome.body.contains("Observed runs: 2"));
+        assert!(outcome.canonical_key.is_some());
+
+        scope.session_id = Some("promotion-session-two".into());
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::ConversationTurn,
+                scope: scope.clone(),
+                content: "Recheck the workspace tests".into(),
+                attributes: BTreeMap::from([("role".into(), json!("user"))]),
+                trust: TrustLevel::UserConfirmed,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        engine
+            .observe(ObserveRequest {
+                kind: EventKind::CommandResult,
+                scope: scope.clone(),
+                content: "workspace test failed again".into(),
+                attributes: BTreeMap::from([
+                    ("tool_name".into(), json!("Bash")),
+                    ("command".into(), json!("cargo test --workspace")),
+                    ("succeeded".into(), json!(false)),
+                    ("verification".into(), json!(true)),
+                    ("error_fingerprint".into(), json!("workspace-test-v1")),
+                ]),
+                trust: TrustLevel::ToolVerified,
+                ..ObserveRequest::default()
+            })
+            .unwrap();
+        let second = engine
+            .checkpoint_session(CheckpointRequest {
+                idempotency_key: Some("promotion-checkpoint-two".into()),
+                scope,
+                goal: "coding task".into(),
+                summary: "The regression returned".into(),
+                outcome: CheckpointOutcome::Failure,
+                ..CheckpointRequest::default()
+            })
+            .unwrap();
+        assert_eq!(second.memory_ids.len(), 2);
+        assert_eq!(second.memory_ids[1], outcome_id);
+        assert_eq!(engine.history(outcome_id).unwrap().revisions.len(), 2);
+    }
+
+    #[test]
+    fn checkpoint_classifier_distinguishes_negative_probes_and_real_failures() {
+        let mut event = SessionEvent {
+            event_id: "probe".into(),
+            kind: EventKind::CommandResult.as_str().into(),
+            content: String::new(),
+            attributes: BTreeMap::from([
+                ("command".into(), json!("rg missing_symbol src")),
+                ("exit_code".into(), json!(1)),
+                ("succeeded".into(), json!(false)),
+            ]),
+        };
+        assert_eq!(classify_checkpoint_event(&event), None);
+
+        event.attributes.insert("exit_code".into(), json!(2));
+        assert_eq!(
+            classify_checkpoint_event(&event),
+            Some(CheckpointPromotionReason::FailedExecution)
+        );
+
+        event.attributes.insert("succeeded".into(), json!(true));
+        event
+            .attributes
+            .insert("memory_salient".into(), json!(true));
+        assert_eq!(
+            classify_checkpoint_event(&event),
+            Some(CheckpointPromotionReason::ExplicitSalience)
         );
     }
 
@@ -5721,10 +6797,25 @@ mod tests {
         let connection = engine.lock().unwrap();
         let point = load_memories(&connection, &[first]).unwrap();
         let batch = load_memories(&connection, &[second, first]).unwrap();
+        let bounded = load_memory_revisions_bounded(
+            &connection,
+            &[
+                (second, batch[&second].revision),
+                (first, batch[&first].revision),
+            ],
+            1_024,
+        )
+        .unwrap();
         assert_eq!(
             serde_json::to_value(&point[&first]).unwrap(),
             serde_json::to_value(&batch[&first]).unwrap()
         );
+        for memory_id in [first, second] {
+            assert_eq!(
+                serde_json::to_value(&batch[&memory_id]).unwrap(),
+                serde_json::to_value(&bounded[&memory_id]).unwrap()
+            );
+        }
         assert_eq!(
             batch[&first]
                 .artifacts
@@ -7018,9 +8109,9 @@ mod tests {
         prune_candidates(&mut profile_candidates, 256);
         let candidate_elapsed = candidate_started.elapsed();
         let profile_ids = profile_candidates.keys().copied().collect::<Vec<_>>();
-        let materialize_started = Instant::now();
-        black_box(load_memories(&connection, &profile_ids).unwrap());
-        let materialize_elapsed = materialize_started.elapsed();
+        let staging_started = Instant::now();
+        black_box(load_candidate_memories(&connection, &profile_ids).unwrap());
+        let staging_elapsed = staging_started.elapsed();
         let feedback_started = Instant::now();
         black_box(feedback_utilities(&connection, &profile_ids).unwrap());
         let feedback_elapsed = feedback_started.elapsed();
@@ -7113,6 +8204,8 @@ mod tests {
                             result: "Successful benchmark outcome".into(),
                             succeeded: true,
                             fingerprint: Some(format!("benchmark-{index}")),
+                            canonical_key: None,
+                            promotion_reason: None,
                         }],
                         open_tasks: vec![format!("Follow-up {index}")],
                         ..CheckpointRequest::default()
@@ -7162,7 +8255,7 @@ mod tests {
             redaction.as_secs_f64() * 1_000_000.0 / REDACTIONS as f64,
         );
         println!(
-            "PERF_PHASE candidates={} candidate_us={} exact_us={} fts_us={} sparse_us={} entity_us={} error_us={} recent_us={} materialize_us={} feedback_us={}",
+            "PERF_PHASE candidates={} candidate_us={} exact_us={} fts_us={} sparse_us={} entity_us={} error_us={} recent_us={} staging_us={} feedback_us={}",
             profile_ids.len(),
             candidate_elapsed.as_micros(),
             exact_elapsed.as_micros(),
@@ -7171,7 +8264,7 @@ mod tests {
             entity_elapsed.as_micros(),
             error_elapsed.as_micros(),
             recent_elapsed.as_micros(),
-            materialize_elapsed.as_micros(),
+            staging_elapsed.as_micros(),
             feedback_elapsed.as_micros(),
         );
         println!("PERF_PLAN {plan:?}");

@@ -326,6 +326,48 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                     format!("registered search profile {}", profile.profile_id),
                 )?;
             }
+            IndexCommand::ListProfiles => {
+                let engine = open_engine(&database)?;
+                let profiles = engine.list_search_profiles()?;
+                print_value(
+                    &profiles,
+                    true,
+                    format!("{} search profiles", profiles.len()),
+                )?;
+            }
+            IndexCommand::Activate(arguments) => {
+                let engine = open_engine(&database)?;
+                let profile = engine.set_search_profile_active(&arguments.profile_id, true)?;
+                print_value(
+                    &profile,
+                    cli.json,
+                    format!("activated search profile {}", profile.profile_id),
+                )?;
+            }
+            IndexCommand::Deactivate(arguments) => {
+                let engine = open_engine(&database)?;
+                let profile = engine.set_search_profile_active(&arguments.profile_id, false)?;
+                print_value(
+                    &profile,
+                    cli.json,
+                    format!("deactivated search profile {}", profile.profile_id),
+                )?;
+            }
+            IndexCommand::RemoveProfile(arguments) => {
+                if !arguments.yes {
+                    bail!("refusing to remove a search profile without --yes");
+                }
+                let engine = open_engine(&database)?;
+                let removed = engine.remove_search_profile(&arguments.profile_id)?;
+                if !removed {
+                    bail!("search profile {} does not exist", arguments.profile_id);
+                }
+                print_value(
+                    &json!({ "removed": arguments.profile_id }),
+                    cli.json,
+                    "removed search profile and its rebuildable projections",
+                )?;
+            }
             IndexCommand::Pending(arguments) => {
                 let (engine, scope) = open_engine_and_scope(&database, &arguments.scope)?;
                 let documents = engine.pending_search_documents(
@@ -369,8 +411,9 @@ pub fn run_sync(cli: Cli) -> anyhow::Result<()> {
                     &status,
                     cli.json,
                     format!(
-                        "profile={} indexed={}/{} pending={} stale={}",
+                        "profile={} active={} indexed={}/{} pending={} stale={}",
                         status.profile.profile_id,
+                        status.profile.active,
                         status.indexed,
                         status.eligible,
                         status.pending,

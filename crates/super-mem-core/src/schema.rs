@@ -12,7 +12,7 @@ use rusqlite::{Connection, ErrorCode, OpenFlags};
 
 use crate::{Durability, EngineOptions, Error, Result};
 
-pub(crate) const SCHEMA_VERSION: u32 = 5;
+pub(crate) const SCHEMA_VERSION: u32 = 6;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
@@ -122,6 +122,9 @@ pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Re
         }
         if current < 5 {
             migrate_v5(connection)?;
+        }
+        if current < 6 {
+            migrate_v6(connection)?;
         }
         Ok(())
     })();
@@ -786,6 +789,79 @@ fn migrate_v5(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v6(connection: &Connection) -> Result<()> {
+    connection
+        .execute_batch(
+            r"
+            -- Generator identity remains immutable, while operators can
+            -- disable a profile without deleting expensive derived data.
+            CREATE TABLE search_profile_state (
+                profile_id         TEXT PRIMARY KEY,
+                active             INTEGER NOT NULL DEFAULT 1
+                    CHECK(active IN (0,1)),
+                FOREIGN KEY(profile_id) REFERENCES search_profiles(profile_id)
+                    ON DELETE CASCADE
+            );
+            INSERT INTO search_profile_state(profile_id,active)
+            SELECT profile_id,1 FROM search_profiles;
+            CREATE TRIGGER search_profiles_create_state
+            AFTER INSERT ON search_profiles
+            BEGIN
+                INSERT INTO search_profile_state(profile_id,active)
+                VALUES(NEW.profile_id,1);
+            END;
+
+            -- Expansion text is indexed per immutable profile projection.
+            -- Keeping one FTS row per projection prevents alphabetically
+            -- earlier profiles from consuming a shared per-memory byte cap.
+            CREATE VIRTUAL TABLE search_expansion_fts USING fts5(
+                expansion,
+                tokenize = 'unicode61 remove_diacritics 2',
+                content = '',
+                contentless_delete = 1
+            );
+            INSERT INTO search_expansion_fts(rowid,expansion)
+            SELECT rowid,expansion
+            FROM search_projections
+            WHERE expansion!='';
+
+            CREATE TRIGGER search_projections_expansion_insert
+            AFTER INSERT ON search_projections
+            WHEN NEW.expansion!=''
+            BEGIN
+                INSERT INTO search_expansion_fts(rowid,expansion)
+                VALUES(NEW.rowid,NEW.expansion);
+            END;
+            CREATE TRIGGER search_projections_expansion_update
+            AFTER UPDATE OF expansion ON search_projections
+            BEGIN
+                DELETE FROM search_expansion_fts WHERE rowid=OLD.rowid;
+                INSERT INTO search_expansion_fts(rowid,expansion)
+                SELECT NEW.rowid,NEW.expansion WHERE NEW.expansion!='';
+            END;
+            CREATE TRIGGER search_projections_expansion_delete
+            BEFORE DELETE ON search_projections
+            WHEN OLD.expansion!=''
+            BEGIN
+                DELETE FROM search_expansion_fts WHERE rowid=OLD.rowid;
+            END;
+
+            CREATE INDEX memory_link_revisions_target
+                ON memory_link_revisions(
+                    target_memory_id,
+                    source_memory_id,
+                    source_revision,
+                    weight DESC,
+                    relation
+                );
+
+            PRAGMA user_version=6;
+            ",
+        )
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Barrier};
@@ -931,7 +1007,7 @@ mod tests {
     }
 
     #[test]
-    fn v4_migration_adds_constrained_rebuildable_search_projections() {
+    fn v4_database_upgrades_through_search_profile_lifecycle() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
         migrate_v1(&connection).unwrap();
@@ -977,6 +1053,7 @@ mod tests {
             .unwrap();
 
         migrate_v5(&connection).unwrap();
+        migrate_v6(&connection).unwrap();
         assert_eq!(
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
@@ -1012,6 +1089,13 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert!(connection
+            .query_row(
+                "SELECT 1 FROM sqlite_schema WHERE type='table' AND name='search_expansion_fts'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .is_ok());
         assert_eq!(
             connection
                 .query_row("SELECT count(*) FROM search_alias_state", [], |row| {
@@ -1119,6 +1203,42 @@ mod tests {
                 ",
             )
             .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_profile_state WHERE active=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        connection
+            .execute(
+                "DELETE FROM search_profiles WHERE profile_id='expansion-v1'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM search_expansion_fts WHERE search_expansion_fts MATCH 'another'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
         assert!(
             connection
                 .execute(

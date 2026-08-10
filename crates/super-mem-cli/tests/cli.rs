@@ -76,6 +76,83 @@ fn help_exposes_the_complete_surface() {
 }
 
 #[test]
+fn search_profile_cli_lifecycle_is_explicit_and_reversible() {
+    let temp = TempDir::new().unwrap();
+    let database = temp.path().join("memory.sqlite3");
+    command(&database)
+        .args([
+            "--json",
+            "index",
+            "add-profile",
+            "--profile-id",
+            "cli-expansion-v1",
+            "--model-digest",
+            "fixture-generator-v1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"active\": true"));
+
+    command(&database)
+        .args(["index", "list-profiles"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cli-expansion-v1"));
+    command(&database)
+        .args([
+            "--json",
+            "index",
+            "deactivate",
+            "--profile-id",
+            "cli-expansion-v1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"active\": false"));
+    command(&database)
+        .args([
+            "--json",
+            "index",
+            "activate",
+            "--profile-id",
+            "cli-expansion-v1",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"active\": true"));
+
+    command(&database)
+        .args([
+            "index",
+            "remove-profile",
+            "--profile-id",
+            "cli-expansion-v1",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("without --yes"));
+    command(&database)
+        .args([
+            "--json",
+            "index",
+            "remove-profile",
+            "--profile-id",
+            "cli-expansion-v1",
+            "--yes",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"removed\": \"cli-expansion-v1\"",
+        ));
+    command(&database)
+        .args(["index", "list-profiles"])
+        .assert()
+        .success()
+        .stdout(predicate::eq("[]\n"));
+}
+
+#[test]
 fn async_library_entrypoint_remains_usable() {
     let temp = TempDir::new().unwrap();
     let database = temp.path().join("memory.sqlite3");

@@ -427,6 +427,7 @@ fn production_engine_registers_and_recalls_dense_projections() {
         })
         .unwrap();
     assert_eq!(profile.signature_version, 1);
+    assert!(profile.active);
     let pending = engine
         .pending_search_documents(&profile.profile_id, scope.clone(), 10)
         .unwrap();
