@@ -922,6 +922,7 @@ dependencies = [
  "assert_cmd",
  "blake3",
  "clap",
+ "libc",
  "predicates",
  "rmcp",
  "rusqlite",
@@ -941,6 +942,7 @@ version = "0.1.0"
 dependencies = [
  "blake3",
  "chrono",
+ "libc",
  "regex",
  "rusqlite",
  "schemars",
@@ -949,6 +951,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]

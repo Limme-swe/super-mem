@@ -166,3 +166,41 @@ Checkpoints fingerprint staged, unstaged, deleted, and untracked files when Git 
 | No repository identity | Results are unversioned; mismatched repositories remain excluded. |
 
 Stable idempotency keys prevent duplicate hook delivery from recording the same payload twice. Namespace, workspace, and repository filters are enforced in the Rust core rather than reimplemented by each adapter. Divergent memories are excluded unless the caller explicitly opts in.
+
+## Operator diagnosis
+
+Run `supermem --json doctor --cwd /absolute/repository` in the same environment
+that launches the harness. The report shows the resolved database, redacted
+scope-environment sources, installed binary identity, a credential-free bounded
+Git probe, the stored schema manifest, SQLite quick-check and foreign-key
+results, canonical cross-table relationships, writer-lock availability, and
+database-sidecar security. It does not create or migrate a missing/old store and
+does not recover or open live WAL or rollback-journal state; stop/checkpoint the
+owning writer before rerunning it. A descriptor/handle identity joins the file
+preflight to a native source lock. SQLite checks share a five-second work
+deadline and run against a stable private copy rather than the source path.
+Unix streams that copy into a mode-`0600` temporary file that is removed on
+normal completion; an abruptly killed process can leave the file in the OS
+temporary directory. Windows uses a capped in-memory copy so database contents
+do not inherit the temporary-directory ACL.
+Continuity starts with the command's first preflight: no pathname-only tool can
+infer that a different but valid store was already at the configured path
+before observation. Keep the database parent private from untrusted mutation;
+the report's identity digest lets repeated observations be correlated.
+A directory outside Git is a healthy `not_repository` state; a Git worktree
+marker that cannot be inspected is an error. The command exits nonzero for
+database, file-security, binary-resolution, or repository-discovery failures.
+
+File type, reparse/symlink, and hard-link checks run on every supported
+platform. Unix mode bits must be private. Windows reports
+`permissions_verified: false`; this command does not yet claim to audit NTFS
+ACL confidentiality.
+
+The report can contain machine-local paths, but raw scope environment values
+are never emitted. Review it before attaching it to an issue.
+
+`doctor` executes the `git` binary resolved from `PATH` with prompting and
+optional locks disabled, bounded output, and a two-second aggregate deadline.
+That binary is part of the caller's trusted executable environment: these
+bounds are diagnostics controls, not a sandbox for an adversarial replacement
+that deliberately launches detached processes.

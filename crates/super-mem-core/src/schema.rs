@@ -1,21 +1,101 @@
 //! `SQLite` schema and connection initialization.
 
 use std::{
+    fs,
     fs::File,
-    io::{ErrorKind, Read},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::Path,
     thread,
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, ErrorCode, OpenFlags, params};
+#[cfg(not(windows))]
+use std::io::Write;
 
-use crate::{Durability, EngineOptions, Error, Result, applicability::artifact_fingerprint};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, params};
+
+use crate::{
+    DatabaseDiagnostics, DatabaseInspection, Durability, EngineOptions, Error, Result,
+    applicability::artifact_fingerprint,
+};
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
+const MAX_INSPECTION_SQLITE_VALUE_BYTES: i32 = 4 * 1_024 * 1_024;
+const MAX_INSPECTION_SQL_TEXT_BYTES: i32 = 1_024 * 1_024;
+const INSPECTION_WORK_DEADLINE: Duration = Duration::from_secs(5);
+#[cfg(windows)]
+const MAX_WINDOWS_INSPECTION_SNAPSHOT_BYTES: u64 = 512 * 1_024 * 1_024;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
 /// unrelated files before destructive maintenance operations.
 pub const APPLICATION_ID: u32 = 0x534D_454D;
+
+/// Opaque identity captured from the same metadata snapshot a caller audited.
+///
+/// Passing this identity back to [`inspect_database_at_identity`] joins an
+/// outer file-security snapshot to the descriptor-pinned `SQLite` inspection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DatabaseFileIdentity(String);
+
+impl DatabaseFileIdentity {
+    /// Stable, machine-local diagnostic label for correlating before/after
+    /// observations without exposing raw device or file-index fields.
+    #[must_use]
+    pub fn diagnostic_digest(&self) -> String {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"super-mem doctor file identity v1\0");
+        hasher.update(self.0.as_bytes());
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+/// Captures the bounded file identity used to join a diagnostic snapshot to
+/// [`inspect_database_at_identity`].
+pub fn database_file_identity(
+    path: impl AsRef<Path>,
+    metadata: &fs::Metadata,
+) -> Result<DatabaseFileIdentity> {
+    platform_database_file_identity(path.as_ref(), metadata)
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn platform_database_file_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<DatabaseFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(DatabaseFileIdentity(format!(
+        "unix:{}:{}:{}:{}:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.mode(),
+        metadata.nlink()
+    )))
+}
+
+#[cfg(windows)]
+fn platform_database_file_identity(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<DatabaseFileIdentity> {
+    windows_database_file_identity(path, metadata)
+}
+
+#[cfg(not(any(unix, windows)))]
+#[allow(clippy::unnecessary_wraps)]
+fn platform_database_file_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<DatabaseFileIdentity> {
+    Ok(DatabaseFileIdentity(format!(
+        "fallback:{}:{:?}",
+        metadata.len(),
+        metadata.modified().ok()
+    )))
+}
 
 /// Checks a database's identity without creating or modifying it.
 ///
@@ -71,6 +151,1477 @@ pub fn is_super_mem_database(path: impl AsRef<Path>) -> Result<bool> {
     let version = u32::from_be_bytes([header[60], header[61], header[62], header[63]]);
     let application_id = u32::from_be_bytes([header[68], header[69], header[70], header[71]]);
     Ok(application_id == APPLICATION_ID && (1..=SCHEMA_VERSION).contains(&version))
+}
+
+/// Inspects an initialized database without creating it or running migrations.
+///
+/// When no WAL or rollback journal is present, the source is identity-pinned
+/// and protected with native `SQLite`-compatible locks. A stable copy is then
+/// streamed into a private temporary file on Unix or a bounded `SQLite`-owned
+/// allocation on Windows, and only that copy is opened by `SQLite`. The source
+/// and its sidecars are never opened by `SQLite`, created, recovered,
+/// checkpointed, or migrated.
+pub fn inspect_database(
+    path: impl AsRef<Path>,
+    writer_timeout_ms: u64,
+) -> Result<DatabaseInspection> {
+    let path = path.as_ref();
+    let expected = fs::symlink_metadata(path).map_err(Error::Io)?;
+    let expected_identity = database_file_identity(path, &expected)?;
+    inspect_database_at_identity(path, writer_timeout_ms, &expected_identity)
+}
+
+/// Inspects a database only if it is still the exact file captured by an
+/// earlier caller-owned metadata snapshot.
+///
+/// This closes the gap between a CLI file-security preflight and the pinned
+/// `SQLite` descriptor used for inspection. A path exchange at either boundary
+/// fails closed instead of inspecting a different valid store.
+pub fn inspect_database_at_identity(
+    path: impl AsRef<Path>,
+    writer_timeout_ms: u64,
+    expected_identity: &DatabaseFileIdentity,
+) -> Result<DatabaseInspection> {
+    const MAX_FINDINGS: usize = 32;
+    const MAX_FINDING_BYTES: usize = 1_024;
+
+    let path = path.as_ref();
+    if writer_timeout_ms == 0 {
+        return Err(Error::InvalidInput(
+            "database inspection writer timeout must be positive".into(),
+        ));
+    }
+    let identity_before = fs::symlink_metadata(path).map_err(Error::Io)?;
+    if database_file_identity(path, &identity_before)? != *expected_identity {
+        return Err(Error::InvalidInput(
+            "database identity changed after the caller's preflight snapshot".into(),
+        ));
+    }
+    if !identity_before.is_file() || identity_before.file_type().is_symlink() {
+        return Err(Error::InvalidInput(format!(
+            "database does not exist or is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let inspection_deadline = Instant::now() + INSPECTION_WORK_DEADLINE;
+    let pinned = pin_database(path, &identity_before, expected_identity)?;
+    if let Some(reason) = pinned.recovery_sidecar_blocker()? {
+        return Err(Error::Migration(reason));
+    }
+    let header_uses_wal = pinned.header_uses_wal()?;
+    let writer_probe = pinned.acquire_snapshot_guard(header_uses_wal)?;
+    #[cfg(not(windows))]
+    let snapshot = pinned.private_snapshot(inspection_deadline)?;
+    if let Some(reason) = pinned.recovery_sidecar_blocker()? {
+        return Err(Error::Migration(reason));
+    }
+
+    #[cfg(not(windows))]
+    let connection = {
+        let read_flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI;
+        let snapshot_uri = immutable_sqlite_uri(snapshot.path())?;
+        Connection::open_with_flags(&snapshot_uri, read_flags)?
+    };
+    #[cfg(windows)]
+    let connection = {
+        let length = pinned.database.metadata().map_err(Error::Io)?.len();
+        if length > MAX_WINDOWS_INSPECTION_SNAPSHOT_BYTES {
+            return Err(Error::InvalidInput(format!(
+                "database exceeds the {}-byte in-memory Windows inspection bound",
+                MAX_WINDOWS_INSPECTION_SNAPSHOT_BYTES
+            )));
+        }
+        let length = usize::try_from(length).map_err(|_| {
+            Error::InvalidInput("database is too large for this Windows process".into())
+        })?;
+        let source = pinned.database.try_clone().map_err(Error::Io)?;
+        let snapshot =
+            read_windows_inspection_snapshot(source, length, inspection_deadline, header_uses_wal)?;
+        let mut connection = Connection::open_in_memory()?;
+        connection.deserialize(rusqlite::MAIN_DB, snapshot, true)?;
+        if Instant::now() >= inspection_deadline {
+            return Err(Error::Migration(
+                "database snapshot exceeded the five-second inspection deadline".into(),
+            ));
+        }
+        connection
+    };
+    configure_inspection_connection(&connection, inspection_deadline)?;
+    connection.busy_timeout(Duration::from_millis(writer_timeout_ms))?;
+    connection.execute_batch("BEGIN;")?;
+    let schema_version = validate_identity(&connection)?;
+    if schema_version == 0 {
+        return Err(Error::Migration(
+            "database is not an initialized super-mem store".into(),
+        ));
+    }
+
+    let mut statement = connection.prepare("PRAGMA quick_check(33)")?;
+    let mut rows = statement.query([])?;
+    let mut quick_check_findings = Vec::new();
+    let mut quick_check_ok = true;
+    let mut quick_check_total = 0_usize;
+    while let Some(row) = rows.next()? {
+        let finding = row.get::<_, String>(0)?;
+        if finding == "ok" {
+            continue;
+        }
+        quick_check_ok = false;
+        quick_check_total = quick_check_total.saturating_add(1);
+        if quick_check_findings.len() < MAX_FINDINGS {
+            quick_check_findings.push(truncate_diagnostic(&finding, MAX_FINDING_BYTES));
+        }
+    }
+    let quick_check_truncated = quick_check_total > MAX_FINDINGS;
+    drop(rows);
+    drop(statement);
+
+    let mut statement = connection.prepare("SELECT 1 FROM pragma_foreign_key_check LIMIT 33")?;
+    let mut rows = statement.query([])?;
+    let mut foreign_key_violations = 0_u64;
+    while rows.next()?.is_some() {
+        foreign_key_violations = foreign_key_violations.saturating_add(1);
+    }
+    let foreign_key_violations_truncated = foreign_key_violations > MAX_FINDINGS as u64;
+    foreign_key_violations = foreign_key_violations.min(MAX_FINDINGS as u64);
+    drop(rows);
+    drop(statement);
+    let (schema_manifest_ok, schema_manifest_findings, schema_manifest_truncated) =
+        inspect_schema_manifest(&connection, schema_version, MAX_FINDINGS)?;
+    let (
+        application_invariants_ok,
+        application_invariant_findings,
+        application_invariant_findings_truncated,
+    ) = inspect_application_invariants(&connection, schema_version, MAX_FINDINGS)?;
+    let count = |sql: &str| -> Result<u64> {
+        let value: i64 = connection.query_row(sql, [], |row| row.get(0))?;
+        Ok(value.max(0) as u64)
+    };
+    let database_seq = connection
+        .query_row("SELECT coalesce(max(seq),0) FROM events", [], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .max(0);
+    let page_count: i64 = connection.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+    let page_size: i64 = connection.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+    let events = count("SELECT count(*) FROM events")?;
+    let active_memories =
+        count("SELECT count(*) FROM memory_heads WHERE state IN ('active','contested')")?;
+    let superseded_memories = count("SELECT count(*) FROM memory_heads WHERE state='superseded'")?;
+    let retracted_memories = count("SELECT count(*) FROM memory_heads WHERE state='retracted'")?;
+    connection.execute_batch("ROLLBACK;")?;
+    drop(connection);
+
+    let identity_after_read = pinned.metadata()?;
+    if !same_file_identity(&identity_before, &identity_after_read) {
+        return Err(Error::InvalidInput(
+            "database path identity changed during read-only inspection".into(),
+        ));
+    }
+
+    let (writer_lock_checked, writer_lock_available, writer_lock_error) =
+        writer_probe.diagnostics(MAX_FINDING_BYTES);
+    let identity_after_probe = pinned.metadata()?;
+    if !same_file_identity(&identity_before, &identity_after_probe) {
+        return Err(Error::InvalidInput(
+            "database path identity changed during writer-lock probe".into(),
+        ));
+    }
+    let healthy = quick_check_ok
+        && foreign_key_violations == 0
+        && schema_manifest_ok
+        && application_invariants_ok
+        && schema_version == SCHEMA_VERSION
+        && writer_lock_checked
+        && writer_lock_available;
+    Ok(DatabaseInspection {
+        schema_version,
+        database_seq,
+        events,
+        active_memories,
+        superseded_memories,
+        retracted_memories,
+        database_bytes: page_count.max(0).saturating_mul(page_size.max(0)) as u64,
+        diagnostics: DatabaseDiagnostics {
+            quick_check_ok,
+            quick_check_findings,
+            quick_check_truncated,
+            foreign_key_violations,
+            foreign_key_violations_truncated,
+            schema_manifest_ok,
+            schema_current: schema_version == SCHEMA_VERSION,
+            schema_manifest_findings,
+            schema_manifest_truncated,
+            application_invariants_ok,
+            application_invariant_findings,
+            application_invariant_findings_truncated,
+            writer_lock_checked,
+            writer_lock_available,
+            writer_lock_error,
+            healthy,
+        },
+    })
+}
+
+#[cfg(any(windows, test))]
+struct WindowsInspectionSnapshotReader {
+    source: File,
+    offset: usize,
+    deadline: Instant,
+    normalize_wal_header: bool,
+}
+
+#[cfg(any(windows, test))]
+#[allow(unsafe_code)]
+fn read_windows_inspection_snapshot(
+    mut source: File,
+    length: usize,
+    deadline: Instant,
+    normalize_wal_header: bool,
+) -> Result<rusqlite::serialize::OwnedData> {
+    source.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+    let mut reader = WindowsInspectionSnapshotReader {
+        source,
+        offset: 0,
+        deadline,
+        normalize_wal_header,
+    };
+    let allocation_bytes = u64::try_from(length).map_err(|_| {
+        Error::InvalidInput("database is too large for SQLite's snapshot allocator".into())
+    })?;
+    let pointer = unsafe { rusqlite::ffi::sqlite3_malloc64(allocation_bytes) }.cast::<u8>();
+    let pointer = std::ptr::NonNull::new(pointer).ok_or_else(|| {
+        Error::Migration(format!(
+            "SQLite could not allocate the {length}-byte Windows inspection snapshot"
+        ))
+    })?;
+    // SAFETY: `pointer` came from `sqlite3_malloc64`; ownership is transferred
+    // before any fallible read, so every error or panic frees the allocation.
+    let snapshot = unsafe { rusqlite::serialize::OwnedData::from_raw_nonnull(pointer, length) };
+    // SAFETY: the allocation is exactly `length` bytes and remains exclusively
+    // owned by `snapshot` for the duration of this initialization.
+    let output = unsafe { std::slice::from_raw_parts_mut(pointer.as_ptr(), length) };
+    reader.read_exact(output).map_err(Error::Io)?;
+    if Instant::now() >= deadline {
+        return Err(Error::Migration(
+            "database snapshot exceeded the five-second inspection deadline".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(any(windows, test))]
+impl Read for WindowsInspectionSnapshotReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "database snapshot exceeded the five-second inspection deadline",
+            ));
+        }
+        let bounded = output.len().min(64 * 1_024);
+        let read = self.source.read(&mut output[..bounded])?;
+        if self.normalize_wal_header {
+            for header_offset in [18_usize, 19] {
+                if (self.offset..self.offset.saturating_add(read)).contains(&header_offset) {
+                    output[header_offset - self.offset] = 1;
+                }
+            }
+        }
+        self.offset = self.offset.saturating_add(read);
+        Ok(read)
+    }
+}
+
+fn configure_inspection_connection(connection: &Connection, deadline: Instant) -> Result<()> {
+    connection.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        MAX_INSPECTION_SQLITE_VALUE_BYTES,
+    )?;
+    connection.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH,
+        MAX_INSPECTION_SQL_TEXT_BYTES,
+    )?;
+    connection.progress_handler(1_000, Some(move || Instant::now() >= deadline))?;
+    Ok(())
+}
+
+pub(crate) fn inspect_schema_manifest(
+    connection: &Connection,
+    schema_version: u32,
+    maximum_findings: usize,
+) -> Result<(bool, Vec<String>, bool)> {
+    const MAX_SCHEMA_OBJECTS: usize = 512;
+    const MAX_SCHEMA_TYPE_BYTES: i64 = 64;
+    const MAX_SCHEMA_NAME_BYTES: i64 = 1_024;
+    const MAX_SCHEMA_SQL_BYTES: i64 = 64 * 1_024;
+    let expected = Connection::open_in_memory()?;
+    migrate_v1(&expected)?;
+    if schema_version >= 2 {
+        migrate_v2(&expected)?;
+    }
+    if schema_version >= 3 {
+        migrate_v3(&expected)?;
+    }
+    if schema_version >= 4 {
+        migrate_v4(&expected)?;
+    }
+    if schema_version >= 5 {
+        migrate_v5(&expected)?;
+    }
+    if schema_version >= 6 {
+        migrate_v6(&expected)?;
+    }
+
+    let mut statement = expected.prepare(
+        "SELECT type,name,tbl_name,sql FROM sqlite_schema
+         ORDER BY type,name",
+    )?;
+    let mut expected_objects = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?
+        .map(|object| {
+            object.map(|(object_type, name, table, sql)| ((object_type, name), (table, sql)))
+        })
+        .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()?;
+    let mut actual_statement = connection.prepare(
+        "SELECT length(CAST(type AS BLOB)),substr(CAST(type AS BLOB),1,65),
+                length(CAST(name AS BLOB)),substr(CAST(name AS BLOB),1,1025),
+                length(CAST(tbl_name AS BLOB)),substr(CAST(tbl_name AS BLOB),1,1025),
+                length(CAST(sql AS BLOB)),substr(CAST(sql AS BLOB),1,65537)
+         FROM sqlite_schema LIMIT 513",
+    )?;
+    let mut actual_objects = actual_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, Vec<u8>>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
+                row.get::<_, Option<Vec<u8>>>(7)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    actual_objects.sort_by(|left, right| (&left.1, &left.3).cmp(&(&right.1, &right.3)));
+    let mut findings = Vec::new();
+    let mut total_findings = 0_usize;
+    let mut record = |finding: String| {
+        total_findings = total_findings.saturating_add(1);
+        if findings.len() < maximum_findings {
+            findings.push(finding);
+        }
+    };
+    if actual_objects.len() > MAX_SCHEMA_OBJECTS {
+        record(format!("more than {MAX_SCHEMA_OBJECTS} schema objects"));
+        actual_objects.truncate(MAX_SCHEMA_OBJECTS);
+    }
+    for (
+        object_type_length,
+        object_type_bytes,
+        name_length,
+        name_bytes,
+        table_length,
+        table_bytes,
+        actual_sql_length,
+        actual_sql,
+    ) in actual_objects
+    {
+        if object_type_length > MAX_SCHEMA_TYPE_BYTES {
+            record("oversized schema object type".into());
+            continue;
+        }
+        let object_type = String::from_utf8(object_type_bytes)
+            .map_err(|_| Error::Migration("schema object type is not valid UTF-8".into()))?;
+        if name_length > MAX_SCHEMA_NAME_BYTES || table_length > MAX_SCHEMA_NAME_BYTES {
+            record(format!("oversized {object_type} schema identifier"));
+            continue;
+        }
+        let name = String::from_utf8(name_bytes)
+            .map_err(|_| Error::Migration("schema object name is not valid UTF-8".into()))?;
+        let table = String::from_utf8(table_bytes)
+            .map_err(|_| Error::Migration("schema table name is not valid UTF-8".into()))?;
+        let key = (object_type.clone(), name.clone());
+        let Some((expected_table, expected_sql)) = expected_objects.remove(&key) else {
+            record(format!("unexpected {object_type} {name}"));
+            continue;
+        };
+        let matches = table == expected_table
+            && match (expected_sql.as_deref(), actual_sql_length, actual_sql) {
+                (None, None, None) => true,
+                (Some(expected_sql), Some(length), Some(actual_sql))
+                    if length <= MAX_SCHEMA_SQL_BYTES =>
+                {
+                    String::from_utf8(actual_sql).is_ok_and(|actual_sql| {
+                        normalize_schema_sql(&actual_sql) == normalize_schema_sql(expected_sql)
+                    })
+                }
+                _ => false,
+            };
+        if !matches {
+            record(format!("changed {object_type} {name}"));
+        }
+    }
+    for ((object_type, name), _) in expected_objects {
+        record(format!("missing {object_type} {name}"));
+    }
+    Ok((
+        total_findings == 0,
+        findings,
+        total_findings > maximum_findings,
+    ))
+}
+
+pub(crate) fn inspect_application_invariants(
+    connection: &Connection,
+    schema_version: u32,
+    maximum_findings: usize,
+) -> Result<(bool, Vec<String>, bool)> {
+    let mut findings = Vec::new();
+    let mut total_findings = 0_usize;
+    let mut check = |name: &str, sql: &str| -> Result<()> {
+        if connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .optional()?
+            .is_some()
+        {
+            total_findings = total_findings.saturating_add(1);
+            if findings.len() < maximum_findings {
+                findings.push(name.to_owned());
+            }
+        }
+        Ok(())
+    };
+    check(
+        "memory_head_without_head_revision",
+        "SELECT 1
+         FROM memory_heads h
+         WHERE NOT EXISTS (
+             SELECT 1 FROM memory_revisions r
+             WHERE r.memory_id=h.memory_id AND r.revision=h.head_revision
+         )
+         LIMIT 1",
+    )?;
+    check(
+        "memory_head_revision_not_latest",
+        "SELECT 1
+         FROM memory_heads h
+         WHERE EXISTS (
+             SELECT 1 FROM memory_revisions r
+             WHERE r.memory_id=h.memory_id AND r.revision>h.head_revision
+         )
+         LIMIT 1",
+    )?;
+    if schema_version >= 4 {
+        check(
+            "memory_revision_without_metadata",
+            "SELECT 1
+             FROM memory_revisions r
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM memory_revision_metadata m
+                 WHERE m.memory_id=r.memory_id AND m.revision=r.revision
+             )
+             LIMIT 1",
+        )?;
+    }
+    Ok((
+        total_findings == 0,
+        findings,
+        total_findings > maximum_findings,
+    ))
+}
+
+fn normalize_schema_sql(value: &str) -> String {
+    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(not(unix))]
+fn recovery_sidecar_blocker(path: &Path) -> Option<String> {
+    let wal = sidecar_path(path, "-wal");
+    let shm = sidecar_path(path, "-shm");
+    let journal = sidecar_path(path, "-journal");
+    if journal.exists() {
+        return Some(
+            "database has a rollback journal; recovery is required before inspection".into(),
+        );
+    }
+    let wal_present = wal.exists();
+    let shm_present = shm.exists();
+    if wal_present != shm_present {
+        return Some(
+            "database has an incomplete WAL sidecar set; recovery is required before inspection"
+                .into(),
+        );
+    }
+    wal_present.then(|| {
+        "database has live WAL state; observational inspection is unavailable until it is checkpointed"
+            .into()
+    })
+}
+
+#[cfg(any(not(unix), test))]
+fn sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    value.into()
+}
+
+fn immutable_sqlite_uri(path: &Path) -> Result<std::path::PathBuf> {
+    let path = path.to_str().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "private SQLite snapshot path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })?;
+    let mut uri = String::with_capacity(path.len().saturating_mul(3).saturating_add(18));
+    uri.push_str("file:");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/' | b':') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            write!(uri, "%{byte:02X}").expect("writing to String cannot fail");
+        }
+    }
+    uri.push_str("?immutable=1");
+    Ok(uri.into())
+}
+
+#[cfg(not(windows))]
+fn private_database_snapshot(
+    database: &File,
+    deadline: Instant,
+) -> Result<tempfile::NamedTempFile> {
+    let before = database.metadata().map_err(Error::Io)?;
+    let mut source = database.try_clone().map_err(Error::Io)?;
+    source.seek(SeekFrom::Start(0)).map_err(Error::Io)?;
+    let mut snapshot = tempfile::Builder::new()
+        .prefix("super-mem-doctor-")
+        .tempfile()
+        .map_err(Error::Io)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        snapshot
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(Error::Io)?;
+    }
+    let mut copied = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1_024];
+    loop {
+        if Instant::now() >= deadline {
+            return Err(Error::Migration(
+                "database snapshot exceeded the five-second inspection deadline".into(),
+            ));
+        }
+        let read = source.read(&mut buffer).map_err(Error::Io)?;
+        if read == 0 {
+            break;
+        }
+        snapshot.write_all(&buffer[..read]).map_err(Error::Io)?;
+        copied = copied.saturating_add(read as u64);
+        if copied > before.len() {
+            return Err(Error::InvalidInput(
+                "database grew while creating the private inspection snapshot".into(),
+            ));
+        }
+    }
+    snapshot.flush().map_err(Error::Io)?;
+    if copied != before.len() {
+        return Err(Error::InvalidInput(format!(
+            "database length changed while creating the private inspection snapshot: expected {} bytes, copied {copied}",
+            before.len()
+        )));
+    }
+    let after = database.metadata().map_err(Error::Io)?;
+    if !same_file_identity(&before, &after) {
+        return Err(Error::InvalidInput(
+            "database identity changed while creating the private inspection snapshot".into(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+struct SnapshotGuard {
+    #[cfg(any(unix, windows))]
+    file: File,
+    #[cfg(any(unix, windows))]
+    shared_locked: bool,
+    #[cfg(any(unix, windows))]
+    reserved_locked: bool,
+    available: bool,
+    error: Option<String>,
+}
+
+impl SnapshotGuard {
+    fn diagnostics(&self, maximum_error_bytes: usize) -> (bool, bool, Option<String>) {
+        (
+            true,
+            self.available,
+            self.error
+                .as_deref()
+                .map(|error| truncate_diagnostic(error, maximum_error_bytes)),
+        )
+    }
+}
+
+#[cfg(unix)]
+struct PinnedDatabase {
+    directory: File,
+    database: File,
+    database_name: std::ffi::OsString,
+}
+
+#[cfg(unix)]
+impl PinnedDatabase {
+    fn recovery_sidecar_blocker(&self) -> Result<Option<String>> {
+        unix_recovery_sidecar_blocker(&self.directory, &self.database_name)
+    }
+
+    fn metadata(&self) -> Result<fs::Metadata> {
+        self.database.metadata().map_err(Error::Io)
+    }
+
+    fn header_uses_wal(&self) -> Result<bool> {
+        header_uses_wal(&self.database)
+    }
+
+    fn acquire_snapshot_guard(&self, header_uses_wal: bool) -> Result<SnapshotGuard> {
+        acquire_unix_snapshot_guard(self, header_uses_wal)
+    }
+
+    fn private_snapshot(&self, deadline: Instant) -> Result<tempfile::NamedTempFile> {
+        private_database_snapshot(&self.database, deadline)
+    }
+}
+
+#[cfg(unix)]
+fn pin_database(
+    path: &Path,
+    expected: &fs::Metadata,
+    _expected_identity: &DatabaseFileIdentity,
+) -> Result<PinnedDatabase> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(Error::Io)?.join(path)
+    };
+    reject_linked_parent_components(&absolute)?;
+    let parent = absolute.parent().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "database path has no parent: {}",
+            absolute.display()
+        ))
+    })?;
+    let expected_parent = fs::symlink_metadata(parent).map_err(Error::Io)?;
+    if !expected_parent.is_dir() || expected_parent.file_type().is_symlink() {
+        return Err(Error::InvalidInput(format!(
+            "database parent is not a real directory: {}",
+            parent.display()
+        )));
+    }
+    let mut directory_options = fs::OpenOptions::new();
+    directory_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let directory = directory_options.open(parent).map_err(Error::Io)?;
+    if !same_file_identity(&expected_parent, &directory.metadata().map_err(Error::Io)?) {
+        return Err(Error::InvalidInput(
+            "database parent identity changed while it was pinned".into(),
+        ));
+    }
+
+    let name = absolute.file_name().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "database path has no file name: {}",
+            absolute.display()
+        ))
+    })?;
+    let database = open_unix_database_at(&directory, name, false)?;
+    let opened = database.metadata().map_err(Error::Io)?;
+    if !opened.is_file() || !same_file_identity(expected, &opened) {
+        return Err(Error::InvalidInput(
+            "database identity changed while it was pinned".into(),
+        ));
+    }
+    Ok(PinnedDatabase {
+        directory,
+        database,
+        database_name: name.to_os_string(),
+    })
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn open_unix_database_at(directory: &File, name: &std::ffi::OsStr, write: bool) -> Result<File> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
+
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        Error::InvalidInput("database file name contains an embedded NUL byte".into())
+    })?;
+    let access = if write { libc::O_RDWR } else { libc::O_RDONLY };
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            access | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn unix_recovery_sidecar_blocker(
+    directory: &File,
+    database_name: &std::ffi::OsStr,
+) -> Result<Option<String>> {
+    let journal_present = unix_relative_entry_exists(directory, database_name, "-journal")?;
+    if journal_present {
+        return Ok(Some(
+            "database has a rollback journal; recovery is required before inspection".into(),
+        ));
+    }
+    let wal_present = unix_relative_entry_exists(directory, database_name, "-wal")?;
+    let shm_present = unix_relative_entry_exists(directory, database_name, "-shm")?;
+    if wal_present != shm_present {
+        return Ok(Some(
+            "database has an incomplete WAL sidecar set; recovery is required before inspection"
+                .into(),
+        ));
+    }
+    Ok(wal_present.then(|| {
+        "database has live WAL state; observational inspection is unavailable until it is checkpointed"
+            .into()
+    }))
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unix_relative_entry_exists(
+    directory: &File,
+    database_name: &std::ffi::OsStr,
+    suffix: &str,
+) -> Result<bool> {
+    use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
+
+    let mut name = database_name.to_os_string();
+    name.push(suffix);
+    let name = std::ffi::CString::new(name.as_bytes()).map_err(|_| {
+        Error::InvalidInput("database sidecar name contains an embedded NUL byte".into())
+    })?;
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        Ok(false)
+    } else {
+        Err(Error::Io(error))
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn acquire_unix_snapshot_guard(
+    pinned: &PinnedDatabase,
+    header_uses_wal: bool,
+) -> Result<SnapshotGuard> {
+    use std::os::unix::io::AsRawFd;
+
+    let parent_writable = unix_effective_parent_writable(&pinned.directory)?;
+    let (file, main_writable, mut error) =
+        match open_unix_database_at(&pinned.directory, &pinned.database_name, true) {
+            Ok(file) => (file, true, None),
+            Err(open_error) => (
+                pinned.database.try_clone().map_err(Error::Io)?,
+                false,
+                Some(format!(
+                    "database is not writable through its pinned file descriptor: {open_error}"
+                )),
+            ),
+        };
+    if !same_file_identity(
+        &pinned.database.metadata().map_err(Error::Io)?,
+        &file.metadata().map_err(Error::Io)?,
+    ) {
+        return Err(Error::InvalidInput(
+            "database identity changed while acquiring the inspection lock".into(),
+        ));
+    }
+    acquire_unix_shared_snapshot_lock(file.as_raw_fd())?;
+    if !parent_writable {
+        error.get_or_insert_with(|| {
+            "database parent does not grant effective write and search access".into()
+        });
+    }
+    let reserved_locked = if header_uses_wal || !main_writable || !parent_writable {
+        false
+    } else {
+        unix_set_lock(
+            file.as_raw_fd(),
+            libc::F_WRLCK as libc::c_int,
+            SQLITE_RESERVED_BYTE,
+            1,
+        )?
+    };
+    if !header_uses_wal && main_writable && parent_writable && !reserved_locked {
+        error.get_or_insert_with(|| "SQLite reserved writer lock is already held".into());
+    }
+    let available = main_writable && parent_writable && (header_uses_wal || reserved_locked);
+    Ok(SnapshotGuard {
+        file,
+        shared_locked: true,
+        reserved_locked,
+        available,
+        error,
+    })
+}
+
+#[cfg(any(unix, windows))]
+const SQLITE_PENDING_BYTE: i64 = 0x4000_0000;
+#[cfg(any(unix, windows))]
+const SQLITE_RESERVED_BYTE: i64 = SQLITE_PENDING_BYTE + 1;
+#[cfg(any(unix, windows))]
+const SQLITE_SHARED_FIRST: i64 = SQLITE_PENDING_BYTE + 2;
+#[cfg(any(unix, windows))]
+const SQLITE_SHARED_SIZE: i64 = 510;
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unix_effective_parent_writable(directory: &File) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe {
+        libc::faccessat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::W_OK | libc::X_OK,
+            libc::AT_EACCESS,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+        Ok(false)
+    } else {
+        Err(Error::Io(error))
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn unix_set_lock(
+    fd: std::os::fd::RawFd,
+    lock_type: libc::c_int,
+    start: i64,
+    len: i64,
+) -> Result<bool> {
+    let mut lock = libc::flock {
+        l_type: lock_type as _,
+        l_whence: libc::SEEK_SET as _,
+        l_start: start as _,
+        l_len: len as _,
+        l_pid: 0,
+    };
+    let command = unix_open_description_lock_command()?;
+    let result = unsafe { libc::fcntl(fd, command, &raw mut lock) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EAGAIN)) {
+        Ok(false)
+    } else {
+        Err(Error::Io(error))
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unnecessary_wraps)]
+fn unix_open_description_lock_command() -> Result<libc::c_int> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    {
+        Ok(libc::F_OFD_SETLK)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    {
+        Err(Error::Migration(
+            "observational inspection requires open-file-description locks on this Unix platform"
+                .into(),
+        ))
+    }
+}
+
+#[cfg(unix)]
+fn acquire_unix_shared_snapshot_lock(fd: std::os::fd::RawFd) -> Result<()> {
+    let pending_locked = unix_set_lock(fd, libc::F_RDLCK as libc::c_int, SQLITE_PENDING_BYTE, 1)?;
+    if !pending_locked {
+        return Err(Error::Migration(
+            "database has a pending writer; a stable inspection snapshot cannot be created".into(),
+        ));
+    }
+
+    let shared = unix_set_lock(
+        fd,
+        libc::F_RDLCK as libc::c_int,
+        SQLITE_SHARED_FIRST,
+        SQLITE_SHARED_SIZE,
+    );
+    match shared {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = unix_set_lock(fd, libc::F_UNLCK as libc::c_int, SQLITE_PENDING_BYTE, 1);
+            return Err(Error::Migration(
+                "database has an exclusive lock; a stable inspection snapshot cannot be created"
+                    .into(),
+            ));
+        }
+        Err(error) => {
+            let _ = unix_set_lock(fd, libc::F_UNLCK as libc::c_int, SQLITE_PENDING_BYTE, 1);
+            return Err(error);
+        }
+    }
+
+    match unix_set_lock(fd, libc::F_UNLCK as libc::c_int, SQLITE_PENDING_BYTE, 1) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            let _ = unix_set_lock(
+                fd,
+                libc::F_UNLCK as libc::c_int,
+                SQLITE_SHARED_FIRST,
+                SQLITE_SHARED_SIZE,
+            );
+            Err(Error::Migration(
+                "database pending-byte lock could not be released after snapshot acquisition"
+                    .into(),
+            ))
+        }
+        Err(error) => {
+            let _ = unix_set_lock(
+                fd,
+                libc::F_UNLCK as libc::c_int,
+                SQLITE_SHARED_FIRST,
+                SQLITE_SHARED_SIZE,
+            );
+            Err(error)
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        if self.reserved_locked {
+            let _ = unix_set_lock(
+                self.file.as_raw_fd(),
+                libc::F_UNLCK as libc::c_int,
+                SQLITE_RESERVED_BYTE,
+                1,
+            );
+        }
+        if self.shared_locked {
+            let _ = unix_set_lock(
+                self.file.as_raw_fd(),
+                libc::F_UNLCK as libc::c_int,
+                SQLITE_SHARED_FIRST,
+                SQLITE_SHARED_SIZE,
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+fn reject_linked_parent_components(path: &Path) -> Result<()> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(Error::Io)?.join(path)
+    };
+    let parent = absolute.parent().ok_or_else(|| {
+        Error::InvalidInput(format!("database path has no parent: {}", path.display()))
+    })?;
+    let mut cursor = std::path::PathBuf::new();
+    for component in parent.components() {
+        cursor.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&cursor).map_err(Error::Io)?;
+        if metadata.file_type().is_symlink() && !trusted_system_path_alias(&cursor, &metadata) {
+            return Err(Error::InvalidInput(format!(
+                "database parent contains a symbolic link: {}",
+                cursor.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn trusted_system_path_alias(path: &Path, metadata: &fs::Metadata) -> bool {
+    if !metadata.file_type().is_symlink() {
+        return false;
+    }
+    let expected = if path == Path::new("/var") {
+        Path::new("/private/var")
+    } else if path == Path::new("/tmp") {
+        Path::new("/private/tmp")
+    } else {
+        return false;
+    };
+    fs::read_link(path).is_ok_and(|target| {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            Path::new("/").join(target)
+        };
+        target == expected
+    })
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn trusted_system_path_alias(_path: &Path, _metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+struct PinnedDatabase {
+    _directory: File,
+    database: File,
+    identity: DatabaseFileIdentity,
+    sidecar_base: std::path::PathBuf,
+}
+
+#[cfg(windows)]
+impl PinnedDatabase {
+    fn recovery_sidecar_blocker(&self) -> Result<Option<String>> {
+        Ok(recovery_sidecar_blocker(&self.sidecar_base))
+    }
+
+    fn metadata(&self) -> Result<fs::Metadata> {
+        self.database.metadata().map_err(Error::Io)
+    }
+
+    fn header_uses_wal(&self) -> Result<bool> {
+        header_uses_wal(&self.database)
+    }
+
+    fn acquire_snapshot_guard(&self, _header_uses_wal: bool) -> Result<SnapshotGuard> {
+        acquire_windows_snapshot_guard(self)
+    }
+}
+
+#[cfg(windows)]
+fn pin_database(
+    path: &Path,
+    expected: &fs::Metadata,
+    expected_identity: &DatabaseFileIdentity,
+) -> Result<PinnedDatabase> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().map_err(Error::Io)?.join(path)
+    };
+    let parent = absolute.parent().ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "database path has no parent: {}",
+            absolute.display()
+        ))
+    })?;
+    let directory = open_windows_path(parent, false, true)?;
+    let database = open_windows_path(&absolute, false, false)?;
+    let opened = database.metadata().map_err(Error::Io)?;
+    if !windows_metadata_shape_matches(expected, &opened) {
+        return Err(Error::InvalidInput(
+            "database metadata changed while its Windows handle was pinned".into(),
+        ));
+    }
+    let identity = windows_database_file_identity_from_file(&database)?;
+    if &identity != expected_identity {
+        return Err(Error::InvalidInput(
+            "database file ID changed while its Windows handle was pinned".into(),
+        ));
+    }
+    Ok(PinnedDatabase {
+        _directory: directory,
+        database,
+        identity,
+        sidecar_base: absolute,
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn acquire_windows_snapshot_guard(pinned: &PinnedDatabase) -> Result<SnapshotGuard> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+
+    let (file, main_writable, mut error) =
+        match open_windows_path(&pinned.sidecar_base, true, false) {
+            Ok(file) => (file, true, None),
+            Err(open_error) => (
+                open_windows_path(&pinned.sidecar_base, false, false)?,
+                false,
+                Some(format!(
+                    "database is not writable through its pinned Windows handle: {open_error}"
+                )),
+            ),
+        };
+    if windows_database_file_identity_from_file(&file)? != pinned.identity {
+        return Err(Error::InvalidInput(
+            "database file ID changed while acquiring its Windows writer lock".into(),
+        ));
+    }
+    let parent_writable = match open_windows_path(
+        pinned.sidecar_base.parent().ok_or_else(|| {
+            Error::InvalidInput("database path has no Windows parent directory".into())
+        })?,
+        true,
+        true,
+    ) {
+        Ok(_) => true,
+        Err(parent_error) => {
+            error.get_or_insert_with(|| {
+                format!("database parent does not grant Windows create access: {parent_error}")
+            });
+            false
+        }
+    };
+    let mut pending = windows_overlapped(SQLITE_PENDING_BYTE as u64);
+    let pending_locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            1,
+            0,
+            &raw mut pending,
+        )
+    };
+    if pending_locked == 0 {
+        return Err(Error::Migration(format!(
+            "database pending snapshot lock is unavailable: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    let mut shared = windows_overlapped(SQLITE_SHARED_FIRST as u64);
+    let shared_locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle().cast(),
+            LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            SQLITE_SHARED_SIZE as u32,
+            0,
+            &raw mut shared,
+        )
+    };
+    if shared_locked == 0 {
+        let shared_error = std::io::Error::last_os_error();
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        let _ = unsafe { UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &raw mut pending) };
+        return Err(Error::Migration(format!(
+            "database shared snapshot lock is unavailable: {shared_error}"
+        )));
+    }
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    let pending_released =
+        unsafe { UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &raw mut pending) };
+    if pending_released == 0 {
+        let release_error = std::io::Error::last_os_error();
+        let _ = unsafe {
+            UnlockFileEx(
+                file.as_raw_handle().cast(),
+                0,
+                SQLITE_SHARED_SIZE as u32,
+                0,
+                &raw mut shared,
+            )
+        };
+        return Err(Error::Io(release_error));
+    }
+    let reserved_locked = if main_writable && parent_writable {
+        let mut reserved = windows_overlapped(SQLITE_RESERVED_BYTE as u64);
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle().cast(),
+                LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &raw mut reserved,
+            )
+        };
+        if locked == 0 {
+            error.get_or_insert_with(|| {
+                format!(
+                    "database reserved writer lock is unavailable: {}",
+                    std::io::Error::last_os_error()
+                )
+            });
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    };
+    Ok(SnapshotGuard {
+        file,
+        shared_locked: true,
+        reserved_locked,
+        available: main_writable && parent_writable && reserved_locked,
+        error,
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+        if self.reserved_locked {
+            let mut reserved = windows_overlapped(SQLITE_RESERVED_BYTE as u64);
+            let _ = unsafe {
+                UnlockFileEx(self.file.as_raw_handle().cast(), 0, 1, 0, &raw mut reserved)
+            };
+        }
+        if self.shared_locked {
+            let mut shared = windows_overlapped(SQLITE_SHARED_FIRST as u64);
+            let _ = unsafe {
+                UnlockFileEx(
+                    self.file.as_raw_handle().cast(),
+                    0,
+                    SQLITE_SHARED_SIZE as u32,
+                    0,
+                    &raw mut shared,
+                )
+            };
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_overlapped(offset: u64) -> windows_sys::Win32::System::IO::OVERLAPPED {
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let mut overlapped = unsafe { std::mem::zeroed::<OVERLAPPED>() };
+    overlapped.Anonymous.Anonymous.Offset = offset as u32;
+    overlapped.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
+    overlapped
+}
+
+#[cfg(windows)]
+fn open_windows_path(path: &Path, write: bool, directory: bool) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(write).custom_flags(
+        FILE_FLAG_OPEN_REPARSE_POINT
+            | if directory {
+                FILE_FLAG_BACKUP_SEMANTICS
+            } else {
+                0
+            },
+    );
+    let file = options.open(path).map_err(Error::Io)?;
+    use std::os::windows::fs::MetadataExt;
+    if file.metadata().map_err(Error::Io)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(Error::InvalidInput(format!(
+            "refusing a Windows reparse point in the database path: {}",
+            path.display()
+        )));
+    }
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn windows_database_file_identity(
+    path: &Path,
+    expected: &fs::Metadata,
+) -> Result<DatabaseFileIdentity> {
+    let file = open_windows_path(path, false, false)?;
+    let opened = file.metadata().map_err(Error::Io)?;
+    if !windows_metadata_shape_matches(expected, &opened) {
+        return Err(Error::InvalidInput(
+            "database metadata changed while capturing its Windows file ID".into(),
+        ));
+    }
+    windows_database_file_identity_from_file(&file)
+}
+
+#[cfg(windows)]
+fn windows_metadata_shape_matches(first: &fs::Metadata, second: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    first.file_attributes() == second.file_attributes()
+        && first.file_size() == second.file_size()
+        && first.creation_time() == second.creation_time()
+        && first.last_write_time() == second.last_write_time()
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_database_file_identity_from_file(file: &File) -> Result<DatabaseFileIdentity> {
+    use std::{mem::MaybeUninit, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ID_INFO, FileIdInfo, GetFileInformationByHandle,
+        GetFileInformationByHandleEx,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    let succeeded = unsafe {
+        GetFileInformationByHandle(file.as_raw_handle().cast(), information.as_mut_ptr())
+    };
+    if succeeded == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let information = unsafe { information.assume_init() };
+    let mut identity = MaybeUninit::<FILE_ID_INFO>::uninit();
+    let identity_succeeded = unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle().cast(),
+            FileIdInfo,
+            identity.as_mut_ptr().cast(),
+            u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+                .expect("FILE_ID_INFO fits in a Windows API length"),
+        )
+    };
+    if identity_succeeded == 0 {
+        return Err(Error::Io(std::io::Error::last_os_error()));
+    }
+    let identity = unsafe { identity.assume_init() };
+    let file_size =
+        (u64::from(information.nFileSizeHigh) << 32) | u64::from(information.nFileSizeLow);
+    let last_write = (u64::from(information.ftLastWriteTime.dwHighDateTime) << 32)
+        | u64::from(information.ftLastWriteTime.dwLowDateTime);
+    Ok(DatabaseFileIdentity(format!(
+        "windows:{}:{:02x?}:{file_size}:{last_write}:{}:{}",
+        identity.VolumeSerialNumber,
+        identity.FileId.Identifier,
+        information.dwFileAttributes,
+        information.nNumberOfLinks
+    )))
+}
+
+#[cfg(not(any(unix, windows)))]
+struct PinnedDatabase {
+    path: std::path::PathBuf,
+    database: File,
+}
+
+#[cfg(not(any(unix, windows)))]
+impl PinnedDatabase {
+    fn recovery_sidecar_blocker(&self) -> Result<Option<String>> {
+        Ok(recovery_sidecar_blocker(&self.path))
+    }
+
+    fn metadata(&self) -> Result<fs::Metadata> {
+        self.database.metadata().map_err(Error::Io)
+    }
+
+    fn header_uses_wal(&self) -> Result<bool> {
+        header_uses_wal(&self.database)
+    }
+
+    fn acquire_snapshot_guard(&self, _header_uses_wal: bool) -> Result<SnapshotGuard> {
+        Ok(SnapshotGuard {
+            available: false,
+            error: Some("writer availability cannot be verified on this platform".into()),
+        })
+    }
+
+    fn private_snapshot(&self, deadline: Instant) -> Result<tempfile::NamedTempFile> {
+        private_database_snapshot(&self.database, deadline)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn pin_database(
+    path: &Path,
+    _expected: &fs::Metadata,
+    _expected_identity: &DatabaseFileIdentity,
+) -> Result<PinnedDatabase> {
+    Ok(PinnedDatabase {
+        path: path.to_path_buf(),
+        database: File::open(path).map_err(Error::Io)?,
+    })
+}
+
+fn header_uses_wal(file: &File) -> Result<bool> {
+    let mut file = file.try_clone().map_err(Error::Io)?;
+    file.seek(SeekFrom::Start(18)).map_err(Error::Io)?;
+    let mut versions = [0_u8; 2];
+    file.read_exact(&mut versions).map_err(Error::Io)?;
+    match versions {
+        [2, 2] => Ok(true),
+        [1, 1] => Ok(false),
+        _ => Err(Error::Migration(format!(
+            "unsupported SQLite header read/write versions: {}/{}",
+            versions[0], versions[1]
+        ))),
+    }
+}
+
+#[cfg(unix)]
+fn same_file_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.mode() == after.mode()
+        && before.nlink() == after.nlink()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len()
+        && before.modified().ok() == after.modified().ok()
+        && before.file_type() == after.file_type()
+}
+
+fn truncate_diagnostic(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 pub(crate) fn initialize(connection: &Connection, options: &EngineOptions) -> Result<()> {
@@ -938,9 +2489,661 @@ pub(crate) fn rebuild_artifact_fingerprints(connection: &Connection) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::{
+        sync::{Arc, Barrier},
+        time::{Duration, Instant},
+    };
 
     use super::*;
+
+    fn initialized_file(path: &Path) {
+        let connection = Connection::open(path).unwrap();
+        initialize(&connection, &EngineOptions::default()).unwrap();
+    }
+
+    #[test]
+    fn inspection_is_noncreating_nonmigrating_and_observational() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.sqlite3");
+        assert!(inspect_database(&missing, 50).is_err());
+        assert!(!missing.exists());
+
+        let v1 = directory.path().join("v1.sqlite3");
+        let connection = Connection::open(&v1).unwrap();
+        migrate_v1(&connection).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&v1).unwrap();
+        let inspection = inspect_database(&v1, 50).unwrap();
+        assert_eq!(inspection.schema_version, 1);
+        assert!(inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.schema_current);
+        assert!(!inspection.diagnostics.healthy);
+        assert_eq!(fs::read(&v1).unwrap(), before);
+        assert_eq!(u32::from_be_bytes(before[60..64].try_into().unwrap()), 1);
+
+        let current = std::env::current_dir().unwrap();
+        let relative_directory = tempfile::tempdir_in(&current).unwrap();
+        let relative_database = relative_directory.path().join("relative.sqlite3");
+        initialized_file(&relative_database);
+        let relative_database = relative_database.strip_prefix(&current).unwrap();
+        let inspection = inspect_database(relative_database, 50).unwrap();
+        assert_eq!(inspection.schema_version, SCHEMA_VERSION);
+        assert!(inspection.diagnostics.healthy);
+    }
+
+    #[test]
+    fn inspection_bounds_writer_contention_without_normal_initialization() {
+        if let (Some(database), Some(ready)) = (
+            std::env::var_os("SUPER_MEM_INSPECTION_LOCK_DATABASE"),
+            std::env::var_os("SUPER_MEM_INSPECTION_LOCK_READY"),
+        ) {
+            let connection = Connection::open(database).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            fs::write(ready, b"ready").unwrap();
+            thread::sleep(Duration::from_secs(10));
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("locked.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let ready = directory.path().join("writer-ready");
+        let mut writer = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema::tests::inspection_bounds_writer_contention_without_normal_initialization",
+                "--nocapture",
+            ])
+            .env("SUPER_MEM_INSPECTION_LOCK_DATABASE", &database)
+            .env("SUPER_MEM_INSPECTION_LOCK_READY", &ready)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ready.exists(), "writer helper did not acquire its lock");
+        let started = Instant::now();
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert!(inspection.diagnostics.writer_lock_checked);
+        assert!(!inspection.diagnostics.writer_lock_available);
+        assert!(!inspection.diagnostics.healthy);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    #[allow(unsafe_code)]
+    fn inspection_refuses_a_pending_writer_before_joining_the_shared_range() {
+        if let (Some(database), Some(ready)) = (
+            std::env::var_os("SUPER_MEM_INSPECTION_PENDING_DATABASE"),
+            std::env::var_os("SUPER_MEM_INSPECTION_PENDING_READY"),
+        ) {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(database)
+                .unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::fd::AsRawFd;
+                assert!(
+                    unix_set_lock(
+                        file.as_raw_fd(),
+                        libc::F_WRLCK as libc::c_int,
+                        SQLITE_PENDING_BYTE,
+                        1,
+                    )
+                    .unwrap()
+                );
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+                };
+                let mut pending = windows_overlapped(SQLITE_PENDING_BYTE as u64);
+                assert_ne!(
+                    unsafe {
+                        LockFileEx(
+                            file.as_raw_handle().cast(),
+                            LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK,
+                            0,
+                            1,
+                            0,
+                            &raw mut pending,
+                        )
+                    },
+                    0
+                );
+            }
+            fs::write(ready, b"ready").unwrap();
+            thread::sleep(Duration::from_secs(10));
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("pending.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let ready = directory.path().join("pending-ready");
+        let mut writer = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "schema::tests::inspection_refuses_a_pending_writer_before_joining_the_shared_range",
+                "--nocapture",
+            ])
+            .env("SUPER_MEM_INSPECTION_PENDING_DATABASE", &database)
+            .env("SUPER_MEM_INSPECTION_PENDING_READY", &ready)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready.exists(),
+            "pending-writer helper did not acquire its lock"
+        );
+
+        let started = Instant::now();
+        let error = inspect_database(&database, 50).unwrap_err().to_string();
+        assert!(error.contains("pending"), "unexpected error: {error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        writer.kill().unwrap();
+        writer.wait().unwrap();
+        assert!(inspect_database(&database, 50).unwrap().diagnostics.healthy);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_snapshot_does_not_release_the_guard_lock() {
+        if let (Some(database), Some(outcome_path)) = (
+            std::env::var_os("SUPER_MEM_INSPECTION_OFD_DATABASE"),
+            std::env::var_os("SUPER_MEM_INSPECTION_OFD_OUTCOME"),
+        ) {
+            let connection = Connection::open(database).unwrap();
+            connection.busy_timeout(Duration::ZERO).unwrap();
+            let result = connection.execute_batch("BEGIN IMMEDIATE; ROLLBACK;");
+            let outcome_value = match result {
+                Ok(()) => "acquired",
+                Err(rusqlite::Error::SqliteFailure(error, _))
+                    if matches!(
+                        error.code,
+                        ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked
+                    ) =>
+                {
+                    "blocked"
+                }
+                Err(error) => panic!("unexpected writer result: {error}"),
+            };
+            fs::write(outcome_path, outcome_value).unwrap();
+            return;
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("ofd-lock.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        drop(connection);
+        let metadata = fs::symlink_metadata(&database).unwrap();
+        let identity = database_file_identity(&database, &metadata).unwrap();
+        let pinned = pin_database(&database, &metadata, &identity).unwrap();
+        let guard = pinned.acquire_snapshot_guard(false).unwrap();
+        let _snapshot = pinned
+            .private_snapshot(Instant::now() + Duration::from_secs(2))
+            .unwrap();
+
+        let run_writer = |name: &str| {
+            let outcome = directory.path().join(name);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "schema::tests::macos_private_snapshot_does_not_release_the_guard_lock",
+                    "--nocapture",
+                ])
+                .env("SUPER_MEM_INSPECTION_OFD_DATABASE", &database)
+                .env("SUPER_MEM_INSPECTION_OFD_OUTCOME", &outcome)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            fs::read_to_string(outcome).unwrap()
+        };
+
+        assert_eq!(run_writer("while-guarded"), "blocked");
+        drop(guard);
+        assert_eq!(run_writer("after-drop"), "acquired");
+    }
+
+    #[test]
+    fn inspection_of_a_closed_wal_store_does_not_materialize_sidecars() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("closed-wal.sqlite3");
+        initialized_file(&database);
+        let wal = sidecar_path(&database, "-wal");
+        let shm = sidecar_path(&database, "-shm");
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+        let before = fs::read(&database).unwrap();
+
+        let inspection = inspect_database(&database, 50).unwrap();
+
+        assert!(inspection.diagnostics.healthy);
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert!(!wal.exists());
+        assert!(!shm.exists());
+    }
+
+    #[test]
+    fn windows_memory_snapshot_normalizes_a_closed_wal_header() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("closed-wal-memory.sqlite3");
+        initialized_file(&database);
+        let source = File::open(&database).unwrap();
+        assert!(header_uses_wal(&source).unwrap());
+        let length = usize::try_from(source.metadata().unwrap().len()).unwrap();
+        let snapshot = read_windows_inspection_snapshot(
+            source,
+            length,
+            Instant::now() + Duration::from_secs(1),
+            true,
+        )
+        .unwrap();
+        let mut connection = Connection::open_in_memory().unwrap();
+
+        connection
+            .deserialize(rusqlite::MAIN_DB, snapshot, true)
+            .unwrap();
+
+        assert_eq!(validate_identity(&connection).unwrap(), SCHEMA_VERSION);
+        assert!(connection.execute("DELETE FROM events", []).is_err());
+    }
+
+    #[test]
+    fn immutable_snapshot_uri_escapes_windows_and_query_delimiters() {
+        assert_eq!(
+            immutable_sqlite_uri(Path::new(r"C:\Temp\a b?#.sqlite"))
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "file:C:%5CTemp%5Ca%20b%3F%23.sqlite?immutable=1"
+        );
+    }
+
+    #[test]
+    fn inspection_detects_required_schema_damage() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("damaged.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE; DROP INDEX feedback_memory;")
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert!(!inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.healthy);
+        assert!(
+            inspection
+                .diagnostics
+                .schema_manifest_findings
+                .iter()
+                .any(|finding| finding == "missing index feedback_memory")
+        );
+    }
+
+    #[test]
+    fn inspection_detects_a_declared_foreign_key_removed_from_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("missing-foreign-key.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;
+                 PRAGMA foreign_keys=OFF;
+                 ALTER TABLE feedback RENAME TO feedback_old;
+                 CREATE TABLE feedback (
+                    feedback_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    query_id TEXT,
+                    memory_id TEXT NOT NULL,
+                    signal TEXT NOT NULL,
+                    note TEXT,
+                    created_at_ms INTEGER NOT NULL
+                 );
+                 DROP TABLE feedback_old;
+                 CREATE INDEX feedback_memory ON feedback(memory_id, signal);",
+            )
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert_eq!(inspection.diagnostics.foreign_key_violations, 0);
+        assert!(!inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.healthy);
+        assert!(
+            inspection
+                .diagnostics
+                .schema_manifest_findings
+                .iter()
+                .any(|finding| finding == "changed table feedback")
+        );
+    }
+
+    #[test]
+    fn inspection_detects_a_head_whose_current_revision_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("orphaned-head.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO events(
+                    event_id,namespace,kind,scope_json,content,attributes_json,
+                    trust,occurred_at_ms,ingested_at_ms,content_hash,redaction_count
+                 ) VALUES(
+                    'event-1','default','memory','{}','body','{}',
+                    'observed',1,1,'event-hash',0
+                 );
+                 INSERT INTO memory_heads(
+                    memory_id,namespace,scope_key,kind,state,head_revision,
+                    importance,confidence,trust,created_at_ms,updated_at_ms,
+                    created_seq,updated_seq
+                 ) VALUES(
+                    'memory-1','default','scope','fact','active',1,
+                    0.5,0.5,'observed',1,1,1,1
+                 );
+                 INSERT INTO memory_revisions(
+                    memory_id,revision,title,body,attributes_json,scope_json,
+                    content_hash,recorded_at_ms,recorded_seq
+                 ) VALUES(
+                    'memory-1',1,'title','body','{}','{}','memory-hash',1,1
+                 );
+                 INSERT INTO memory_revision_metadata(
+                    memory_id,revision,kind,state,importance,confidence,trust,
+                    metadata_complete
+                 ) VALUES(
+                    'memory-1',1,'fact','active',0.5,0.5,'observed',1
+                 );
+                 PRAGMA foreign_keys=OFF;
+                 DELETE FROM memory_revision_metadata WHERE memory_id='memory-1';
+                 DELETE FROM memory_revisions WHERE memory_id='memory-1';
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert!(inspection.diagnostics.quick_check_ok);
+        assert_eq!(inspection.diagnostics.foreign_key_violations, 0);
+        assert!(inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.application_invariants_ok);
+        assert!(!inspection.diagnostics.healthy);
+        assert!(
+            inspection
+                .diagnostics
+                .application_invariant_findings
+                .iter()
+                .any(|finding| finding == "memory_head_without_head_revision")
+        );
+    }
+
+    #[test]
+    fn inspection_detects_a_head_behind_its_latest_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("stale-head.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "INSERT INTO events(
+                    event_id,namespace,kind,scope_json,content,attributes_json,
+                    trust,occurred_at_ms,ingested_at_ms,content_hash,redaction_count
+                 ) VALUES(
+                    'event-1','default','memory','{}','body','{}',
+                    'observed',1,1,'event-hash',0
+                 );
+                 INSERT INTO memory_heads(
+                    memory_id,namespace,scope_key,kind,state,head_revision,
+                    importance,confidence,trust,created_at_ms,updated_at_ms,
+                    created_seq,updated_seq
+                 ) VALUES(
+                    'memory-1','default','scope','fact','active',1,
+                    0.5,0.5,'observed',1,2,1,1
+                 );
+                 INSERT INTO memory_revisions(
+                    memory_id,revision,title,body,attributes_json,scope_json,
+                    content_hash,recorded_at_ms,recorded_seq
+                 ) VALUES
+                    ('memory-1',1,'title','old','{}','{}','old-hash',1,1),
+                    ('memory-1',2,'title','new','{}','{}','new-hash',2,1);
+                 INSERT INTO memory_revision_metadata(
+                    memory_id,revision,kind,state,importance,confidence,trust,
+                    metadata_complete
+                 ) VALUES
+                    ('memory-1',1,'fact','active',0.5,0.5,'observed',1),
+                    ('memory-1',2,'fact','active',0.5,0.5,'observed',1);
+                 PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert!(inspection.diagnostics.quick_check_ok);
+        assert_eq!(inspection.diagnostics.foreign_key_violations, 0);
+        assert!(inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.application_invariants_ok);
+        assert!(!inspection.diagnostics.healthy);
+        assert!(
+            inspection
+                .diagnostics
+                .application_invariant_findings
+                .iter()
+                .any(|finding| finding == "memory_head_revision_not_latest")
+        );
+    }
+
+    #[test]
+    fn inspection_progress_deadline_interrupts_pathological_sql_work() {
+        let connection = Connection::open_in_memory().unwrap();
+        configure_inspection_connection(&connection, Instant::now()).unwrap();
+        let started = Instant::now();
+        let result = connection.query_row(
+            "WITH RECURSIVE values_(value) AS (
+                 VALUES(1) UNION ALL SELECT value+1 FROM values_ WHERE value<100000000
+             ) SELECT sum(value) FROM values_",
+            [],
+            |row| row.get::<_, i64>(0),
+        );
+        assert!(result.is_err());
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn inspection_rejects_oversized_schema_cells_without_changing_the_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("oversized-schema.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;
+                 PRAGMA writable_schema=ON;
+                 UPDATE sqlite_schema
+                 SET type=printf('%.*c',5242880,'x')
+                 WHERE name='feedback';
+                 PRAGMA writable_schema=OFF;
+                 PRAGMA schema_version=7;",
+            )
+            .unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+        let started = Instant::now();
+
+        assert!(inspect_database(&database, 50).is_err());
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(fs::read(&database).unwrap(), before);
+    }
+
+    #[test]
+    fn inspection_rejects_unexpected_tables_indexes_and_triggers() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("extra-schema.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_checkpoint(TRUNCATE);
+                 PRAGMA journal_mode=DELETE;
+                 CREATE TABLE doctor_rogue(value INTEGER);
+                 CREATE INDEX doctor_rogue_index ON doctor_rogue(value);
+                 CREATE TRIGGER doctor_rogue_trigger AFTER INSERT ON events
+                 BEGIN INSERT INTO doctor_rogue VALUES(NEW.seq); END;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&database, 50).unwrap();
+        assert!(!inspection.diagnostics.schema_manifest_ok);
+        assert!(!inspection.diagnostics.healthy);
+        for finding in [
+            "unexpected table doctor_rogue",
+            "unexpected index doctor_rogue_index",
+            "unexpected trigger doctor_rogue_trigger",
+        ] {
+            assert!(
+                inspection
+                    .diagnostics
+                    .schema_manifest_findings
+                    .iter()
+                    .any(|actual| actual == finding)
+            );
+        }
+
+        let reserved_database = directory.path().join("reserved-prefix.sqlite3");
+        initialized_file(&reserved_database);
+        let connection = Connection::open(&reserved_database).unwrap();
+        connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE;")
+            .unwrap();
+        let schema_cookie = connection
+            .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        connection
+            .execute_batch(&format!(
+                "PRAGMA writable_schema=ON;
+                 INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)
+                 VALUES('trigger','sqlite_doctor_rogue','events',0,
+                   'CREATE TRIGGER sqlite_doctor_rogue AFTER INSERT ON events BEGIN SELECT 1; END');
+                 PRAGMA schema_version={};
+                 PRAGMA writable_schema=OFF;",
+                schema_cookie + 1
+            ))
+            .unwrap();
+        drop(connection);
+
+        let inspection = inspect_database(&reserved_database, 50).unwrap();
+        assert!(!inspection.diagnostics.schema_manifest_ok);
+        assert!(
+            inspection
+                .diagnostics
+                .schema_manifest_findings
+                .iter()
+                .any(|finding| finding == "unexpected trigger sqlite_doctor_rogue")
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_malformed_and_symbolic_link_inputs() {
+        let directory = tempfile::tempdir().unwrap();
+        let malformed = directory.path().join("malformed.sqlite3");
+        fs::write(&malformed, b"not sqlite").unwrap();
+        assert!(inspect_database(&malformed, 50).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let database = directory.path().join("real.sqlite3");
+            initialized_file(&database);
+            let alias = directory.path().join("alias.sqlite3");
+            symlink(&database, &alias).unwrap();
+            assert!(inspect_database(&alias, 50).is_err());
+        }
+    }
+
+    #[test]
+    fn inspection_rejects_a_store_exchanged_after_the_callers_preflight() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("memory.sqlite3");
+        let replacement = directory.path().join("replacement.sqlite3");
+        let original = directory.path().join("original.sqlite3");
+        initialized_file(&database);
+        initialized_file(&replacement);
+        let expected =
+            database_file_identity(&database, &fs::symlink_metadata(&database).unwrap()).unwrap();
+        let expected_digest = expected.diagnostic_digest();
+
+        fs::rename(&database, &original).unwrap();
+        fs::rename(&replacement, &database).unwrap();
+        let replacement_identity =
+            database_file_identity(&database, &fs::symlink_metadata(&database).unwrap()).unwrap();
+        assert_ne!(expected_digest, replacement_identity.diagnostic_digest());
+
+        let error = inspect_database_at_identity(&database, 50, &expected)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("changed after the caller's preflight snapshot"));
+    }
+
+    #[test]
+    fn inspection_refuses_live_wal_without_touching_shared_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("live.sqlite3");
+        initialized_file(&database);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE inspection_live(value INTEGER);
+                 INSERT INTO inspection_live VALUES(1);",
+            )
+            .unwrap();
+        let wal = sidecar_path(&database, "-wal");
+        let shm = sidecar_path(&database, "-shm");
+        let wal_before = fs::read(&wal).unwrap();
+        let shm_before = fs::read(&shm).unwrap();
+
+        let error = inspect_database(&database, 50).unwrap_err().to_string();
+        assert!(error.contains("live WAL state"));
+        assert_eq!(fs::read(&wal).unwrap(), wal_before);
+        assert_eq!(fs::read(&shm).unwrap(), shm_before);
+        drop(connection);
+    }
 
     #[test]
     fn v1_migration_rebuilds_search_as_contentless_without_losing_matches() {

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import tarfile
 import tempfile
@@ -17,8 +18,18 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def run(binary: Path, arguments: list[str], *, stdin: str | None = None) -> str:
+    environment = os.environ.copy()
+    path_key = next(
+        (key for key in environment if key.upper() == "PATH"),
+        "PATH",
+    )
+    existing_path = environment.get(path_key)
+    environment[path_key] = os.pathsep.join(
+        part for part in (str(binary.parent), existing_path) if part
+    )
     result = subprocess.run(
         [str(binary), *arguments],
+        env=environment,
         input=stdin,
         text=True,
         encoding="utf-8",

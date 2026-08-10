@@ -31,5 +31,8 @@ pub use engine::MemoryEngine;
 pub use error::{Error, Result};
 pub use git::{canonical_path_digest, compare_revisions, discover_repository, normalize_remote};
 pub use redaction::{Redaction, Redactor};
-pub use schema::{APPLICATION_ID, is_super_mem_database};
+pub use schema::{
+    APPLICATION_ID, DatabaseFileIdentity, database_file_identity, inspect_database,
+    inspect_database_at_identity, is_super_mem_database,
+};
 pub use types::*;

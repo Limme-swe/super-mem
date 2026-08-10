@@ -23,7 +23,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "serd
 clap = { version = "4.6", features = ["derive", "env", "wrap_help"] }
 regex = "1.12"
 rmcp = { version = "3.1", default-features = false, features = ["macros", "server", "transport-io"] }
-rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache", "chrono", "serde_json", "uuid"] }
+rusqlite = { version = "=0.39.0", default-features = false, features = ["backup", "bundled", "cache", "chrono", "hooks", "limits", "serialize", "serde_json", "uuid"] }
 schemars = { version = "1.2", features = ["chrono04", "uuid1"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["float_roundtrip"] }

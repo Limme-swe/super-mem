@@ -104,6 +104,8 @@ Purge does not remove exported snapshots, user-managed backups, filesystem snaps
 - The store is not encrypted by super-mem. Use operating-system permissions and disk encryption where required.
 - Pattern-based redaction is incomplete by nature.
 - A compromised user account, harness, or kernel can bypass application controls.
+- Executables resolved from the caller's `PATH`, including `git`, are trusted;
+  subprocess deadlines and output limits are not an operating-system sandbox.
 - A malicious but authorized harness can store false or sensitive evidence.
 - Accurate evidence can still be misunderstood by the consuming model.
 - Remote MCP transport and remote embeddings are not implemented.
