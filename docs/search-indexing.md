@@ -134,9 +134,9 @@ Scope and lifecycle eligibility are applied before either path. Final dense-chan
 
 ## Rebuilds and snapshots
 
-Canonical events, memories, revisions, evidence, links, and feedback remain SQLite truth. FTS rows, alias-version markers, search profiles and activation state, expansions, vectors, and random-hyperplane signatures are derived search state.
+Canonical events, memories, revisions, evidence, links, and feedback remain SQLite truth. FTS rows, alias-version markers, fixed-width artifact fingerprints, search profiles and activation state, expansions, vectors, and random-hyperplane signatures are derived search state.
 
-Rebuild deterministic aliases and both canonical and expansion FTS rows from current canonical heads and registered projections with:
+Rebuild deterministic aliases, artifact fingerprints, and both canonical and expansion FTS rows from current canonical heads and registered projections with:
 
 ~~~sh
 supermem index rebuild

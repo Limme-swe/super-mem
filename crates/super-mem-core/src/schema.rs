@@ -8,9 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, ErrorCode, OpenFlags};
+use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 
-use crate::{Durability, EngineOptions, Error, Result};
+use crate::{Durability, EngineOptions, Error, Result, applicability::artifact_fingerprint};
 
 pub(crate) const SCHEMA_VERSION: u32 = 6;
 /// `SQLite` application identifier (`SMEM`) used to distinguish stores from
@@ -855,10 +855,84 @@ fn migrate_v6(connection: &Connection) -> Result<()> {
                     relation
                 );
 
-            PRAGMA user_version=6;
+            -- Historical checkpoint retries reconstruct whether an outcome
+            -- was retracted at their original sequence boundary without
+            -- scanning unrelated event associations.
+            CREATE INDEX event_memories_memory
+                ON event_memories(memory_id,event_id);
+
+            -- Historical checkpoint retries start from the bounded automatic
+            -- command keys, then join the exact revision at their sequence
+            -- boundary. Keep this separate from the current-head canonical
+            -- index used by ordinary checkpoints.
+            CREATE INDEX memory_revision_metadata_checkpoint
+                ON memory_revision_metadata(
+                    kind,
+                    canonical_key,
+                    memory_id,
+                    revision
+                )
+                WHERE canonical_key IS NOT NULL;
+
+            -- Canonical artifact metadata can contain multi-KiB paths,
+            -- symbols, and hashes. This rebuildable fixed-width projection
+            -- lets recall stage and deduplicate applicability material without
+            -- repeatedly transferring or sorting those strings.
+            CREATE TABLE artifact_fingerprints (
+                artifact_id       INTEGER PRIMARY KEY
+                    REFERENCES artifacts(artifact_id) ON DELETE CASCADE,
+                identity          BLOB CHECK(identity IS NULL OR length(identity)=32),
+                content           BLOB CHECK(content IS NULL OR length(content)=32),
+                CHECK((identity IS NULL)=(content IS NULL))
+            );
+            CREATE INDEX artifact_fingerprints_identity
+                ON artifact_fingerprints(identity,artifact_id);
             ",
         )
         .map_err(|error| Error::Migration(error.to_string()))?;
+    rebuild_artifact_fingerprints(connection)?;
+    connection
+        .execute_batch("PRAGMA user_version=6;")
+        .map_err(|error| Error::Migration(error.to_string()))?;
+    Ok(())
+}
+
+/// Rebuilds fixed-width artifact applicability fingerprints from canonical rows.
+///
+/// Rows are read and hashed one at a time so migration and snapshot restore do
+/// not retain or sort a corpus of attacker-controlled paths and symbols.
+pub(crate) fn rebuild_artifact_fingerprints(connection: &Connection) -> Result<()> {
+    connection.execute("DELETE FROM artifact_fingerprints", [])?;
+    let mut artifacts = connection.prepare(
+        "SELECT artifact_id,repo_id,path,symbol,content_hash FROM artifacts ORDER BY artifact_id",
+    )?;
+    let mut insert = connection.prepare(
+        "INSERT INTO artifact_fingerprints(artifact_id,identity,content) VALUES(?1,?2,?3)",
+    )?;
+    let mut rows = artifacts.query([])?;
+    while let Some(row) = rows.next()? {
+        let artifact_id = row.get::<_, i64>(0)?;
+        let repo_id = row.get::<_, String>(1)?;
+        let path = row.get::<_, String>(2)?;
+        let symbol = row.get::<_, String>(3)?;
+        let content_hash = row.get::<_, String>(4)?;
+        if content_hash.is_empty() {
+            insert.execute(params![
+                artifact_id,
+                Option::<&[u8]>::None,
+                Option::<&[u8]>::None
+            ])?;
+        } else {
+            let (identity, content) = artifact_fingerprint(
+                &repo_id,
+                &path,
+                (!symbol.is_empty()).then_some(symbol.as_str()),
+                &content_hash,
+            )
+            .digests();
+            insert.execute(params![artifact_id, &identity[..], &content[..]])?;
+        }
+    }
     Ok(())
 }
 
@@ -1078,6 +1152,16 @@ mod tests {
                     'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
                     'another likely query',NULL,NULL,NULL,11
                 );
+                INSERT INTO artifacts(
+                    artifact_id,namespace,repo_id,path,symbol,content_hash,
+                    git_oid,language
+                ) VALUES(
+                    41,'default','repo','src/migration.rs','migrate',
+                    'artifact-hash','','rust'
+                ),(
+                    42,'default','repo','src/unverifiable.rs','',
+                    '','','rust'
+                );
                 ",
             )
             .unwrap();
@@ -1132,6 +1216,56 @@ mod tests {
                 .unwrap(),
             0,
             "legacy heads must be detected as needing alias backfill"
+        );
+        let (stored_identity, stored_content) = connection
+            .query_row(
+                "SELECT identity,content FROM artifact_fingerprints WHERE artifact_id=41",
+                [],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap();
+        let (expected_identity, expected_content) = crate::applicability::artifact_fingerprint(
+            "repo",
+            "src/migration.rs",
+            Some("migrate"),
+            "artifact-hash",
+        )
+        .digests();
+        assert_eq!(stored_identity, expected_identity);
+        assert_eq!(stored_content, expected_content);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM artifact_fingerprints WHERE artifact_id=42 AND identity IS NULL AND content IS NULL",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "migration must retain a coverage marker for unverifiable artifacts"
+        );
+        connection
+            .execute("DELETE FROM artifacts WHERE artifact_id=41", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM artifact_fingerprints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1,
+            "derived artifact fingerprints must follow canonical row deletion"
+        );
+        connection
+            .execute("DELETE FROM artifacts WHERE artifact_id=42", [])
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM artifact_fingerprints", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
         );
         assert!(connection
             .query_row(

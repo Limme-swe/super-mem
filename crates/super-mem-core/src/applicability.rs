@@ -15,6 +15,19 @@ pub(crate) struct ArtifactFingerprint {
     content: [u8; 32],
 }
 
+impl ArtifactFingerprint {
+    pub(crate) fn from_digests(identity: &[u8], content: &[u8]) -> Option<Self> {
+        Some(Self {
+            identity: identity.try_into().ok()?,
+            content: content.try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn digests(self) -> ([u8; 32], [u8; 32]) {
+        (self.identity, self.content)
+    }
+}
+
 /// A bounded set of verifiable artifacts.
 ///
 /// `complete` is false when storage contained more artifacts than candidate
@@ -52,6 +65,26 @@ pub(crate) fn artifact_fingerprint(
     symbol: Option<&str>,
     content_hash: &str,
 ) -> ArtifactFingerprint {
+    let identity = artifact_identity_fingerprint(repo_id, path, symbol);
+
+    let mut content = blake3::Hasher::new();
+    update_length_framed(&mut content, b"super-mem:artifact-content:v1");
+    update_length_framed(&mut content, content_hash.as_bytes());
+    ArtifactFingerprint {
+        identity,
+        content: *content.finalize().as_bytes(),
+    }
+}
+
+/// Fixed-width identity shared by applicability staging and derived storage
+/// indexes. Content and Git revisions are intentionally excluded: callers use
+/// this key to recognize the same repository path and optional symbol across
+/// revisions.
+pub(crate) fn artifact_identity_fingerprint(
+    repo_id: &str,
+    path: &str,
+    symbol: Option<&str>,
+) -> [u8; 32] {
     let mut identity = blake3::Hasher::new();
     update_length_framed(&mut identity, b"super-mem:artifact-identity:v1");
     update_length_framed(&mut identity, repo_id.as_bytes());
@@ -65,14 +98,7 @@ pub(crate) fn artifact_fingerprint(
             identity.update(&[0]);
         }
     }
-
-    let mut content = blake3::Hasher::new();
-    update_length_framed(&mut content, b"super-mem:artifact-content:v1");
-    update_length_framed(&mut content, content_hash.as_bytes());
-    ArtifactFingerprint {
-        identity: *identity.finalize().as_bytes(),
-        content: *content.finalize().as_bytes(),
-    }
+    *identity.finalize().as_bytes()
 }
 
 pub(crate) fn fingerprint_artifacts(artifacts: &[ArtifactRef]) -> ArtifactFingerprintSet {
