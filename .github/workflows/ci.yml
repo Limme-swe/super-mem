@@ -85,8 +85,10 @@ jobs:
         with:
           node-version: 24
           package-manager-cache: false
-      - name: Validate evaluation fixture contract
-        run: node scripts/validate-eval-fixture.mjs
+      - name: Validate evaluation fixture contracts
+        run: |
+          node scripts/validate-eval-fixture.mjs
+          node scripts/validate-retrieval-fixture.mjs
       - name: Validate release tooling and metadata
         run: |
           python -m py_compile scripts/*.py

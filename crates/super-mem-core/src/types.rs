@@ -802,6 +802,123 @@ pub struct ContextHints {
     pub error_fingerprint: Option<String>,
     /// Explicit entity identities to boost.
     pub entities: Vec<String>,
+    /// Optional caller-generated dense query vector. The core never invokes
+    /// or downloads an embedding model.
+    pub dense: Option<DenseQuery>,
+}
+
+/// A caller-generated vector for one immutable search profile.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct DenseQuery {
+    /// Search profile whose model, preprocessing, and dimensions produced the vector.
+    pub profile_id: String,
+    /// Finite, non-zero floating-point vector.
+    pub vector: Vec<f32>,
+    /// Optional minimum cosine similarity for the dense candidate channel.
+    pub min_similarity: Option<f32>,
+}
+
+/// Immutable registration for a background search encoder or expander.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SearchProfileRegistration {
+    /// Stable digest-derived identity for model, tokenizer, preprocessing, and metric.
+    pub profile_id: String,
+    /// Digest of the complete generator configuration.
+    pub model_digest: String,
+    /// Dense-vector dimensions, or `None` for document expansion only.
+    pub dimensions: Option<usize>,
+}
+
+/// One registered background search profile.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SearchProfile {
+    /// Stable profile identity.
+    pub profile_id: String,
+    /// Digest of the complete generator configuration.
+    pub model_digest: String,
+    /// Dense-vector dimensions, if this profile supports dense retrieval.
+    pub dimensions: Option<usize>,
+    /// Core random-hyperplane signature algorithm version.
+    pub signature_version: u32,
+    /// Registration time.
+    pub created_at: DateTime<Utc>,
+}
+
+/// One current memory that still needs background search enrichment.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct PendingSearchDocument {
+    /// Logical memory identity.
+    pub memory_id: MemoryId,
+    /// Current immutable revision.
+    pub revision: u32,
+    /// Canonical content hash used for compare-and-swap registration.
+    pub content_hash: String,
+    /// Current title.
+    pub title: String,
+    /// Current body.
+    pub body: String,
+    /// Current tags.
+    pub tags: Vec<String>,
+    /// Current named entities.
+    pub entities: Vec<EntityRef>,
+    /// Current code artifacts.
+    pub artifacts: Vec<ArtifactRef>,
+}
+
+/// Derived search material for one current memory revision.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SearchProjectionInput {
+    /// Logical memory identity.
+    pub memory_id: MemoryId,
+    /// Revision that was encoded.
+    pub revision: u32,
+    /// Canonical content hash that was encoded.
+    pub content_hash: String,
+    /// Bounded likely queries, aliases, or semantic concepts generated off the write path.
+    #[serde(default)]
+    pub expansions: Vec<String>,
+    /// Optional dense vector produced by the registered profile.
+    #[serde(default)]
+    pub vector: Option<Vec<f32>>,
+}
+
+/// Atomic batch registration of background search projections.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct RegisterSearchProjectionsRequest {
+    /// Scope authorized to enrich these memories.
+    pub scope: Scope,
+    /// Immutable profile that generated every record.
+    pub profile_id: String,
+    /// Current-revision projections to register.
+    pub projections: Vec<SearchProjectionInput>,
+}
+
+/// Result of registering a projection batch.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SearchProjectionReceipt {
+    /// Profile receiving the projections.
+    pub profile_id: String,
+    /// Projections inserted or replaced.
+    pub registered: usize,
+    /// Byte-identical projections that were already present.
+    pub unchanged: usize,
+    /// Latest canonical event sequence observed by the transaction.
+    pub database_seq: i64,
+}
+
+/// Coverage for one search profile inside one authorized scope.
+#[derive(Clone, Debug, JsonSchema, Serialize, Deserialize)]
+pub struct SearchIndexStatus {
+    /// Registered immutable profile.
+    pub profile: SearchProfile,
+    /// Non-retracted current memory heads in scope.
+    pub eligible: u64,
+    /// Current heads with a matching revision and content hash projection.
+    pub indexed: u64,
+    /// Current heads still awaiting registration.
+    pub pending: u64,
+    /// Stored projections whose source revision is no longer current.
+    pub stale: u64,
 }
 
 /// Request for a compiled context pack.
@@ -882,6 +999,16 @@ pub enum RetrievalSignal {
     Exact,
     /// FTS lexical match.
     Lexical,
+    /// All bounded lexical query terms matched.
+    LexicalStrict,
+    /// Deterministic code-identifier or coding-concept alias matched.
+    CodeAlias,
+    /// All bounded query terms matched deterministic code aliases.
+    CodeAliasStrict,
+    /// Background document expansion matched without query-time inference.
+    SemanticExpansion,
+    /// Caller-supplied dense vector matched a registered projection.
+    DenseVector,
     /// Identifier, tag, or artifact token matched.
     Sparse,
     /// Entity identity matched.

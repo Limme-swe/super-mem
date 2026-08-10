@@ -11,7 +11,7 @@ super-mem records prompts, decisions, tool results, tests, and failed attempts i
 
 **Status:** pre-1.0. The CLI and database schema may change between minor releases. Native release binaries are available for Linux, Windows, and both Intel and Apple Silicon Macs; crates.io and npm packages are not published yet.
 
-[Installation](docs/installation.md) · [Architecture](docs/architecture.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
+[Installation](docs/installation.md) · [Architecture](docs/architecture.md) · [Search indexing](docs/search-indexing.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -20,8 +20,9 @@ super-mem records prompts, decisions, tool results, tests, and failed attempts i
 - Tracks revisions, source events, historical links, corrections, retractions, and conflicting evidence without erasing history.
 - Classifies repository memories as exact, compatible, stale, divergent, or unversioned.
 - Builds a small, deterministic context packet under a fixed token budget.
+- Builds bounded code-aware aliases and strict/loose lexical candidates, with optional background expansions and caller-supplied dense vectors.
 - Serves concurrent MCP recalls through a bounded SQLite reader pool while serializing writes on one primary connection.
-- Runs locally without an embedding model, hosted database, or telemetry service.
+- Makes no model calls or downloads in the write and recall paths, and needs no hosted database or telemetry service.
 
 The Rust core owns storage, scoping, retrieval, and context assembly. Harness adapters only translate lifecycle events and inject the resulting context.
 
@@ -102,13 +103,15 @@ Automatic capture is fail-open: a memory error must not stop the coding session.
 1. Harness events and explicit records are validated, redacted, and appended to SQLite.
 2. Queryable records keep their source events, outcome, scope, and revision history.
 3. Hard namespace, workspace, repository, lifecycle, and time filters run before channel limits.
-4. Exact, lexical, diagnostic, entity, artifact, and recency channels produce candidates.
-5. Git applicability, feedback, evidence quality, and redundancy affect ranking.
+4. Exact, strict/loose lexical, code-alias, diagnostic, entity, artifact, and recency channels produce candidates; registered expansions and caller-supplied vectors can add optional semantic candidates.
+5. Git applicability, importance, confidence, trust, feedback, and redundancy affect ranking.
 6. Selected records are rendered as untrusted evidence under the requested budget.
 
 Stale records require `--include-stale`. Descendant and diverged records are hidden unless recall uses `--include-divergent` or MCP sets `include_divergent`. A complete set of matching artifact hashes can keep a memory exact despite unrelated dirty files; incomplete automatic Git capture supplies no artifact evidence.
 
-SQLite rows are canonical. FTS and lookup indexes are rebuildable projections. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Recall does not depend on network access or an embedding model.
+SQLite memory rows are canonical. FTS, deterministic aliases, and optional search projections are derived state. Rendered text and structured recall contain the same selected, safely truncated bodies, and the reported token estimate is computed from the final rendering. Default recall does not depend on network access or an embedding model; optional dense vectors are generated and supplied by the caller.
+
+See [Search indexing](docs/search-indexing.md) for the background `pending`/`register` workflow, immutable profiles, dense-vector scoring, rebuilds, snapshot behavior, and evaluation limits.
 
 ## MCP tools
 
@@ -163,6 +166,7 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-targets --all-features
 node scripts/validate-eval-fixture.mjs
+node scripts/validate-retrieval-fixture.mjs
 ~~~
 
 Changes to retrieval, scoping, snapshots, or performance need a focused regression test. Performance claims need a reproducible workload and hardware description.
