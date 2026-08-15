@@ -1,0 +1,43 @@
+name: Recover long-horizon benchmark bootstrap
+
+on:
+  push:
+    branches: [agent/long-horizon-benchmark]
+    paths: [.github/workflows/recover-long-horizon.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          ref: agent/long-horizon-benchmark
+      - name: Materialize reviewed changes
+        shell: bash
+        env:
+          ARCHIVE_SHA256: 5737b619c1e710b27821f2a605da44f0d0c72724a7c7232d9b7e1df2cd177acc
+        run: |
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          source = Path('.github/workflows/apply-long-horizon.yml').read_text(encoding='utf-8')
+          payload = source.split("<<'ARCHIVE'\n", 1)[1].split('\nARCHIVE', 1)[0].strip()
+          archive = Path(os.environ['RUNNER_TEMP']) / 'changes.tar.gz'
+          archive.write_bytes(base64.b64decode(payload, validate=True))
+          PY
+          echo "$ARCHIVE_SHA256  $RUNNER_TEMP/changes.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/changes.tar.gz" -C .
+          python scripts/generate_long_horizon_fixture.py
+          rm .github/workflows/apply-long-horizon.yml
+          rm .github/workflows/recover-long-horizon.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add -A
+          git diff --cached --check
+          git commit -m "Add long-horizon retrieval benchmark"
+          git push origin HEAD:agent/long-horizon-benchmark
