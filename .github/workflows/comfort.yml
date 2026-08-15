@@ -1,0 +1,93 @@
+name: Comfort checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/**"
+      - "docs/**"
+      - "README.md"
+      - ".github/workflows/comfort.yml"
+  pull_request:
+    paths:
+      - "scripts/**"
+      - "docs/**"
+      - "README.md"
+      - ".github/workflows/comfort.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: comfort-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-and-posix:
+    name: Python, docs, and POSIX helpers
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Parse POSIX helpers
+        run: bash -n scripts/install.sh scripts/uninstall.sh
+      - name: Compile Python helpers
+        run: python -m compileall -q scripts
+      - name: Run helper tests
+        run: python -m unittest discover -s scripts/tests -p "test_*.py"
+      - name: Validate documentation links
+        run: python scripts/check_docs.py
+      - name: Validate task-runner contracts
+        run: python scripts/dev.py full --dry-run
+      - name: Verify offline help paths
+        run: |
+          sh scripts/install.sh --help >/dev/null
+          sh scripts/uninstall.sh --help >/dev/null
+
+  powershell:
+    name: PowerShell helpers
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($path in @('scripts/install.ps1', 'scripts/uninstall.ps1')) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error "$path: $_" }
+              $failed = $true
+            }
+          }
+          if ($failed) { exit 1 }
+      - name: Run PowerShell contract tests
+        run: python -m unittest discover -s scripts/tests -p "test_*_ps1.py"
+
+  macos-shell:
+    name: macOS helper compatibility
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+      - name: Parse and invoke POSIX help paths
+        run: |
+          sh -n scripts/install.sh scripts/uninstall.sh
+          sh scripts/install.sh --help >/dev/null
+          sh scripts/uninstall.sh --help >/dev/null
+      - name: Compile portable Python helpers
+        run: python -m compileall -q scripts
