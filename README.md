@@ -1,17 +1,18 @@
 # super-mem
 
 [![CI](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml/badge.svg)](https://github.com/Limme-swe/super-mem/actions/workflows/ci.yml)
+[![Comfort checks](https://github.com/Limme-swe/super-mem/actions/workflows/comfort.yml/badge.svg)](https://github.com/Limme-swe/super-mem/actions/workflows/comfort.yml)
 [![Release](https://img.shields.io/github/v/release/Limme-swe/super-mem?display_name=tag)](https://github.com/Limme-swe/super-mem/releases/latest)
 [![MSRV](https://img.shields.io/badge/rustc-1.88%2B-000000?logo=rust)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-2ea44f.svg)](LICENSE)
 
 Local, Git-aware memory for coding agents.
 
-super-mem records prompts, decisions, tool results, tests, and failed attempts in a local SQLite store. Recall is filtered by workspace, repository, and Git state before anything is ranked, so an old note from another branch is not treated as current fact.
+super-mem records prompts, decisions, tool results, tests, and failed attempts in a local SQLite store. Recall is filtered by namespace, workspace, repository, lifecycle, time, and Git applicability before anything is ranked, so an old note from another branch is not silently treated as current fact.
 
 **Status:** pre-1.0. The CLI and database schema may change between minor releases. Native release binaries are available for Linux, Windows, and both Intel and Apple Silicon Macs; crates.io and npm packages are not published yet.
 
-[Installation](docs/installation.md) · [Architecture](docs/architecture.md) · [Search indexing](docs/search-indexing.md) · [Integrations](docs/integrations.md) · [Security](docs/privacy-and-threat-model.md) · [Evaluation](docs/evaluation.md) · [Contributing](CONTRIBUTING.md)
+[Five-minute quickstart](docs/quickstart.md) · [Installation](docs/installation.md) · [Configuration](docs/configuration.md) · [CLI cookbook](docs/cli-cookbook.md) · [Integrations](docs/integrations.md) · [Integration checklist](docs/integration-checklist.md) · [Troubleshooting](docs/troubleshooting.md) · [Data lifecycle](docs/data-lifecycle.md) · [Security](docs/privacy-and-threat-model.md) · [Architecture](docs/architecture.md) · [Search indexing](docs/search-indexing.md) · [Evaluation](docs/evaluation.md) · [Development](docs/development-workflow.md) · [Contributing](CONTRIBUTING.md)
 
 ## What it does
 
@@ -28,7 +29,33 @@ The Rust core owns storage, scoping, retrieval, and context assembly. Harness ad
 
 ## Install
 
-Download the archive for your system from the [latest GitHub release](https://github.com/Limme-swe/super-mem/releases/latest), extract `supermem` (`supermem.exe` on Windows), and place it on `PATH`.
+### Verified installer
+
+Download the installer, inspect it, then run it. The installer retrieves the archive and `SHA256SUMS` from the same release, requires an exact checksum match, stages the executable, and verifies the installed version.
+
+Linux or macOS:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/Limme-swe/super-mem/main/scripts/install.sh
+less install.sh
+sh install.sh
+```
+
+The default destination is `~/.local/bin/supermem`. Choose another user-writable directory with `--install-dir`.
+
+Windows PowerShell:
+
+```powershell
+Invoke-WebRequest https://raw.githubusercontent.com/Limme-swe/super-mem/main/scripts/install.ps1 -OutFile install.ps1
+Get-Content .\install.ps1
+.\install.ps1
+```
+
+The default destination is `%LOCALAPPDATA%\Programs\super-mem\bin`. The Windows installer adds it to the user `PATH`; open a new terminal when necessary.
+
+### Manual release installation
+
+Download the archive for your system from the [latest GitHub release](https://github.com/Limme-swe/super-mem/releases/latest), verify it, extract `supermem` (`supermem.exe` on Windows), and place it on `PATH`.
 
 | System | Release target |
 | --- | --- |
@@ -37,41 +64,72 @@ Download the archive for your system from the [latest GitHub release](https://gi
 | macOS Apple Silicon | `aarch64-apple-darwin` |
 | macOS Intel | `x86_64-apple-darwin` |
 
-Every release includes `SHA256SUMS` and GitHub build-provenance attestations. See [Installation](docs/installation.md) for exact commands, default data locations, verification, unsigned-binary notices, and source builds.
+Every release includes `SHA256SUMS` and GitHub build-provenance attestations. See [Installation](docs/installation.md) for exact manual commands, default data locations, verification, unsigned-binary notices, and source builds.
 
 Keep Git on `PATH` to enable repository identity, ancestry, changed-file capture, and file-freshness checks. The CLI still supports unscoped local memory when Git is unavailable.
 
+### Verify the installation
+
+From a source checkout or extracted release archive, run the non-destructive environment check:
+
+```sh
+python scripts/preflight.py --cwd .
+```
+
+Then exercise the complete lifecycle against temporary databases only:
+
+```sh
+python scripts/smoke_install.py
+```
+
+The smoke test runs version, init, remember, recall, export, import, status, and doctor without reusing `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, or `SUPER_MEM_WORKSPACE`.
+
 ## Quickstart
 
-Create the local store:
+The [five-minute quickstart](docs/quickstart.md) gives the full install-to-agent path. The core CLI flow is:
 
-~~~sh
+```sh
 supermem init
-~~~
+```
 
 Record a repository decision:
 
-~~~sh
-supermem remember --kind decision --body "Use the workspace-level Cargo release profile" --file Cargo.toml --cwd .
-~~~
+```sh
+supermem remember \
+  --kind decision \
+  --body "Use the workspace-level Cargo release profile" \
+  --file Cargo.toml \
+  --cwd .
+```
+
+For long or sensitive text, prefer stdin so content does not appear in a process listing:
+
+```sh
+printf '%s\n' 'Keep SQLite canonical; every search index must be rebuildable.' \
+  | supermem remember --kind constraint --body-stdin --cwd .
+```
 
 Recall relevant context:
 
-~~~sh
-supermem recall --query "why is the release profile ignored?" --cwd . --token-budget 1200
-~~~
+```sh
+supermem recall \
+  --query "why is the release profile ignored?" \
+  --file Cargo.toml \
+  --cwd . \
+  --token-budget 1200
+```
 
 `--file` is repeatable on `remember`, `recall`, and `checkpoint`; it records or checks repository-relative content hashes. Checkpoints also attempt to fingerprint the complete changed-file set by default and attach nothing if automatic capture is incomplete. Use `--no-auto-artifacts` to disable that capture.
 
 Run the MCP server:
 
-~~~sh
+```sh
 supermem mcp --root .
-~~~
+```
 
 A generic stdio configuration looks like this:
 
-~~~json
+```json
 {
   "mcpServers": {
     "super-mem": {
@@ -80,9 +138,9 @@ A generic stdio configuration looks like this:
     }
   }
 }
-~~~
+```
 
-The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries. `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` can provide the same store and scope to scoped CLI commands, hooks, and MCP; keep both processes configured alike.
+The launch command pins the root, namespace, and optional workspace. Model tool arguments cannot replace those boundaries. `SUPER_MEM_DB`, `SUPER_MEM_NAMESPACE`, and `SUPER_MEM_WORKSPACE` can provide the same store and hard scope to scoped CLI commands, hooks, and MCP; keep every process configured alike. See [Configuration](docs/configuration.md) for precedence and platform defaults.
 
 ## Integrations
 
@@ -96,7 +154,7 @@ Reference adapters are included in [adapters/](adapters/) in both the repository
 | Pi | CLI management | Native extension | Source extension package |
 | Generic client | MCP | Host-dependent | Stdio configuration |
 
-Automatic capture is fail-open: a memory error must not stop the coding session. See [Harness integrations](docs/integrations.md) for installation details and the events captured by each adapter.
+Automatic capture is fail-open: a memory error must not stop the coding session. A session continuing normally therefore does not prove that capture succeeded. See [Harness integrations](docs/integrations.md) for host-specific installation, then use the [integration checklist](docs/integration-checklist.md) to verify CLI storage, MCP access, lifecycle capture, compaction, restart behavior, and hard-scope consistency separately.
 
 ## How recall works
 
@@ -124,80 +182,101 @@ The model-facing surface has four tools:
 | **memory_feedback** | Attach an observed result or judgment to a memory. |
 | **memory_manage** | Inspect a memory, load its revision, event, link, and feedback history, or retract it. |
 
-Database status, import/export, and physical purge remain CLI operations.
+Database status, import/export, and physical purge remain CLI operations. The [CLI cookbook](docs/cli-cookbook.md) covers the complete command surface with copy-ready examples.
 
-Run an explicit local health check after installing an adapter or when capture
-appears silent:
+## Diagnose problems
 
-~~~sh
+Start outside the harness so installation, data-path, Git, and adapter failures are not conflated:
+
+```sh
+python scripts/preflight.py --cwd /absolute/path/to/repository --doctor
+```
+
+Run the explicit observational health check in the same environment that launches the agent:
+
+```sh
 supermem --json doctor --cwd /absolute/path/to/repository
-~~~
+```
 
-`doctor` requires an initialized store and never creates, migrates, checkpoints,
-recovers, or changes its journal mode. It pins the audited database identity,
-checks writer access with native file locks, and inspects only a stable copy.
-Unix uses a mode-`0600` temporary file; Windows uses an in-memory copy capped at
-512 MiB so database contents never inherit a temporary-directory ACL. An
-abruptly killed Unix process can leave its private copy in the OS temporary
-directory. Copying and SQLite work share a five-second deadline, SQLite value
-sizes are capped, and integrity includes canonical cross-table relationships in
-addition to quick-check, foreign-key, and exact-schema checks. Live WAL state
-and rollback journals are reported without letting SQLite open the source
-because even a read-only SQLite connection can rewrite shared-memory state.
-File aliases and Unix permissions are checked, Git subprocesses have a
-two-second aggregate deadline and bounded output, and scope environment values
-are redacted. A machine-local identity digest makes path exchange observations
-correlatable without emitting raw device/file IDs. It exits nonzero when a
-required check fails.
-The JSON report still contains machine-local paths and a credential-free
-repository probe, so review it before sharing it outside the machine.
+`doctor` requires an initialized store and never creates, migrates, checkpoints, recovers, or changes its journal mode. It pins the audited database identity, checks writer access with native file locks, and inspects only a stable copy. Unix uses a mode-`0600` temporary file; Windows uses an in-memory copy capped at 512 MiB so database contents never inherit a temporary-directory ACL.
 
-The CLI exposes the same history as JSON:
+Copying and SQLite work share a five-second deadline, SQLite value sizes are capped, and integrity includes canonical cross-table relationships in addition to quick-check, foreign-key, and exact-schema checks. Live WAL state and rollback journals are reported without letting SQLite open the source because even a read-only SQLite connection can rewrite shared-memory state. File aliases and Unix permissions are checked, Git subprocesses have a two-second aggregate deadline and bounded output, and scope environment values are redacted. A machine-local identity digest makes path exchange observations correlatable without emitting raw device/file IDs. Required-check failure produces a nonzero exit.
 
-~~~sh
+The JSON report still contains machine-local paths and a credential-free repository probe. For a smaller path-sanitized issue attachment, generate and review:
+
+```sh
+python scripts/support_bundle.py \
+  --cwd /absolute/path/to/repository \
+  --output super-mem-support.json
+```
+
+The support collector does not copy memory rows, the database file, environment variables, or Git remotes. Read [Troubleshooting](docs/troubleshooting.md) before changing retrieval or weakening a path-safety check.
+
+The CLI exposes memory history as JSON:
+
+```sh
 supermem --json inspect MEMORY_ID --history
-~~~
+```
 
 ## Data and safety
 
-The default store is local, plaintext SQLite. New files use restrictive permissions where the platform supports them. Treat the store like source code or terminal history.
+The default store is local, plaintext SQLite. New files use restrictive permissions where the platform supports them. Treat the store like source code, shell history, or terminal transcripts.
 
 - With the default configuration, common credential patterns are redacted before storage. Redaction is not a guarantee.
 - Recalled content is labeled as untrusted evidence, never promoted to instructions.
-- Repository and workspace filters are applied before ranking.
+- Namespace, workspace, repository, lifecycle, time, and Git-applicability filters run before ranking.
 - Automatic capture is capped and uses stdin rather than command arguments for captured text.
 - Full snapshots are integrity-checked. Import is atomic and requires an otherwise empty store.
 
-Keep the database outside the Git worktree unless there is a specific reason not to. Repository-local paths have additional platform and link-safety restrictions. Read [Security and privacy](docs/privacy-and-threat-model.md) before enabling automatic capture.
+Keep the database outside the Git worktree unless there is a specific reason not to. Repository-local paths have additional platform and link-safety restrictions. Read [Security and privacy](docs/privacy-and-threat-model.md) and the [operator security checklist](docs/operator-security-checklist.md) before enabling automatic capture.
 
-Create or restore a snapshot with:
+Create a logical backup and test a restore in a separate store:
 
-~~~sh
+```sh
 supermem export --output memory.jsonl
-supermem import memory.jsonl
-~~~
+supermem --db restored.sqlite3 import memory.jsonl
+supermem --db restored.sqlite3 --json status
+```
+
+Use [Backup, upgrade, restore, and uninstall](docs/data-lifecycle.md) for safe upgrades, release checks, downgrade cautions, retention, and confirmed data deletion. The supplied uninstallers remove the executable while preserving memories by default:
+
+```sh
+sh scripts/uninstall.sh
+```
+
+```powershell
+.\scripts\uninstall.ps1
+```
 
 ## Development
 
 To build the CLI from source, install Rust 1.88 or newer, clone the repository, and run:
 
-~~~sh
+```sh
 cargo install --path crates/super-mem-cli --locked
-~~~
+```
 
-Run the full local checks with:
+Discover the cross-platform local check targets:
 
-~~~sh
-cargo fmt --all --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-targets --all-features
-node scripts/validate-eval-fixture.mjs
-node scripts/validate-retrieval-fixture.mjs
-~~~
+```sh
+python scripts/dev.py --list
+```
 
-Changes to retrieval, scoping, snapshots, or performance need a focused regression test. Performance claims need a reproducible workload and hardware description.
+Run the fast review loop:
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow, [SECURITY.md](SECURITY.md) for private vulnerability reporting, and [SUPPORT.md](SUPPORT.md) for usage questions.
+```sh
+python scripts/dev.py quick
+```
+
+Run the complete local validation before a pull request:
+
+```sh
+python scripts/dev.py full
+```
+
+The full target covers formatting, Clippy with warnings denied, Rust tests, Python helper tests, documentation links, evaluation and retrieval fixtures, and package construction. Use `--dry-run` to inspect commands and `--keep-going` to collect all failures.
+
+Changes to retrieval, scoping, snapshots, or performance need a focused regression test. Performance claims need a reproducible workload and hardware description. See [Development workflow](docs/development-workflow.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), and [SUPPORT.md](SUPPORT.md).
 
 ## License
 
