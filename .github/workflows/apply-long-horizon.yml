@@ -30,7 +30,7 @@ jobs:
           source = (Path(os.environ['RUNNER_TEMP']) / 'bootstrap.yml').read_text(encoding='utf-8')
           payload = source.split("<<'ARCHIVE'\n", 1)[1].split('\nARCHIVE', 1)[0].strip()
           archive = Path(os.environ['RUNNER_TEMP']) / 'changes.tar.gz'
-          archive.write_bytes(base64.b64decode(payload, validate=True))
+          archive.write_bytes(base64.b64decode(payload))
           PY
           echo "$ARCHIVE_SHA256  $RUNNER_TEMP/changes.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/changes.tar.gz" -C .
