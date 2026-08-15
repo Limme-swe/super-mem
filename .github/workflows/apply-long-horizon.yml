@@ -20,6 +20,7 @@ jobs:
         env:
           ARCHIVE_SHA256: 5737b619c1e710b27821f2a605da44f0d0c72724a7c7232d9b7e1df2cd177acc
         run: |
+          # Reassemble the reviewed payload from connector-sized chunks.
           cat .phase2/long-horizon/part-* | base64 --decode > "$RUNNER_TEMP/changes.tar.gz"
           echo "$ARCHIVE_SHA256  $RUNNER_TEMP/changes.tar.gz" | sha256sum --check
           tar -xzf "$RUNNER_TEMP/changes.tar.gz" -C .
