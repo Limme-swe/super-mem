@@ -1,6 +1,6 @@
 # Evaluation
 
-super-mem measures recall, scope safety, freshness, provenance, context cost, latency, and task results separately. The repository ships invariant tests, retrieval fixtures, and two development probes. Public and end-to-end benchmarks are planned.
+super-mem measures recall, scope safety, freshness, provenance, context cost, latency, and task results separately. The repository ships invariant tests, a 12-case retrieval seed, a 32-case long-horizon production-engine benchmark, machine-readable retrieval reports, and two development probes. Public benchmark adapters and stochastic end-to-end agent runs remain separate work.
 
 Published results must include enough configuration and raw data to reproduce the run.
 
@@ -41,13 +41,32 @@ node scripts/validate-eval-fixture.mjs
 
 The script is deterministic and uses only the Node.js standard library. It validates the fixture's labeled retrieval intent; it is not a production-engine or end-to-end quality benchmark.
 
+## Long-horizon production benchmark
+
+[`fixtures/long-horizon`](../fixtures/long-horizon) expands the checked-in regression surface to 32 cases and more than 300 writes. It exercises later-session decisions, verified procedures versus failed attempts, current revisions, repository and workspace isolation, artifact freshness, error fingerprints, and code aliases against the production `MemoryEngine`.
+
+Regenerate and validate the immutable fixture:
+
+```sh
+python scripts/generate_long_horizon_fixture.py --check
+node scripts/validate-retrieval-fixture.mjs fixtures/long-horizon
+```
+
+Produce a raw JSON report:
+
+```sh
+python scripts/run_long_horizon_benchmark.py --output long-horizon-report.json
+```
+
+The runner can enforce explicit minimum MRR@10, Recall@10, and nDCG@10 values, but safety and lifecycle assertions are never reduced to aggregate scores. CI publishes the raw report as an artifact after the complete Rust test suite succeeds.
+
 ## Development probes
 
 Ignored, fixed-workload probes cover core recall and diversity selection. They run in release mode with one thread and are profiling aids, not cross-machine claims. See [benchmark notes](../benches/README.md) for commands and equivalence checks.
 
-## Planned evaluation
+## External and stochastic evaluation
 
-The following work is not yet a shipped benchmark suite.
+The following work is not represented by the deterministic checked-in benchmark and still requires separately licensed corpora or model access.
 
 ### Public memory benchmarks
 

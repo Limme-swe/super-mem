@@ -42,6 +42,14 @@ PY_TEST = Step(
 DOCS = Step("Documentation links", (PYTHON, "scripts/check_docs.py"))
 EVAL = Step("Evaluation fixture", ("node", "scripts/validate-eval-fixture.mjs"))
 RETRIEVAL = Step("Retrieval fixture", ("node", "scripts/validate-retrieval-fixture.mjs"))
+LONG_HORIZON_GENERATED = Step(
+    "Long-horizon fixture freshness",
+    (PYTHON, "scripts/generate_long_horizon_fixture.py", "--check"),
+)
+LONG_HORIZON = Step(
+    "Long-horizon fixture",
+    ("node", "scripts/validate-retrieval-fixture.mjs", "fixtures/long-horizon"),
+)
 PACKAGE_CORE = Step(
     "Package core crate",
     ("cargo", "package", "-p", "super-mem-core", "--locked", "--no-verify"),
@@ -62,9 +70,27 @@ PACKAGE_CLI = Step(
 
 TARGETS: dict[str, tuple[Step, ...]] = {
     "fmt": (FMT,),
-    "quick": (FMT, CHECK, PY_COMPILE, PY_TEST, DOCS, EVAL, RETRIEVAL),
+    "quick": (
+        FMT,
+        CHECK,
+        PY_COMPILE,
+        PY_TEST,
+        DOCS,
+        EVAL,
+        RETRIEVAL,
+        LONG_HORIZON_GENERATED,
+        LONG_HORIZON,
+    ),
     "rust": (FMT, CLIPPY, TEST),
-    "scripts": (PY_COMPILE, PY_TEST, DOCS, EVAL, RETRIEVAL),
+    "scripts": (
+        PY_COMPILE,
+        PY_TEST,
+        DOCS,
+        EVAL,
+        RETRIEVAL,
+        LONG_HORIZON_GENERATED,
+        LONG_HORIZON,
+    ),
     "docs": (DOCS,),
     "package": (PACKAGE_CORE, PACKAGE_CLI),
     "full": (
@@ -76,6 +102,8 @@ TARGETS: dict[str, tuple[Step, ...]] = {
         DOCS,
         EVAL,
         RETRIEVAL,
+        LONG_HORIZON_GENERATED,
+        LONG_HORIZON,
         PACKAGE_CORE,
         PACKAGE_CLI,
     ),
