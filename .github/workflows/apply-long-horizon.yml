@@ -15,7 +15,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           ref: agent/long-horizon-benchmark
-      - name: Materialize reviewed changes
+      - name: Materialize reviewed source changes
         shell: bash
         env:
           ARCHIVE_SHA256: 5737b619c1e710b27821f2a605da44f0d0c72724a7c7232d9b7e1df2cd177acc
@@ -29,8 +29,8 @@ jobs:
           path = Path('crates/super-mem-core/tests/long_horizon_fixture.rs')
           path.write_text(path.read_text(encoding='utf-8').rstrip() + '\n', encoding='utf-8')
           PY
+          git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/apply-long-horizon.yml
           rm -rf .phase2
-          rm -f .github/workflows/apply-long-horizon.yml
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
           git add -A
