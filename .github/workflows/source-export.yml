@@ -15,10 +15,10 @@ jobs:
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
       - name: Build source archive
-        run: tar --exclude=.git -czf super-mem-source.tar.gz .
+        run: tar --exclude=.git -czf "$RUNNER_TEMP/super-mem-source.tar.gz" .
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: super-mem-source
-          path: super-mem-source.tar.gz
+          path: ${{ runner.temp }}/super-mem-source.tar.gz
           if-no-files-found: error
           retention-days: 1
